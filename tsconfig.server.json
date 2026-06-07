@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "skipLibCheck": true,
+    "outDir": "dist-server",
+    "rootDir": ".",
+    "baseUrl": ".",
+    "paths": {
+      "@domain/*": ["src/domain/*"]
+    },
+    "types": ["node"]
+  },
+  "include": [
+    "server/**/*.ts",
+    "src/domain/siteflow.ts",
+    "src/domain/readModels.ts",
+    "src/lib/api/siteflowClient.ts",
+    "src/lib/environmentTarget.ts",
+    "src/lib/sealedSecrets.ts"
+  ],
+  "exclude": ["server/**/*.test.ts", "src/**/*.test.tsx", "src/**/*.test.ts"]
+}

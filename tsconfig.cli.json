@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "skipLibCheck": true,
+    "outDir": "dist-cli",
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  "include": ["cli/**/*.ts", "src/lib/api/deployContracts.ts"],
+  "exclude": ["cli/**/*.test.ts"]
+}

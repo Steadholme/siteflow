@@ -1,0 +1,274 @@
+{
+  "id": "ui-design-siteflow-20260515-execution-plan",
+  "title": "Implement the SiteFlow operator console from the Operations Ledger design reference",
+  "source_context": {
+    "session_folder": ".workflow/.csv-wave/20260515-plan-siteflow-ui-design",
+    "target_plan_directory": ".workflow/scratch/ui-design-siteflow-20260515",
+    "repo_state": {
+      "implementation_baseline": "Empty/minimal repository: no package.json, source tree, lockfile, or existing frontend conventions were found in the tracked workspace listing.",
+      "git_state": "Repository root is not currently a Git repository, so collision safety is based on file ownership rather than Git metadata."
+    },
+    "artifacts_read": [
+      ".workflow/.csv-wave/20260515-plan-siteflow-ui-design/tasks.csv",
+      ".workflow/.csv-wave/20260515-plan-siteflow-ui-design/wave-1-results.csv",
+      ".workflow/.csv-wave/20260515-plan-siteflow-ui-design/discoveries.ndjson",
+      ".workflow/.csv-wave/20260515-brainstorm-siteflow-self-hosted-vercel/context.md",
+      ".workflow/.csv-wave/20260515-brainstorm-siteflow-self-hosted-vercel/.brainstorming/feature-index.json",
+      ".workflow/.csv-wave/20260515-brainstorm-siteflow-self-hosted-vercel/.brainstorming/synthesis-changelog.md",
+      ".workflow/scratch/ui-design-siteflow-20260515/context.md",
+      ".workflow/scratch/ui-design-siteflow-20260515/index.json",
+      ".workflow/scratch/ui-design-siteflow-20260515/design-ref/MASTER.md",
+      ".workflow/scratch/ui-design-siteflow-20260515/design-ref/design-tokens.json",
+      ".workflow/scratch/ui-design-siteflow-20260515/design-ref/animation-tokens.json",
+      ".workflow/scratch/ui-design-siteflow-20260515/design-ref/selection.json",
+      ".workflow/scratch/ui-design-siteflow-20260515/design-ref/compare.html",
+      ".workflow/scratch/ui-design-siteflow-20260515/design-ref/layout-templates/*.json",
+      ".workflow/scratch/ui-design-siteflow-20260515/design-ref/prototypes/*.html",
+      ".workflow/scratch/ui-design-siteflow-20260515/design-ref/prototypes/prototype.css"
+    ],
+    "wave_1_findings": {
+      "architecture": "Use design-ref as source of truth. Routes are /projects, /projects/:id, /deployments/:id, /projects/:id/release/:channel, and /projects/:id/rollback/:channel. Domain state follows source_event -> build_job -> artifact -> deployment -> release_channel/preview -> route_revision/audit_event.",
+      "implementation": "Scaffold a TypeScript React/Vite console with shared shell, panels, tables, status pills, timelines, logs/evidence, safety checks, audit forms, fixture-backed API boundary, Vitest, and Playwright.",
+      "integration": "Define DB-backed read models for projects, deployments, channels, artifacts, route revisions, logs, and audit. Include polling/SSE boundaries and explicit loading, error, and empty states.",
+      "risk": "Mitigate secret leakage, destructive promote/rollback, stale route/CDN states, rollback eligibility, dense responsive/a11y issues, missing tests, and file collision risk."
+    },
+    "design_reference": {
+      "selected_style": "Operations Ledger",
+      "routes": [
+        "/projects",
+        "/projects/:projectId",
+        "/deployments/:deploymentId",
+        "/projects/:projectId/release/:channel",
+        "/projects/:projectId/rollback/:channel"
+      ],
+      "targets": [
+        "project-list",
+        "project-detail",
+        "deployment-detail",
+        "release-rollback-console"
+      ],
+      "visual_rules": [
+        "Compact operations workspace, not a marketing landing page.",
+        "Use OKLCH design tokens, Inter, JetBrains Mono, 4-8px radii, stable tables, and reduced-motion CSS.",
+        "Expose production state, build/artifact evidence, route health, safety checks, audit reasons, and actor history.",
+        "Never show secret values in settings, logs, manifests, fixtures, route config, or copied evidence."
+      ]
+    }
+  },
+  "complexity": {
+    "level": "high",
+    "rationale": "The repository needs first-time frontend scaffolding plus multiple route-level operational workflows, typed fixture contracts, destructive-action safeguards, and cross-page verification.",
+    "task_count": 6,
+    "estimated_total_minutes": 420
+  },
+  "waves": [
+    {
+      "wave": 1,
+      "description": "Create the frontend foundation, tokenized shell, shared UI primitives, and route handoff points.",
+      "tasks": [
+        "TASK-001"
+      ],
+      "parallel": false
+    },
+    {
+      "wave": 2,
+      "description": "Define fixture-backed SiteFlow read models and API/state contracts consumed by all route features.",
+      "tasks": [
+        "TASK-005"
+      ],
+      "parallel": false
+    },
+    {
+      "wave": 3,
+      "description": "Implement the three independent operator workflows against the shared contracts.",
+      "tasks": [
+        "TASK-002",
+        "TASK-003",
+        "TASK-004"
+      ],
+      "parallel": true
+    },
+    {
+      "wave": 4,
+      "description": "Harden cross-page verification, responsive checks, and risk-focused regression coverage.",
+      "tasks": [
+        "TASK-006"
+      ],
+      "parallel": false
+    }
+  ],
+  "tasks": [
+    {
+      "id": "TASK-001",
+      "title": "Scaffold React/Vite console, tokens, shell, and shared UI primitives",
+      "wave": 1,
+      "depends_on": [],
+      "owns": [
+        "package.json",
+        "package-lock.json",
+        "index.html",
+        "vite.config.ts",
+        "tsconfig.json",
+        "tsconfig.node.json",
+        "src/main.tsx",
+        "src/app/**",
+        "src/components/shell/**",
+        "src/components/ui/**",
+        "src/styles/**",
+        "src/test/setup.ts"
+      ],
+      "handoff_placeholders": [
+        "src/features/projects/projectRoutes.tsx",
+        "src/features/deployments/deploymentRoutes.tsx",
+        "src/features/release/releaseRoutes.tsx"
+      ],
+      "estimate_minutes": 60
+    },
+    {
+      "id": "TASK-005",
+      "title": "Define fixture-backed API boundary and SiteFlow state contracts",
+      "wave": 2,
+      "depends_on": [
+        "TASK-001"
+      ],
+      "owns": [
+        "src/domain/**",
+        "src/lib/api/**",
+        "src/lib/fixtures/**",
+        "src/lib/state/**",
+        "src/lib/redaction.ts"
+      ],
+      "estimate_minutes": 60
+    },
+    {
+      "id": "TASK-002",
+      "title": "Implement project inventory and project detail views",
+      "wave": 3,
+      "depends_on": [
+        "TASK-001",
+        "TASK-005"
+      ],
+      "owns": [
+        "src/features/projects/**"
+      ],
+      "estimate_minutes": 75
+    },
+    {
+      "id": "TASK-003",
+      "title": "Implement deployment evidence, lineage, and log views",
+      "wave": 3,
+      "depends_on": [
+        "TASK-001",
+        "TASK-005"
+      ],
+      "owns": [
+        "src/features/deployments/**"
+      ],
+      "estimate_minutes": 75
+    },
+    {
+      "id": "TASK-004",
+      "title": "Implement release promotion and rollback safeguards",
+      "wave": 3,
+      "depends_on": [
+        "TASK-001",
+        "TASK-005"
+      ],
+      "owns": [
+        "src/features/release/**"
+      ],
+      "estimate_minutes": 80
+    },
+    {
+      "id": "TASK-006",
+      "title": "Harden verification, responsive behavior, a11y, and security regressions",
+      "wave": 4,
+      "depends_on": [
+        "TASK-002",
+        "TASK-003",
+        "TASK-004",
+        "TASK-005"
+      ],
+      "owns": [
+        "playwright.config.ts",
+        "tests/e2e/**",
+        "src/test/accessibility.ts",
+        "src/test/consoleSmoke.test.tsx",
+        "src/test/securityCanary.test.tsx"
+      ],
+      "estimate_minutes": 70
+    }
+  ],
+  "verification": {
+    "required_commands": [
+      "npm install",
+      "npm run build",
+      "npm test -- --run",
+      "npm run test:e2e"
+    ],
+    "cross_task_checks": [
+      "All five target routes render through the shared shell without a marketing or landing screen.",
+      "Rendered DOM and fixture exports contain no raw secret canary values.",
+      "Promotion and rollback actions remain disabled until safety checks pass and an audit reason is present.",
+      "Deployment views do not label a deployment routable before verified artifact and applied route revision evidence is present.",
+      "Tables, lineage chains, logs, and sticky action bars remain usable at 375px, 768px, and 1280px widths.",
+      "Reduced-motion media query is present and effective."
+    ],
+    "quality_floor": {
+      "unit_and_component_tests": "Core public helpers, feature routes, safety guards, redaction, and rendered states covered with Vitest/Testing Library.",
+      "e2e_tests": "Playwright smoke coverage across all target routes and responsive widths.",
+      "build": "TypeScript and Vite production build pass."
+    }
+  },
+  "collision_notes": {
+    "status": "manageable",
+    "notes": [
+      "No existing source implementation or Git metadata was found, so all source files are new.",
+      "TASK-001 owns root setup, shell, styles, shared UI, and test setup. It may create three feature route placeholder modules only to keep the scaffold buildable.",
+      "After TASK-001, feature work is isolated by directory: projects, deployments, and release. The three wave 3 tasks can run in parallel if they do not edit root config, shell, shared UI, domain, or API files.",
+      "TASK-006 owns only Playwright and cross-page test files. It should not rewrite feature implementation files except for narrowly scoped fixes required by failing tests.",
+      "Because the root is not a Git repository, future executors should avoid broad staging assumptions and should not use git add . if a repository is initialized later."
+    ],
+    "intentional_handoffs": [
+      "src/features/projects/projectRoutes.tsx",
+      "src/features/deployments/deploymentRoutes.tsx",
+      "src/features/release/releaseRoutes.tsx"
+    ]
+  },
+  "readiness_gate": {
+    "passed": true,
+    "criteria": [
+      "Every task file includes a non-empty read_first list.",
+      "Every task file includes convergence.criteria with grep- or command-verifiable outcomes.",
+      "Task count is six or fewer and grouped by feature, not by individual file.",
+      "Dependencies are limited to scaffold, shared API contracts, and final verification.",
+      "File ownership is explicit and parallel wave tasks are isolated by feature directory."
+    ],
+    "blocking_issues": []
+  },
+  "confidence": {
+    "overall": 0.88,
+    "dimensions": {
+      "requirements_coverage": {
+        "score": 0.94,
+        "reason": "The six mandatory task areas are represented and mapped to the requested routes, design reference, and Wave 1 risk findings."
+      },
+      "task_quality": {
+        "score": 0.89,
+        "reason": "Tasks are feature-level, have exact ownership, concrete actions, tests, and convergence criteria."
+      },
+      "dependency_correctness": {
+        "score": 0.87,
+        "reason": "Only scaffold, API contracts, and final verification are sequential. Feature tasks are parallel after shared contracts exist."
+      },
+      "estimation_accuracy": {
+        "score": 0.78,
+        "reason": "Estimates are reasonable for first implementation work, but package installation and UI polish may vary because the repository has no baseline."
+      },
+      "collision_safety": {
+        "score": 0.91,
+        "reason": "Ownership separates root scaffold, shared contracts, feature folders, and test hardening. Known scaffold placeholders are explicitly called out as handoffs."
+      }
+    }
+  }
+}

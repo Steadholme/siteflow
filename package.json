@@ -1,0 +1,43 @@
+{
+  "name": "siteflow-console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "siteflow": "./dist-cli/cli/index.js"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json && npm run build:cli && npm run build:server && npm run build:worker && vite build",
+    "build:cli": "tsc -p tsconfig.cli.json",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build:worker": "tsc -p tsconfig.worker.json",
+    "api": "node dist-server/server/index.js",
+    "siteflow": "node dist-cli/cli/index.js",
+    "test": "vitest",
+    "test:watch": "vitest --watch",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "pg": "^8.20.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.28.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.1",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.1.0",
+    "@testing-library/user-event": "^14.5.2",
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.20.0",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^25.0.1",
+    "typescript": "^5.7.2",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.8"
+  }
+}

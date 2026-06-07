@@ -1,0 +1,44 @@
+{
+  "name": "siteflow-precision-operations-console",
+  "colors": {
+    "brandPrimary": "oklch(41% 0.16 254)",
+    "brandPrimaryHover": "oklch(34% 0.15 254)",
+    "brandSecondary": "oklch(43% 0.08 178)",
+    "brandAccent": "oklch(55% 0.14 36)",
+    "surfaceBackground": "oklch(98.5% 0.003 250)",
+    "surfaceSubtle": "oklch(96% 0.004 250)",
+    "surfaceElevated": "oklch(100% 0 0)",
+    "surfaceCard": "oklch(100% 0 0)",
+    "textPrimary": "oklch(19% 0.015 250)",
+    "textSecondary": "oklch(38% 0.014 250)",
+    "textTertiary": "oklch(55% 0.012 250)",
+    "borderDefault": "oklch(88% 0.006 250)",
+    "borderStrong": "oklch(76% 0.01 250)"
+  },
+  "typography": {
+    "heading": "Inter, system-ui, sans-serif",
+    "body": "Inter, system-ui, sans-serif",
+    "mono": "JetBrains Mono, SFMono-Regular, Consolas, monospace",
+    "scale": {
+      "xs": "0.75rem",
+      "sm": "0.8125rem",
+      "base": "0.875rem",
+      "md": "1rem",
+      "lg": "1.125rem",
+      "xl": "1.25rem",
+      "2xl": "1.375rem"
+    }
+  },
+  "spacing": {
+    "density": "compact",
+    "baseUnit": "4px",
+    "panelPadding": "16px",
+    "pagePadding": "24px"
+  },
+  "componentStyles": {
+    "cards": "1px border, 8px radius, minimal shadow",
+    "tables": "sticky-feeling header band, compact rows, monospace metadata",
+    "buttons": "32-34px height, crisp borders, icon-first commands",
+    "navigation": "left rail on desktop, compact tab strip on mobile"
+  }
+}

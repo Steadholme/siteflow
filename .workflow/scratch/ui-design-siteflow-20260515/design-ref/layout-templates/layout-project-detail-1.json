@@ -1,0 +1,12 @@
+{
+  "target": "project-detail",
+  "variant_id": "layout-1",
+  "device_type": "responsive",
+  "design_philosophy": "Project command center with deployment history as the primary object and settings summarized in side panels.",
+  "dom_structure": {
+    "tag": "body",
+    "children": ["app-shell", "sidebar-nav", "topbar", "project-header", "main.detail-grid", "deployment-history", "settings-rail"]
+  },
+  "component_hierarchy": ["project-header", "environment-tabs", "deployment-history", "domain-status", "repository-card", "secret-policy"],
+  "css_layout_rules": "Use single column on mobile. At 1024px, grid-template-columns: minmax(0, 1fr) 320px. Deployment rows maintain fixed cells for version, commit, status, artifact, and action."
+}

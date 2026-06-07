@@ -1,0 +1,12 @@
+{
+  "target": "deployment-detail",
+  "variant_id": "layout-2",
+  "device_type": "responsive",
+  "design_philosophy": "Evidence ledger layout where source, build, artifact, deployment, and route lineage are shown as a horizontal chain.",
+  "dom_structure": {
+    "tag": "body",
+    "children": ["app-shell", "sidebar-nav", "topbar", "deployment-header", "lineage-chain", "evidence-table", "log-drawer"]
+  },
+  "component_hierarchy": ["deployment-header", "lineage-chain", "evidence-table", "log-drawer"],
+  "css_layout_rules": "Lineage chain scrolls horizontally below 768px and uses five equal columns above 1024px. Evidence table uses compact rows with fixed label width."
+}

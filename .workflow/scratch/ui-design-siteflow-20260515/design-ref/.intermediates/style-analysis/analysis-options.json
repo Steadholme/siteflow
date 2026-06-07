@@ -1,0 +1,96 @@
+{
+  "mode": "explore",
+  "design_directions": [
+    {
+      "variant": 1,
+      "philosophy_name": "Operations Ledger",
+      "search_keywords": ["developer platform dashboard", "deployment operations", "audit trail", "dense table UI", "control plane"],
+      "anti_keywords": ["marketing hero", "decorative gradients", "oversized cards", "playful SaaS"],
+      "rationale": "Prioritizes repeated operational work: scanning project health, build status, route state, release lineage, and audit history.",
+      "colors": {
+        "primary": "oklch(42% 0.13 168)",
+        "accent": "oklch(58% 0.17 35)",
+        "background": "oklch(97% 0.006 250)",
+        "surface": "oklch(100% 0 0)",
+        "text": "oklch(22% 0.025 250)"
+      },
+      "fonts": {
+        "heading": "Inter",
+        "body": "Inter",
+        "mono": "JetBrains Mono"
+      },
+      "border_radius_base": "6px",
+      "mood_description": "precise, compact, status-first, audit-friendly",
+      "attribute_scores": {
+        "color_saturation": 0.34,
+        "visual_weight": 0.46,
+        "formality": 0.82,
+        "organic_geometric": 0.72,
+        "innovation": 0.42,
+        "density": 0.84
+      }
+    },
+    {
+      "variant": 2,
+      "philosophy_name": "Signal Console",
+      "search_keywords": ["live infrastructure console", "status monitor", "terminal inspired", "routing health", "build telemetry"],
+      "anti_keywords": ["flat enterprise table only", "pastel product UI", "consumer app"],
+      "rationale": "Emphasizes live build and routing telemetry with stronger contrast, suitable for operators watching worker and deployment health.",
+      "colors": {
+        "primary": "oklch(72% 0.16 186)",
+        "accent": "oklch(76% 0.18 82)",
+        "background": "oklch(18% 0.018 245)",
+        "surface": "oklch(24% 0.018 245)",
+        "text": "oklch(94% 0.01 245)"
+      },
+      "fonts": {
+        "heading": "IBM Plex Sans",
+        "body": "IBM Plex Sans",
+        "mono": "IBM Plex Mono"
+      },
+      "border_radius_base": "4px",
+      "mood_description": "high signal, dark console, telemetry-driven, crisp",
+      "attribute_scores": {
+        "color_saturation": 0.62,
+        "visual_weight": 0.76,
+        "formality": 0.74,
+        "organic_geometric": 0.88,
+        "innovation": 0.68,
+        "density": 0.78
+      }
+    },
+    {
+      "variant": 3,
+      "philosophy_name": "Release Workshop",
+      "search_keywords": ["release management workspace", "collaborative operations", "workflow dashboard", "approval queue", "deployment timeline"],
+      "anti_keywords": ["command center", "cold infrastructure", "consumer social UI"],
+      "rationale": "Balances operational clarity with project-owner friendliness for teams reviewing previews, approvals, rollback reasons, and release notes.",
+      "colors": {
+        "primary": "oklch(48% 0.16 282)",
+        "accent": "oklch(62% 0.19 25)",
+        "background": "oklch(96% 0.008 95)",
+        "surface": "oklch(99% 0.004 95)",
+        "text": "oklch(24% 0.03 270)"
+      },
+      "fonts": {
+        "heading": "Source Sans 3",
+        "body": "Source Sans 3",
+        "mono": "Roboto Mono"
+      },
+      "border_radius_base": "8px",
+      "mood_description": "structured, approachable, workflow-oriented, review-friendly",
+      "attribute_scores": {
+        "color_saturation": 0.52,
+        "visual_weight": 0.56,
+        "formality": 0.64,
+        "organic_geometric": 0.58,
+        "innovation": 0.50,
+        "density": 0.66
+      }
+    }
+  ],
+  "attribute_space_coverage": {
+    "min_pairwise_distance": 0.41,
+    "coverage_note": "Variants differ by surface brightness, density, telemetry emphasis, and release workflow friendliness."
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "phase": "siteflow-vercel-parity",
+  "status": "passed",
+  "validated_at": "2026-05-26T10:00:46+08:00",
+  "test_frameworks": ["vitest", "playwright", "typescript", "vite"],
+  "commands": [
+    {
+      "command": "npm test -- --run",
+      "status": "passed",
+      "evidence": "18 test files passed, 148 tests passed."
+    },
+    {
+      "command": "npm run test:e2e",
+      "status": "passed",
+      "evidence": "51 Playwright tests passed."
+    },
+    {
+      "command": "npx tsc --noEmit -p tsconfig.json",
+      "status": "passed"
+    },
+    {
+      "command": "npx tsc --noEmit -p tsconfig.server.json",
+      "status": "passed"
+    },
+    {
+      "command": "npx tsc --noEmit -p tsconfig.cli.json",
+      "status": "passed"
+    },
+    {
+      "command": "npx tsc --noEmit -p tsconfig.node.json",
+      "status": "passed"
+    },
+    {
+      "command": "npx tsc --noEmit -p tsconfig.worker.json",
+      "status": "passed"
+    },
+    {
+      "command": "npm run build",
+      "status": "passed",
+      "evidence": "CLI, server, worker, app TypeScript checks and Vite production build passed."
+    }
+  ],
+  "requirement_coverage": [
+    {
+      "requirement": "VP-001 through VP-014 issues completed",
+      "status": "covered",
+      "evidence": ".workflow/issues/issues.jsonl and .workflow/state.json audit"
+    },
+    {
+      "requirement": "Unit and integration behavior remains green",
+      "status": "covered",
+      "evidence": "npm test -- --run"
+    },
+    {
+      "requirement": "Console E2E smoke, safeguards, responsive layout, and no-secret leakage remain green",
+      "status": "covered",
+      "evidence": "npm run test:e2e"
+    },
+    {
+      "requirement": "Build artifacts can be produced",
+      "status": "covered",
+      "evidence": "npm run build"
+    }
+  ],
+  "gaps": []
+}

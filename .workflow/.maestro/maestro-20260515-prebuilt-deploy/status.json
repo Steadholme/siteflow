@@ -1,0 +1,68 @@
+{
+  "session_id": "maestro-20260515-prebuilt-deploy",
+  "source": "maestro",
+  "created_at": "2026-05-15T13:53:39+08:00",
+  "updated_at": "2026-05-15T14:03:37+08:00",
+  "intent": "Implement SiteFlow prebuilt deploy MVP for Vercel-like uuid subdomain preview URLs",
+  "task_type": "feature",
+  "chain_name": "feature",
+  "phase": "prebuilt-deploy-mvp",
+  "milestone": null,
+  "auto_mode": true,
+  "exec_mode": "implementation",
+  "cli_tool": "codex",
+  "target": "server/, cli/",
+  "context": {
+    "design_dir": ".workflow/design/siteflow-cli-installer",
+    "session_report": ".workflow/.maestro/maestro-20260515-prebuilt-deploy/context.md",
+    "scope": "siteflow deploy --prebuilt upload -> Postgres metadata -> local artifact files -> uuid preview route"
+  },
+  "waves": [
+    {
+      "wave_n": 1,
+      "status": "completed",
+      "summary": "Planned prebuilt deploy MVP scope.",
+      "completed_at": "2026-05-15T13:53:39+08:00"
+    },
+    {
+      "wave_n": 2,
+      "status": "completed",
+      "summary": "Implemented prebuilt deploy CLI, API endpoint, Postgres persistence, artifact writes, and preview host routing.",
+      "completed_at": "2026-05-15T14:02:43+08:00"
+    },
+    {
+      "wave_n": 3,
+      "status": "completed",
+      "summary": "Verified with unit tests, build, e2e, and CLI help/dry-run commands.",
+      "completed_at": "2026-05-15T14:03:37+08:00"
+    }
+  ],
+  "steps": [
+    {
+      "index": 0,
+      "skill": "maestro-plan",
+      "args": "--dir .workflow/design/siteflow-prebuilt-deploy \"Plan prebuilt deploy MVP\"",
+      "type": "skill",
+      "status": "completed",
+      "wave_n": 1
+    },
+    {
+      "index": 1,
+      "skill": "maestro-execute",
+      "args": "--scope server/,cli/,src/lib/api/",
+      "type": "skill",
+      "status": "completed",
+      "wave_n": 2
+    },
+    {
+      "index": 2,
+      "skill": "maestro-verify",
+      "args": "--checks test,build,e2e,cli",
+      "type": "skill",
+      "status": "completed",
+      "wave_n": 3
+    }
+  ],
+  "current_step": 3,
+  "status": "completed"
+}

@@ -1,0 +1,12 @@
+{
+  "target": "release-rollback-console",
+  "variant_id": "layout-1",
+  "device_type": "responsive",
+  "design_philosophy": "Two-pane release control surface with current channel state, candidate deployment, risk checks, and audit reason capture.",
+  "dom_structure": {
+    "tag": "body",
+    "children": ["app-shell", "sidebar-nav", "topbar", "release-header", "main.release-grid", "candidate-panel", "safety-checks", "audit-form"]
+  },
+  "component_hierarchy": ["release-header", "candidate-panel", "safety-checks", "route-preview", "audit-form", "action-bar"],
+  "css_layout_rules": "Stack on mobile. At 1024px, grid-template-columns: minmax(0, 1fr) 380px. Action bar is sticky at the bottom of the main panel, not viewport-overlapping."
+}

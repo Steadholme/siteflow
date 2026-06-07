@@ -1,0 +1,154 @@
+{
+  "id": "TASK-006",
+  "title": "Harden verification, responsive behavior, a11y, and security regressions",
+  "wave": 4,
+  "depends_on": [
+    "TASK-002",
+    "TASK-003",
+    "TASK-004",
+    "TASK-005"
+  ],
+  "objective": "Add cross-page tests and verification hardening for responsive density, accessibility basics, reduced motion, stale-state copy, destructive-action safeguards, and secret leakage across the completed operator console.",
+  "ownership": {
+    "owns": [
+      "playwright.config.ts",
+      "tests/e2e/operator-console.spec.ts",
+      "tests/e2e/responsive-layout.spec.ts",
+      "tests/e2e/release-safeguards.spec.ts",
+      "tests/e2e/no-secret-leakage.spec.ts",
+      "src/test/accessibility.ts",
+      "src/test/consoleSmoke.test.tsx",
+      "src/test/securityCanary.test.tsx"
+    ],
+    "must_not_touch": [
+      "package.json unless a test script from TASK-001 is missing",
+      "src/app/** unless a cross-page route bug blocks all tests",
+      "src/components/** unless a shared accessibility bug blocks all tests",
+      "src/features/** except minimal fixes directly required by failing verification",
+      "src/domain/**",
+      "src/lib/api/**",
+      "src/lib/fixtures/**"
+    ]
+  },
+  "read_first": [
+    ".workflow/scratch/ui-design-siteflow-20260515/design-ref/MASTER.md",
+    ".workflow/scratch/ui-design-siteflow-20260515/design-ref/animation-tokens.json",
+    ".workflow/scratch/ui-design-siteflow-20260515/design-ref/prototypes/prototype.css",
+    ".workflow/.csv-wave/20260515-plan-siteflow-ui-design/discoveries.ndjson",
+    "package.json",
+    "vite.config.ts",
+    "src/app/router.tsx",
+    "src/styles/tokens.css",
+    "src/styles/global.css",
+    "src/features/projects/projects.test.tsx",
+    "src/features/deployments/deployments.test.tsx",
+    "src/features/release/release.test.tsx",
+    "src/lib/redaction.test.ts"
+  ],
+  "actions": [
+    "Create Playwright config that starts the Vite dev server and runs Chromium tests at 375x812, 768x1024, and 1280x900 viewports.",
+    "Add e2e smoke coverage for /projects, /projects/:projectId, /deployments/:deploymentId, /projects/:projectId/release/:channel, and /projects/:projectId/rollback/:channel.",
+    "Add responsive assertions that tables, lineage chains, log panels, and sticky action bars do not create viewport-level horizontal body overflow or overlap primary actions.",
+    "Add release safeguard e2e coverage proving promote and rollback controls are disabled until safety checks pass and audit reasons are present.",
+    "Add no-secret-leakage e2e coverage that scans rendered text for fixture canary secrets, raw provider payload markers, and unredacted token patterns.",
+    "Add Vitest smoke tests that render every route with fixture scenarios for loading, error, empty, stale, partial route failure, and route drift.",
+    "Add lightweight accessibility helpers for labels, focus visibility, icon-button names, non-color status text, and heading structure.",
+    "Verify reduced-motion CSS exists and that no page relies on animation to reveal critical state."
+  ],
+  "files": [
+    {
+      "path": "playwright.config.ts",
+      "operation": "create",
+      "purpose": "Playwright dev-server and viewport configuration"
+    },
+    {
+      "path": "tests/e2e/operator-console.spec.ts",
+      "operation": "create",
+      "purpose": "cross-route smoke tests"
+    },
+    {
+      "path": "tests/e2e/responsive-layout.spec.ts",
+      "operation": "create",
+      "purpose": "mobile/tablet/desktop overflow and overlap checks"
+    },
+    {
+      "path": "tests/e2e/release-safeguards.spec.ts",
+      "operation": "create",
+      "purpose": "destructive action disabled-state and audit checks"
+    },
+    {
+      "path": "tests/e2e/no-secret-leakage.spec.ts",
+      "operation": "create",
+      "purpose": "rendered DOM secret canary checks"
+    },
+    {
+      "path": "src/test/accessibility.ts",
+      "operation": "create",
+      "purpose": "shared test assertions for labels, focus, heading structure, and status text"
+    },
+    {
+      "path": "src/test/consoleSmoke.test.tsx",
+      "operation": "create",
+      "purpose": "Vitest cross-route rendering smoke tests"
+    },
+    {
+      "path": "src/test/securityCanary.test.tsx",
+      "operation": "create",
+      "purpose": "DOM-level secret leakage regression tests"
+    }
+  ],
+  "tests": {
+    "commands": [
+      "npm test -- --run",
+      "npm run build",
+      "npm run test:e2e"
+    ],
+    "new_tests": [
+      "Every target route renders inside AppShell at mobile, tablet, and desktop widths.",
+      "No target route causes document.body.scrollWidth to exceed viewport width except inside intentional table or lineage scroll containers.",
+      "Promote and rollback buttons remain disabled without passing safety checks and audit reason.",
+      "Rendered DOM for all target routes contains no secret canary, raw webhook payload, raw manifest secret marker, or route config secret marker.",
+      "Reduced-motion media query exists in src/styles/tokens.css and computed critical state remains visible without animation."
+    ]
+  },
+  "convergence": {
+    "criteria": [
+      "playwright.config.ts exists and defines projects or test use settings for 375x812, 768x1024, and 1280x900 viewports.",
+      "tests/e2e/operator-console.spec.ts visits all five target routes.",
+      "tests/e2e/no-secret-leakage.spec.ts scans rendered DOM text for the fixture canary values defined by src/lib/fixtures/siteflow.fixtures.ts.",
+      "tests/e2e/release-safeguards.spec.ts verifies promote and rollback actions are disabled before safety requirements and audit reason are satisfied.",
+      "npm test -- --run, npm run build, and npm run test:e2e pass."
+    ]
+  },
+  "risks": [
+    "Playwright may need browser installation on a fresh machine; document or run npx playwright install if required by the environment.",
+    "Responsive tests can be flaky if they rely on screenshots only; prefer DOM layout metrics and targeted assertions.",
+    "If this task finds shared bugs, fixes must stay narrowly scoped and avoid broad rewrites of feature work."
+  ],
+  "estimate_minutes": 70,
+  "status": "completed",
+  "execution": {
+    "status": "completed",
+    "findings": "Added Playwright/Vitest hardening for five operator routes, responsive overflow, release safeguards, no-secret scans, and a11y helpers. Installed missing Chromium. Fixed default fixture docs-portal aliasing and deployment lineage redaction fallback to keep status text accessible.",
+    "files_modified": [
+      "playwright.config.ts",
+      "tests/e2e/operator-console.spec.ts",
+      "tests/e2e/responsive-layout.spec.ts",
+      "tests/e2e/release-safeguards.spec.ts",
+      "tests/e2e/no-secret-leakage.spec.ts",
+      "src/test/accessibility.ts",
+      "src/test/consoleSmoke.test.tsx",
+      "src/test/securityCanary.test.tsx",
+      "src/features/projects/ProjectDetailPage.tsx",
+      "src/features/release/ReleaseConsolePage.tsx",
+      "src/features/release/RollbackConsolePage.tsx",
+      "src/features/deployments/DeploymentDetailPage.tsx",
+      "vite.config.ts",
+      ".workflow/scratch/ui-design-siteflow-20260515/.summaries/TASK-006-summary.md"
+    ],
+    "tests_passed": "npm test -- --run passed: 10 files/56 tests. npm run build passed. npm run test:e2e passed: 51 tests across 375x812, 768x1024, 1280x900.",
+    "error": "",
+    "completed_at": "2026-05-15T10:45:00+08:00",
+    "session": ".workflow/.csv-wave/20260515-execute-siteflow-ui-design"
+  }
+}

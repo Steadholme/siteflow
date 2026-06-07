@@ -1,0 +1,206 @@
+{
+  "id": "TASK-001",
+  "title": "Scaffold React/Vite console, tokens, shell, and shared UI primitives",
+  "wave": 1,
+  "depends_on": [],
+  "objective": "Create a buildable TypeScript React/Vite operator console foundation that translates the Operations Ledger design tokens into CSS, renders the shared SiteFlow shell, and exposes route handoff modules for downstream feature work.",
+  "ownership": {
+    "owns": [
+      "package.json",
+      "package-lock.json",
+      "index.html",
+      "vite.config.ts",
+      "tsconfig.json",
+      "tsconfig.node.json",
+      "src/main.tsx",
+      "src/app/App.tsx",
+      "src/app/router.tsx",
+      "src/app/RoutePlaceholder.tsx",
+      "src/components/shell/AppShell.tsx",
+      "src/components/shell/SidebarNav.tsx",
+      "src/components/shell/Topbar.tsx",
+      "src/components/ui/Button.tsx",
+      "src/components/ui/IconButton.tsx",
+      "src/components/ui/Panel.tsx",
+      "src/components/ui/StatusPill.tsx",
+      "src/components/ui/DataTable.tsx",
+      "src/components/ui/Timeline.tsx",
+      "src/styles/tokens.css",
+      "src/styles/global.css",
+      "src/styles/layout.css",
+      "src/test/setup.ts"
+    ],
+    "handoff_placeholders": [
+      "src/features/projects/projectRoutes.tsx",
+      "src/features/deployments/deploymentRoutes.tsx",
+      "src/features/release/releaseRoutes.tsx"
+    ],
+    "must_not_touch": [
+      "src/domain/**",
+      "src/lib/api/**",
+      "src/lib/fixtures/**",
+      "src/features/projects/** except projectRoutes.tsx placeholder",
+      "src/features/deployments/** except deploymentRoutes.tsx placeholder",
+      "src/features/release/** except releaseRoutes.tsx placeholder"
+    ]
+  },
+  "read_first": [
+    ".workflow/scratch/ui-design-siteflow-20260515/design-ref/MASTER.md",
+    ".workflow/scratch/ui-design-siteflow-20260515/design-ref/design-tokens.json",
+    ".workflow/scratch/ui-design-siteflow-20260515/design-ref/animation-tokens.json",
+    ".workflow/scratch/ui-design-siteflow-20260515/design-ref/prototypes/prototype.css",
+    ".workflow/scratch/ui-design-siteflow-20260515/design-ref/layout-templates/layout-project-list-1.json",
+    ".workflow/scratch/ui-design-siteflow-20260515/design-ref/layout-templates/layout-project-detail-1.json",
+    ".workflow/scratch/ui-design-siteflow-20260515/design-ref/layout-templates/layout-deployment-detail-2.json",
+    ".workflow/scratch/ui-design-siteflow-20260515/design-ref/layout-templates/layout-release-rollback-console-1.json"
+  ],
+  "actions": [
+    "Initialize npm package metadata for a private SiteFlow operator console using TypeScript, React, Vite, React Router, lucide-react, Vitest, Testing Library, jsdom, and Playwright dependencies.",
+    "Create Vite and TypeScript configs with strict TypeScript enabled and path aliases for app, components, features, domain, lib, styles, and test helpers.",
+    "Create index.html, src/main.tsx, src/app/App.tsx, and src/app/router.tsx so the first rendered screen is /projects inside the console shell.",
+    "Create route handoff modules for projects, deployments, and release that initially point to RoutePlaceholder so the scaffold can build before feature tasks replace their own modules.",
+    "Translate design-tokens.json and animation-tokens.json into src/styles/tokens.css with OKLCH variables, Inter/JetBrains Mono font stacks, 4/6/8px radii, semantic status variables, transition variables, and reduced-motion media query.",
+    "Create global and layout CSS for dense operations surfaces: 232px desktop nav, mobile single-column shell, sticky topbar, stable table overflow, panel spacing, focus states, and no decorative hero treatment.",
+    "Build shell components AppShell, SidebarNav, and Topbar with accessible nav labels and lucide icons for Projects, Deployments, Routes, Artifacts, Audit, and Settings.",
+    "Build shared UI primitives Button, IconButton, Panel, StatusPill, DataTable, and Timeline with accessible names, stable dimensions, semantic status text, and tokenized styles.",
+    "Create src/test/setup.ts with Testing Library jest-dom setup for downstream component tests."
+  ],
+  "files": [
+    {
+      "path": "package.json",
+      "operation": "create",
+      "purpose": "npm scripts, dependencies, devDependencies, and private package metadata"
+    },
+    {
+      "path": "package-lock.json",
+      "operation": "generate",
+      "purpose": "lock dependency versions after npm install"
+    },
+    {
+      "path": "index.html",
+      "operation": "create",
+      "purpose": "Vite HTML entrypoint"
+    },
+    {
+      "path": "vite.config.ts",
+      "operation": "create",
+      "purpose": "React plugin, aliases, and Vitest environment"
+    },
+    {
+      "path": "tsconfig.json",
+      "operation": "create",
+      "purpose": "strict TS config for browser source"
+    },
+    {
+      "path": "tsconfig.node.json",
+      "operation": "create",
+      "purpose": "TS config for Vite config"
+    },
+    {
+      "path": "src/main.tsx",
+      "operation": "create",
+      "purpose": "React root bootstrap"
+    },
+    {
+      "path": "src/app/App.tsx",
+      "operation": "create",
+      "purpose": "application shell root"
+    },
+    {
+      "path": "src/app/router.tsx",
+      "operation": "create",
+      "purpose": "route table for all five target routes using feature route handoff modules"
+    },
+    {
+      "path": "src/app/RoutePlaceholder.tsx",
+      "operation": "create",
+      "purpose": "temporary route body for buildable scaffold"
+    },
+    {
+      "path": "src/components/shell/*.tsx",
+      "operation": "create",
+      "purpose": "shared shell navigation and topbar"
+    },
+    {
+      "path": "src/components/ui/*.tsx",
+      "operation": "create",
+      "purpose": "shared dense operations UI primitives"
+    },
+    {
+      "path": "src/styles/*.css",
+      "operation": "create",
+      "purpose": "token, global, and layout styles"
+    },
+    {
+      "path": "src/test/setup.ts",
+      "operation": "create",
+      "purpose": "Vitest DOM test setup"
+    }
+  ],
+  "tests": {
+    "commands": [
+      "npm install",
+      "npm run build",
+      "npm test -- --run"
+    ],
+    "new_tests": [
+      "Render AppShell with a memory router and assert the SiteFlow brand, primary nav labels, and /projects placeholder are visible.",
+      "Render StatusPill for success, warning, error, and info and assert each has visible text plus semantic CSS class."
+    ]
+  },
+  "convergence": {
+    "criteria": [
+      "package.json contains scripts named dev, build, test, test:watch, and test:e2e.",
+      "src/styles/tokens.css contains --color-brand-primary, --color-surface-background, --color-success, --radius-md, --duration-fast, and @media (prefers-reduced-motion: reduce).",
+      "src/app/router.tsx includes routes for /projects, /projects/:projectId, /deployments/:deploymentId, /projects/:projectId/release/:channel, and /projects/:projectId/rollback/:channel.",
+      "src/components/shell/SidebarNav.tsx renders SiteFlow and includes accessible nav links for Projects, Deployments, Routes, Artifacts, Audit, and Settings.",
+      "npm run build completes successfully after npm install."
+    ]
+  },
+  "risks": [
+    "Initial dependency install may surface network or lockfile constraints because there is no existing package manager baseline.",
+    "Route handoff placeholders intentionally touch feature directories once; downstream tasks must replace only their own feature module.",
+    "Design tokens should be copied faithfully from design-ref and not replaced with a new palette."
+  ],
+  "estimate_minutes": 60,
+  "status": "completed",
+  "execution": {
+    "status": "completed",
+    "findings": "Created Vite/React TypeScript console scaffold with tokenized shell, route handoff placeholders, shared UI primitives, and basic component tests. npm install/build/test passed; npm audit reports 5 moderate dependency advisories. Vite pinned to 5.x for Vitest type compatibility.",
+    "files_modified": [
+      "package.json",
+      "package-lock.json",
+      "index.html",
+      "vite.config.ts",
+      "tsconfig.json",
+      "tsconfig.node.json",
+      "src/main.tsx",
+      "src/app/App.tsx",
+      "src/app/router.tsx",
+      "src/app/RoutePlaceholder.tsx",
+      "src/components/shell/AppShell.tsx",
+      "src/components/shell/SidebarNav.tsx",
+      "src/components/shell/Topbar.tsx",
+      "src/components/shell/AppShell.test.tsx",
+      "src/components/ui/Button.tsx",
+      "src/components/ui/IconButton.tsx",
+      "src/components/ui/Panel.tsx",
+      "src/components/ui/StatusPill.tsx",
+      "src/components/ui/StatusPill.test.tsx",
+      "src/components/ui/DataTable.tsx",
+      "src/components/ui/Timeline.tsx",
+      "src/features/projects/projectRoutes.tsx",
+      "src/features/deployments/deploymentRoutes.tsx",
+      "src/features/release/releaseRoutes.tsx",
+      "src/styles/tokens.css",
+      "src/styles/global.css",
+      "src/styles/layout.css",
+      "src/test/setup.ts",
+      ".workflow/scratch/ui-design-siteflow-20260515/.summaries/TASK-001-summary.md"
+    ],
+    "tests_passed": "npm install passed; npm run build passed; npm test -- --run passed (2 files, 5 tests).",
+    "error": "",
+    "completed_at": "2026-05-15T10:45:00+08:00",
+    "session": ".workflow/.csv-wave/20260515-execute-siteflow-ui-design"
+  }
+}

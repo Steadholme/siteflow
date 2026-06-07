@@ -1,0 +1,95 @@
+{
+  "topic": "SiteFlow: self-hosted Vercel-like framework",
+  "generated_at": "2026-05-15T08:45:00+08:00",
+  "features": [
+    {
+      "id": "F-001",
+      "slug": "project-management",
+      "priority": "P0",
+      "title": "Project Management",
+      "source_roles": ["guidance", "system-architect", "data-architect", "product-manager"],
+      "spec_file": ".workflow/.csv-wave/20260515-brainstorm-siteflow-self-hosted-vercel/.brainstorming/feature-specs/F-001-project-management.md",
+      "dependencies": [],
+      "risk": "medium: project policy mistakes cascade into webhook, build, routing, and retention behavior",
+      "mvp_phase": "M1 Deployable Core"
+    },
+    {
+      "id": "F-002",
+      "slug": "git-webhook-ingestion",
+      "priority": "P0",
+      "title": "Git Webhook Ingestion",
+      "source_roles": ["guidance", "system-architect", "data-architect", "product-manager"],
+      "spec_file": ".workflow/.csv-wave/20260515-brainstorm-siteflow-self-hosted-vercel/.brainstorming/feature-specs/F-002-git-webhook-ingestion.md",
+      "dependencies": ["F-001"],
+      "risk": "medium: signature verification, idempotency, and event disposition must be correct to avoid missing or duplicate builds",
+      "mvp_phase": "M1 Deployable Core"
+    },
+    {
+      "id": "F-003",
+      "slug": "framework-detection-versioning",
+      "priority": "P0",
+      "title": "Framework Detection and Versioning",
+      "source_roles": ["guidance", "system-architect", "data-architect", "product-manager"],
+      "spec_file": ".workflow/.csv-wave/20260515-brainstorm-siteflow-self-hosted-vercel/.brainstorming/feature-specs/F-003-framework-detection-versioning.md",
+      "dependencies": ["F-001", "F-002"],
+      "risk": "medium: ambiguous detection can create surprising builds unless explicit configuration wins",
+      "mvp_phase": "M1 Deployable Core"
+    },
+    {
+      "id": "F-004",
+      "slug": "docker-build-worker",
+      "priority": "P0",
+      "title": "Docker Build Worker",
+      "source_roles": ["guidance", "system-architect", "data-architect", "product-manager"],
+      "spec_file": ".workflow/.csv-wave/20260515-brainstorm-siteflow-self-hosted-vercel/.brainstorming/feature-specs/F-004-docker-build-worker.md",
+      "dependencies": ["F-001", "F-002", "F-003"],
+      "risk": "high: untrusted source execution requires strong isolation, logging, cleanup, and resource limits",
+      "mvp_phase": "M1 Deployable Core"
+    },
+    {
+      "id": "F-005",
+      "slug": "artifact-storage-management",
+      "priority": "P0",
+      "title": "Artifact Storage Management",
+      "source_roles": ["guidance", "system-architect", "data-architect", "product-manager"],
+      "spec_file": ".workflow/.csv-wave/20260515-brainstorm-siteflow-self-hosted-vercel/.brainstorming/feature-specs/F-005-artifact-storage-management.md",
+      "dependencies": ["F-003", "F-004"],
+      "risk": "high: artifact immutability and retention are core rollback safety guarantees",
+      "mvp_phase": "M1 Deployable Core"
+    },
+    {
+      "id": "F-006",
+      "slug": "routing-cdn-integration",
+      "priority": "P0",
+      "title": "Routing and CDN Integration",
+      "source_roles": ["guidance", "system-architect", "data-architect", "product-manager"],
+      "spec_file": ".workflow/.csv-wave/20260515-brainstorm-siteflow-self-hosted-vercel/.brainstorming/feature-specs/F-006-routing-cdn-integration.md",
+      "dependencies": ["F-001", "F-005", "F-008"],
+      "risk": "high: route generation and Nginx reload failures directly affect traffic",
+      "mvp_phase": "M1 Deployable Core / M2 Controlled Release"
+    },
+    {
+      "id": "F-007",
+      "slug": "preview-deployments",
+      "priority": "P1",
+      "title": "Preview Deployments",
+      "source_roles": ["guidance", "system-architect", "data-architect", "product-manager"],
+      "spec_file": ".workflow/.csv-wave/20260515-brainstorm-siteflow-self-hosted-vercel/.brainstorming/feature-specs/F-007-preview-deployments.md",
+      "dependencies": ["F-002", "F-004", "F-005", "F-006"],
+      "risk": "medium: preview routing and retention can grow scope unless production path stays primary",
+      "mvp_phase": "M3 Team Workflow"
+    },
+    {
+      "id": "F-008",
+      "slug": "release-promotion-rollback",
+      "priority": "P0",
+      "title": "Release Promotion and Rollback",
+      "source_roles": ["guidance", "system-architect", "data-architect", "product-manager"],
+      "spec_file": ".workflow/.csv-wave/20260515-brainstorm-siteflow-self-hosted-vercel/.brainstorming/feature-specs/F-008-release-promotion-rollback.md",
+      "dependencies": ["F-003", "F-005", "F-006"],
+      "risk": "high: transaction and routing side-effect boundaries must preserve auditability and rollback safety",
+      "mvp_phase": "M2 Controlled Release"
+    }
+  ]
+}
+

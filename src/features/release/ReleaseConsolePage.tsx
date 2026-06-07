@@ -1,0 +1,218 @@
+import { useEffect, useMemo, useState } from "react";
+import { AlertTriangle, Rocket } from "lucide-react";
+import { useParams } from "react-router-dom";
+
+import { Panel } from "@components/ui/Panel";
+import type { ReleaseChannelName } from "@domain/siteflow";
+import type { CommandResultReadModel, ReleaseConsoleReadModel } from "@domain/readModels";
+import { createSiteFlowClient, getDefaultSiteFlowClientMode, type SiteFlowClient } from "@lib/api";
+import { AuditReasonForm } from "./components/AuditReasonForm";
+import { CandidatePanel } from "./components/CandidatePanel";
+import { ReleaseHeader } from "./components/ReleaseHeader";
+import { RoutePreview } from "./components/RoutePreview";
+import { evaluateSafetyGate, normalizeSafetyChecks, SafetyChecks } from "./components/SafetyChecks";
+import { StickyActionBar, type CommandState } from "./components/StickyActionBar";
+
+interface ReleaseConsolePageProps {
+  client?: SiteFlowClient;
+  projectId?: string;
+  channel?: ReleaseChannelName;
+  initialReason?: string;
+}
+
+type LoadState =
+  | { status: "loading" }
+  | { status: "ready"; data: ReleaseConsoleReadModel }
+  | { status: "error"; message: string };
+
+const releaseChannels = ["production", "staging", "preview"] as const;
+const defaultFixtureProjectId = "project-acme-dashboard";
+
+function isReleaseChannelName(value: string | undefined): value is ReleaseChannelName {
+  return releaseChannels.some((channel) => channel === value);
+}
+
+function toErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : "Unknown release console error.";
+}
+
+function commandMessage(result: CommandResultReadModel) {
+  return result.operationId ? `${result.message} Operation ${result.operationId}.` : result.message;
+}
+
+function fixtureProjectIdForRoute(projectId: string) {
+  return projectId === "docs-portal" ? defaultFixtureProjectId : projectId;
+}
+
+export function ReleaseConsolePage({ client, projectId, channel, initialReason = "" }: ReleaseConsolePageProps) {
+  const params = useParams();
+  const defaultClientMode = useMemo(() => (client ? "http" : getDefaultSiteFlowClientMode()), [client]);
+  const usesDefaultFixtureClient = !client && defaultClientMode === "fixture";
+  const resolvedProjectId = projectId ?? params.projectId ?? defaultFixtureProjectId;
+  const requestProjectId = usesDefaultFixtureClient ? fixtureProjectIdForRoute(resolvedProjectId) : resolvedProjectId;
+  const resolvedChannel = channel ?? (isReleaseChannelName(params.channel) ? params.channel : "production");
+  const resolvedClient = useMemo(() => client ?? createSiteFlowClient(), [client]);
+  const [loadState, setLoadState] = useState<LoadState>({ status: "loading" });
+  const [reason, setReason] = useState(initialReason);
+  const [commandState, setCommandState] = useState<CommandState>({ status: "idle" });
+
+  useEffect(() => {
+    let cancelled = false;
+
+    setLoadState({ status: "loading" });
+    resolvedClient
+      .getReleaseConsole(requestProjectId, resolvedChannel)
+      .then((data) => {
+        if (!cancelled) {
+          setLoadState({ status: "ready", data });
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setLoadState({ status: "error", message: toErrorMessage(error) });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [requestProjectId, resolvedChannel, resolvedClient]);
+
+  if (loadState.status === "loading") {
+    return (
+      <div className="workspace-stack release-page">
+        <Panel title="Release console">
+          <p className="release-muted">Loading promote workflow…</p>
+        </Panel>
+      </div>
+    );
+  }
+
+  if (loadState.status === "error") {
+    return (
+      <div className="workspace-stack release-page">
+        <Panel title="Release console">
+          <div role="alert" className="release-alert release-alert--error">
+            <strong>API error</strong>
+            <span>{loadState.message}</span>
+          </div>
+        </Panel>
+      </div>
+    );
+  }
+
+  const { data } = loadState;
+  const actor = data.recentChannelEvents[0]?.actor ?? data.auditEvents[0]?.actor;
+  const idempotencyKey = `promote-${data.project.id}-${data.channel}-${data.candidateDeployment?.id ?? "pending"}`;
+  const safetyChecks = normalizeSafetyChecks(data.safetyChecks, data.routePreview?.checks);
+  const staleCandidate = safetyChecks.find((check) => check.id === "check-candidate-freshness" && check.status !== "pass");
+  const gate = evaluateSafetyGate({
+    checks: safetyChecks,
+    auditReason: reason,
+    extraRequirements: [
+      {
+        label: "Candidate deployment",
+        passed: Boolean(data.candidateDeployment),
+        failure: "Candidate deployment is required before promotion."
+      },
+      {
+        label: "Current channel target",
+        passed: Boolean(data.currentDeployment),
+        failure: "Current channel target must remain protected before promotion."
+      },
+      {
+        label: "Route preview",
+        passed: Boolean(data.routePreview),
+        failure: "Route preview must be generated before promotion."
+      }
+    ]
+  });
+  const routeConsequence = data.routePreview
+    ? `Queue route revision ${data.routePreview.routeRevision.id} for ${data.channel}; CDN work remains observable separately.`
+    : `Queue a route revision for ${data.channel} after dry-run passes.`;
+  const actionLabel = `Promote ${data.channel} from ${data.currentDeployment?.id ?? "none"} to ${
+    data.candidateDeployment?.id ?? "none"
+  } and queue route apply`;
+
+  async function submitPromotion() {
+    if (!data.candidateDeployment || !actor) {
+      setCommandState({ status: "validationError", message: "Promotion requires a candidate deployment and actor." });
+      return;
+    }
+
+    if (!gate.canSubmit) {
+      setCommandState({ status: "validationError", message: gate.blockingReasons[0] ?? "Promotion failed validation." });
+      return;
+    }
+
+    setCommandState({ status: "submitting", message: "Submitting promote command." });
+
+    try {
+      const result = await resolvedClient.promoteDeployment({
+        projectId: data.project.id,
+        channel: data.channel,
+        targetDeploymentId: data.candidateDeployment.id,
+        actor,
+        reason: reason.trim(),
+        idempotencyKey
+      });
+
+      setCommandState(
+        result.status === "accepted"
+          ? { status: "success", message: commandMessage(result), operationId: result.operationId }
+          : { status: "validationError", message: result.message }
+      );
+    } catch (error: unknown) {
+      setCommandState({ status: "apiError", message: toErrorMessage(error) });
+    }
+  }
+
+  return (
+    <div className="workspace-stack release-page">
+      <ReleaseHeader
+        mode="promote"
+        projectName={data.project.name}
+        channel={data.channel}
+        currentDeployment={data.currentDeployment}
+        targetDeployment={data.candidateDeployment}
+      />
+      {staleCandidate && (
+        <div role="alert" className="release-alert release-alert--error">
+          <AlertTriangle size={18} aria-hidden="true" />
+          <strong>Stale candidate detected</strong>
+          <span>{staleCandidate.summary}</span>
+        </div>
+      )}
+      <main className="release-grid">
+        <section className="release-stack">
+          <CandidatePanel channel={data.channel} currentDeployment={data.currentDeployment} candidateDeployment={data.candidateDeployment} />
+          <SafetyChecks checks={safetyChecks} />
+          <RoutePreview preview={data.routePreview} />
+        </section>
+        <aside className="release-stack">
+          <AuditReasonForm
+            title="Audit reason"
+            label="Promotion reason"
+            value={reason}
+            onChange={setReason}
+            actor={actor}
+            idempotencyKey={idempotencyKey}
+            channel={data.channel}
+            currentDeploymentId={data.currentDeployment?.id}
+            targetDeploymentId={data.candidateDeployment?.id}
+            routeConsequence={routeConsequence}
+          />
+          <StickyActionBar
+            actionLabel={actionLabel}
+            actionIcon={<Rocket size={16} aria-hidden="true" />}
+            buttonVariant="primary"
+            disabled={!gate.canSubmit}
+            blockingReasons={gate.blockingReasons}
+            commandState={commandState}
+            onSubmit={submitPromotion}
+          />
+        </aside>
+      </main>
+    </div>
+  );
+}

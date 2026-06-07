@@ -1,0 +1,18 @@
+{
+  "selected_variant": 1,
+  "variant_name": "Operations Ledger",
+  "selection_mode": "user_choice",
+  "rationale": "Best fit for SiteFlow's MVP because the UI must support dense operational scanning, status triage, audit trail review, route safety, artifact evidence, promotion, and rollback. It avoids marketing composition and keeps project management close to deployment state.",
+  "design_attributes": {
+    "color_saturation": 0.34,
+    "visual_weight": 0.46,
+    "formality": 0.82,
+    "organic_geometric": 0.72,
+    "innovation": 0.42,
+    "density": 0.84
+  },
+  "alternatives_reviewed": 3,
+  "targets": ["project-list", "project-detail", "deployment-detail", "release-rollback-console"],
+  "layouts_per_target": 2,
+  "selected_at": "2026-05-15T09:05:00+08:00"
+}

@@ -1,0 +1,96 @@
+{
+  "phase": "siteflow-vercel-parity",
+  "status": "passed",
+  "verified_at": "2026-05-26T10:00:46+08:00",
+  "verifier": "codex-closeout-audit",
+  "source_of_truth": {
+    "roadmap": ".workflow/design/siteflow-vercel-parity/roadmap.md",
+    "tasks": ".workflow/design/siteflow-vercel-parity/tasks.md",
+    "issues": ".workflow/issues/issues.jsonl",
+    "state": ".workflow/state.json"
+  },
+  "must_haves": {
+    "truths": [
+      {
+        "claim": "All planned VP-001 through VP-014 tasks have completed issue records.",
+        "status": "verified",
+        "evidence": "ISS-20260525-001 through ISS-20260525-014 are status=completed in .workflow/issues/issues.jsonl."
+      },
+      {
+        "claim": "Every planned task has a completed execution artifact in workflow state.",
+        "status": "verified",
+        "evidence": "EXC-010 through EXC-022 in .workflow/state.json cover issue_refs ISS-20260525-001 through ISS-20260525-014."
+      },
+      {
+        "claim": "The full unit/integration test suite passes.",
+        "status": "verified",
+        "evidence": "npm test -- --run passed with 18 files and 148 tests."
+      },
+      {
+        "claim": "The Playwright E2E suite passes.",
+        "status": "verified",
+        "evidence": "npm run test:e2e passed with 51 tests."
+      },
+      {
+        "claim": "All TypeScript and production build gates pass.",
+        "status": "verified",
+        "evidence": "npx tsc --noEmit passed for tsconfig.json, tsconfig.server.json, tsconfig.cli.json, tsconfig.node.json, and tsconfig.worker.json; npm run build passed."
+      }
+    ],
+    "artifacts": [
+      {
+        "path": ".workflow/design/siteflow-vercel-parity/tasks.md",
+        "status": "exists",
+        "substantive": true,
+        "evidence": "Defines VP-001 through VP-014 and is marked Status: completed."
+      },
+      {
+        "path": ".workflow/design/siteflow-vercel-parity/roadmap.md",
+        "status": "exists",
+        "substantive": true,
+        "evidence": "Roadmap is marked Status: completed."
+      },
+      {
+        "path": ".workflow/.maestro/maestro-20260525-vercel-parity-closeout/closeout.md",
+        "status": "exists",
+        "substantive": true,
+        "evidence": "Human-readable closeout report records task coverage, verification commands, and residual risks."
+      }
+    ],
+    "key_links": [
+      {
+        "from": "tasks.md VP issue refs",
+        "to": "issues.jsonl completed records",
+        "status": "wired",
+        "evidence": "Each VP task's issue id resolves to a completed issue."
+      },
+      {
+        "from": "issues.jsonl completed records",
+        "to": "state.json execution artifacts",
+        "status": "wired",
+        "evidence": "Completed execution artifacts reference all planned issue ids."
+      }
+    ]
+  },
+  "task_audit": [
+    { "task": "VP-001", "issue": "ISS-20260525-001", "status": "completed", "execution": "EXC-010" },
+    { "task": "VP-002", "issue": "ISS-20260525-002", "status": "completed", "execution": "EXC-011" },
+    { "task": "VP-003", "issue": "ISS-20260525-003", "status": "completed", "execution": "EXC-012" },
+    { "task": "VP-004", "issue": "ISS-20260525-004", "status": "completed", "execution": "EXC-013" },
+    { "task": "VP-005", "issue": "ISS-20260525-005", "status": "completed", "execution": "EXC-014" },
+    { "task": "VP-006", "issue": "ISS-20260525-006", "status": "completed", "execution": "EXC-015" },
+    { "task": "VP-007", "issue": "ISS-20260525-007", "status": "completed", "execution": "EXC-016" },
+    { "task": "VP-008", "issue": "ISS-20260525-008", "status": "completed", "execution": "EXC-015" },
+    { "task": "VP-009", "issue": "ISS-20260525-009", "status": "completed", "execution": "EXC-017" },
+    { "task": "VP-010", "issue": "ISS-20260525-010", "status": "completed", "execution": "EXC-018" },
+    { "task": "VP-011", "issue": "ISS-20260525-011", "status": "completed", "execution": "EXC-019" },
+    { "task": "VP-012", "issue": "ISS-20260525-012", "status": "completed", "execution": "EXC-020" },
+    { "task": "VP-013", "issue": "ISS-20260525-013", "status": "completed", "execution": "EXC-021" },
+    { "task": "VP-014", "issue": "ISS-20260525-014", "status": "completed", "execution": "EXC-022" }
+  ],
+  "gaps": [],
+  "antipatterns": [],
+  "fix_plans": [],
+  "human_verification": [],
+  "coverage_score": 1
+}

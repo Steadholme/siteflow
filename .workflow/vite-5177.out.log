@@ -1,0 +1,30 @@
+
+> siteflow-console@0.1.0 dev
+> vite --host 127.0.0.1 --port 5177
+
+
+  [32m[1mVITE[22m v5.4.21[39m  [2mready in [0m[1m312[22m[2m[0m ms[22m
+
+  [32m➜[39m  [1mLocal[22m:   [36mhttp://127.0.0.1:[1m5177[22m/[39m
+[2m[32m  ➜[39m[22m[2m  press [22m[1mh + enter[22m[2m to show help[22m
+[2m07:10:59[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.workflow/scratch/ui-design-siteflow-vercel-console-20260528/design-ref/prototypes/console.html[22m
+[2m07:12:13[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles/tokens.css[22m
+[2m07:12:13[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles/global.css[22m
+[2m07:12:13[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles/layout.css[22m
+[2m07:12:29[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/shell/SidebarNav.tsx[22m
+[2m07:12:29[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/shell/Topbar.tsx[22m
+[2m07:13:25[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/features/projects/projects.css[22m
+[2m07:13:25[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/features/deployments/deployments.css[22m
+[2m07:13:25[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/features/release/release.css[22m
+[2m07:39:09[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles/tokens.css[22m
+[2m07:39:09[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles/global.css[22m
+[2m07:39:09[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/shell/AppShell.tsx[22m
+[2m07:39:30[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles/layout.css[22m
+[2m07:39:30[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/shell/Topbar.tsx[22m
+[2m07:40:11[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/features/projects/ProjectListPage.tsx[22m
+[2m07:40:11[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/features/projects/components/ProjectInventoryTable.tsx[22m
+[2m07:40:30[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/features/projects/projects.css[22m
+[2m07:40:30[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/features/projects/ProjectDetailPage.tsx[22m
+[2m07:40:30[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/features/deployments/DeploymentDetailPage.tsx[22m
+[2m07:40:30[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/features/release/ReleaseConsolePage.tsx[22m
+[2m07:40:30[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/features/release/RollbackConsolePage.tsx[22m

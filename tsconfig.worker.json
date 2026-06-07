@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "skipLibCheck": true,
+    "outDir": "dist-worker",
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  "include": [
+    "worker/**/*.ts",
+    "server/migrations.ts",
+    "src/domain/siteflow.ts",
+    "src/lib/environmentTarget.ts",
+    "src/lib/redaction.ts",
+    "src/lib/sealedSecrets.ts"
+  ],
+  "exclude": ["worker/**/*.test.ts"]
+}

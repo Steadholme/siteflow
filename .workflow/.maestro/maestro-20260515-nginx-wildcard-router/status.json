@@ -1,0 +1,66 @@
+{
+  "session_id": "maestro-20260515-nginx-wildcard-router",
+  "source": "maestro",
+  "created_at": "2026-05-15T14:23:46+08:00",
+  "updated_at": "2026-05-15T14:27:51+08:00",
+  "intent": "Continue SiteFlow production iteration by rendering managed Nginx wildcard routing config",
+  "task_type": "feature",
+  "chain_name": "feature",
+  "phase": "managed-nginx-wildcard-router",
+  "auto_mode": true,
+  "exec_mode": "implementation",
+  "cli_tool": "codex",
+  "target": "cli/",
+  "context": {
+    "previous_session": ".workflow/.maestro/maestro-20260515-wildcard-domain",
+    "scope": "Installer dry-run should render managed Nginx config for control-plane and *.SITEFLOW_BASE_DOMAIN preview routing."
+  },
+  "waves": [
+    {
+      "wave_n": 1,
+      "steps": [0],
+      "status": "completed",
+      "summary": "Planned managed Nginx wildcard router rendering for installer dry-run."
+    },
+    {
+      "wave_n": 2,
+      "steps": [1],
+      "status": "completed",
+      "summary": "Implemented install asset renderers, install --base-domain parsing, install state router metadata, and dry-run rendered assets."
+    },
+    {
+      "wave_n": 3,
+      "steps": [2],
+      "status": "completed",
+      "summary": "Verified targeted CLI/router tests, production build, full Vitest suite, and Playwright e2e suite."
+    }
+  ],
+  "steps": [
+    {
+      "index": 0,
+      "skill": "maestro-plan",
+      "args": "--dir .workflow/design/siteflow-nginx-wildcard-router \"Plan managed Nginx wildcard router rendering\"",
+      "type": "skill",
+      "status": "completed",
+      "wave_n": 1
+    },
+    {
+      "index": 1,
+      "skill": "maestro-execute",
+      "args": "--scope cli/",
+      "type": "skill",
+      "status": "completed",
+      "wave_n": 2
+    },
+    {
+      "index": 2,
+      "skill": "maestro-verify",
+      "args": "--checks test,build",
+      "type": "skill",
+      "status": "completed",
+      "wave_n": 3
+    }
+  ],
+  "current_step": 3,
+  "status": "completed"
+}

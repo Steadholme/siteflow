@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SiteFlow Project Board - Operations Ledger</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="prototype.css">
+  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar"><div class="brand"><span class="brand-mark"><i data-lucide="workflow"></i></span>SiteFlow</div><nav class="nav"><a class="active"><i data-lucide="folder-kanban"></i>Projects</a><a><i data-lucide="git-pull-request"></i>Previews</a><a><i data-lucide="activity"></i>Events</a></nav></aside>
+    <div>
+      <header class="topbar"><div><div class="eyebrow">Projects / Environment lanes</div><h1 class="page-title">Operations board</h1></div><button class="btn primary"><i data-lucide="plus"></i>Bind repository</button></header>
+      <main class="main split-grid">
+        <section class="lane-grid" aria-label="Environment lanes">
+          <div class="panel"><div class="panel-header"><h2 class="panel-title">Production</h2><span class="status success">16 healthy</span></div><div class="panel-body stack">
+            <div class="row"><div class="row-main"><div class="row-title">docs-portal</div><div class="meta mono">prod -> dpl_4829</div></div><span class="status success">routed</span></div>
+            <div class="row"><div class="row-main"><div class="row-title">admin-console</div><div class="meta mono">prod -> dpl_4818</div></div><span class="status success">routed</span></div>
+            <div class="row"><div class="row-main"><div class="row-title">status-page</div><div class="meta mono">prod -> dpl_4809</div></div><span class="status error">drift</span></div>
+          </div></div>
+          <div class="panel"><div class="panel-header"><h2 class="panel-title">Staging</h2><span class="status info">6 candidates</span></div><div class="panel-body stack">
+            <div class="row"><div class="row-main"><div class="row-title">marketing-web</div><div class="meta mono">staging -> dpl_4826</div></div><span class="status warning">queued</span></div>
+            <div class="row"><div class="row-main"><div class="row-title">checkout-ui</div><div class="meta mono">staging -> dpl_4821</div></div><span class="status success">verified</span></div>
+          </div></div>
+          <div class="panel"><div class="panel-header"><h2 class="panel-title">Previews</h2><span class="status warning">31 active</span></div><div class="panel-body stack">
+            <div class="row"><div class="row-main"><div class="row-title">docs-portal / PR-284</div><div class="meta">retains 7 days after close</div></div><button class="btn">Open</button></div>
+            <div class="row"><div class="row-main"><div class="row-title">admin-console / release audit</div><div class="meta">updated 18m ago</div></div><button class="btn">Open</button></div>
+          </div></div>
+        </section>
+        <aside class="panel">
+          <div class="panel-header"><h2 class="panel-title">Recent control-plane events</h2><button class="btn"><i data-lucide="bell"></i></button></div>
+          <div class="panel-body timeline">
+            <div class="timeline-item"><span class="dot"></span><div><strong>Route revision rev-118 applied</strong><div class="meta">docs-portal production · Nginx reload 220ms</div></div></div>
+            <div class="timeline-item"><span class="dot"></span><div><strong>Artifact protected</strong><div class="meta">rollback window extended to 14 days</div></div></div>
+            <div class="timeline-item"><span class="dot"></span><div><strong>Webhook deduplicated</strong><div class="meta">GitHub delivery 9d4e was already processed</div></div></div>
+          </div>
+        </aside>
+      </main>
+    </div>
+  </div>
+  <script>lucide.createIcons();</script>
+</body>
+</html>

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SiteFlow Deployment Detail - Operations Ledger</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="prototype.css">
+  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar"><div class="brand"><span class="brand-mark"><i data-lucide="workflow"></i></span>SiteFlow</div><nav class="nav"><a><i data-lucide="folder-kanban"></i>Projects</a><a class="active"><i data-lucide="rocket"></i>Deployments</a><a><i data-lucide="terminal"></i>Workers</a></nav></aside>
+    <div>
+      <header class="topbar"><div><div class="eyebrow">Deployments / docs-portal</div><h1 class="page-title">dpl_4829</h1></div><div class="actions"><span class="status success">Routed</span><button class="btn"><i data-lucide="copy"></i>Copy URL</button></div></header>
+      <main class="main forensic-grid">
+        <section class="panel"><div class="panel-header"><h2 class="panel-title">Build timeline</h2></div><div class="panel-body timeline">
+          <div class="timeline-item"><span class="dot"></span><div><strong>Webhook accepted</strong><div class="meta">GitHub delivery 837a · signature verified</div></div></div>
+          <div class="timeline-item"><span class="dot"></span><div><strong>Worker claimed job</strong><div class="meta">worker-03 · 2 CPU · 2048 MB · 8m timeout</div></div></div>
+          <div class="timeline-item"><span class="dot"></span><div><strong>Artifact published</strong><div class="meta">58 MB · 1428 files · manifest v1</div></div></div>
+          <div class="timeline-item"><span class="dot"></span><div><strong>Route applied</strong><div class="meta">Nginx reload 220ms · previous config preserved</div></div></div>
+        </div></section>
+        <section class="panel"><div class="panel-header"><h2 class="panel-title">Build log</h2><button class="btn"><i data-lucide="download"></i>Download</button></div><pre class="log">08:14:01 clone repository github.com/acme/docs
+08:14:09 detect framework: next-static confidence=0.94
+08:14:12 install dependencies with pnpm
+08:15:44 run build command: pnpm build && pnpm export
+08:16:38 validate output directory: out/
+08:16:41 write manifest: 1428 files
+08:16:42 checksum sha256:91fa73c2...
+08:16:44 publish artifact to s3://siteflow-artifacts/docs-portal/dpl_4829
+08:16:45 job succeeded</pre></section>
+        <aside class="panel"><div class="panel-header"><h2 class="panel-title">Artifact proof</h2></div><div class="panel-body stack">
+          <div><span class="label">Checksum</span><div class="mono">sha256:91fa73c2d18e...</div></div>
+          <div><span class="label">Manifest</span><div>schema v1 · immutable</div></div>
+          <div><span class="label">Storage</span><div>s3-compatible · protected</div></div>
+          <div><span class="label">Release channel</span><div>production -> dpl_4829</div></div>
+          <button class="btn">Open manifest</button>
+        </div></aside>
+      </main>
+    </div>
+  </div>
+  <script>lucide.createIcons();</script>
+</body>
+</html>

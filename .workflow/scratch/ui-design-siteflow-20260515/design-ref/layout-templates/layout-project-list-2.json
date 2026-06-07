@@ -1,0 +1,12 @@
+{
+  "target": "project-list",
+  "variant_id": "layout-2",
+  "device_type": "responsive",
+  "design_philosophy": "Grouped project operations board with environment lanes and right-side activity inspector.",
+  "dom_structure": {
+    "tag": "body",
+    "children": ["app-shell", "sidebar-nav", "topbar", "main.board-layout", "lane-grid", "activity-inspector"]
+  },
+  "component_hierarchy": ["app-shell", "sidebar-nav", "topbar", "lane-grid", "project-row-cards", "activity-inspector"],
+  "css_layout_rules": "Mobile first. Stack lanes and inspector below 1024px. At 1280px, use grid-template-columns: minmax(0, 1fr) 340px. Lanes use equal minmax columns and compact row cards with fixed status zones."
+}

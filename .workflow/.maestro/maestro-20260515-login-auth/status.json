@@ -1,0 +1,66 @@
+{
+  "session_id": "maestro-20260515-login-auth",
+  "source": "maestro",
+  "created_at": "2026-05-15T14:06:43+08:00",
+  "updated_at": "2026-05-15T14:10:35+08:00",
+  "intent": "Add CLI login token config and server deploy auth",
+  "task_type": "feature",
+  "chain_name": "feature",
+  "phase": "prebuilt-deploy-auth",
+  "auto_mode": true,
+  "exec_mode": "implementation",
+  "cli_tool": "codex",
+  "target": "cli/,server/",
+  "context": {
+    "previous_session": ".workflow/.maestro/maestro-20260515-prebuilt-deploy",
+    "scope": "siteflow login stores server/token; deploy uses saved config; server validates Bearer token for mutations"
+  },
+  "waves": [
+    {
+      "wave_n": 1,
+      "status": "completed",
+      "summary": "Planned login config and mutation auth scope.",
+      "completed_at": "2026-05-15T14:06:43+08:00"
+    },
+    {
+      "wave_n": 2,
+      "status": "completed",
+      "summary": "Implemented CLI login config, deploy bearer tokens, auth verify endpoint, and server token enforcement.",
+      "completed_at": "2026-05-15T14:09:48+08:00"
+    },
+    {
+      "wave_n": 3,
+      "status": "completed",
+      "summary": "Verified with targeted tests, full tests, build, e2e, and compiled CLI login smoke.",
+      "completed_at": "2026-05-15T14:10:35+08:00"
+    }
+  ],
+  "steps": [
+    {
+      "index": 0,
+      "skill": "maestro-plan",
+      "args": "--dir .workflow/design/siteflow-login-auth \"Plan CLI login and deploy auth\"",
+      "type": "skill",
+      "status": "completed",
+      "wave_n": 1
+    },
+    {
+      "index": 1,
+      "skill": "maestro-execute",
+      "args": "--scope cli/,server/",
+      "type": "skill",
+      "status": "completed",
+      "wave_n": 2
+    },
+    {
+      "index": 2,
+      "skill": "maestro-verify",
+      "args": "--checks test,build,e2e,cli",
+      "type": "skill",
+      "status": "completed",
+      "wave_n": 3
+    }
+  ],
+  "current_step": 3,
+  "status": "completed"
+}

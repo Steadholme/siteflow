@@ -1,0 +1,146 @@
+{
+  "name": "SiteFlow Operations Ledger",
+  "mode": "light",
+  "colors": {
+    "brand": {
+      "primary": "oklch(42% 0.13 168)",
+      "primary_hover": "oklch(36% 0.13 168)",
+      "secondary": "oklch(46% 0.12 250)",
+      "accent": "oklch(58% 0.17 35)"
+    },
+    "surface": {
+      "background": "oklch(97% 0.006 250)",
+      "subtle": "oklch(94% 0.008 250)",
+      "elevated": "oklch(100% 0 0)",
+      "card": "oklch(100% 0 0)",
+      "overlay": "oklch(22% 0.025 250 / 0.72)"
+    },
+    "semantic": {
+      "success": "oklch(48% 0.14 152)",
+      "success_bg": "oklch(94% 0.045 152)",
+      "warning": "oklch(58% 0.15 78)",
+      "warning_bg": "oklch(95% 0.06 78)",
+      "error": "oklch(52% 0.18 28)",
+      "error_bg": "oklch(95% 0.045 28)",
+      "info": "oklch(48% 0.13 235)",
+      "info_bg": "oklch(94% 0.04 235)"
+    },
+    "text": {
+      "primary": "oklch(22% 0.025 250)",
+      "secondary": "oklch(40% 0.022 250)",
+      "tertiary": "oklch(53% 0.018 250)",
+      "inverse": "oklch(98% 0.004 250)"
+    },
+    "border": {
+      "default": "oklch(86% 0.012 250)",
+      "strong": "oklch(72% 0.018 250)",
+      "subtle": "oklch(92% 0.01 250)",
+      "focus": "oklch(54% 0.15 168)"
+    }
+  },
+  "typography": {
+    "font_family": {
+      "heading": "Inter, system-ui, sans-serif",
+      "body": "Inter, system-ui, sans-serif",
+      "mono": "\"JetBrains Mono\", \"SFMono-Regular\", Consolas, monospace"
+    },
+    "font_size": {
+      "xs": "0.75rem",
+      "sm": "0.8125rem",
+      "base": "0.875rem",
+      "md": "1rem",
+      "lg": "1.125rem",
+      "xl": "1.25rem",
+      "2xl": "1.5rem",
+      "3xl": "1.875rem"
+    },
+    "font_weight": {
+      "normal": "400",
+      "medium": "500",
+      "semibold": "600",
+      "bold": "700"
+    },
+    "line_height": {
+      "tight": "1.25",
+      "normal": "1.5",
+      "relaxed": "1.7"
+    },
+    "letter_spacing": {
+      "normal": "0",
+      "label": "0"
+    },
+    "combinations": {
+      "page-title": { "family": "heading", "size": "2xl", "weight": "semibold", "line_height": "tight", "letter_spacing": "normal" },
+      "section-title": { "family": "heading", "size": "lg", "weight": "semibold", "line_height": "tight", "letter_spacing": "normal" },
+      "body-regular": { "family": "body", "size": "base", "weight": "normal", "line_height": "normal", "letter_spacing": "normal" },
+      "body-emphasis": { "family": "body", "size": "base", "weight": "medium", "line_height": "normal", "letter_spacing": "normal" },
+      "caption": { "family": "body", "size": "xs", "weight": "medium", "line_height": "normal", "letter_spacing": "normal" },
+      "code": { "family": "mono", "size": "xs", "weight": "medium", "line_height": "normal", "letter_spacing": "normal" }
+    }
+  },
+  "spacing": {
+    "0": "0",
+    "1": "0.25rem",
+    "2": "0.5rem",
+    "3": "0.75rem",
+    "4": "1rem",
+    "5": "1.25rem",
+    "6": "1.5rem",
+    "8": "2rem",
+    "10": "2.5rem",
+    "12": "3rem",
+    "16": "4rem",
+    "20": "5rem",
+    "24": "6rem"
+  },
+  "opacity": {
+    "0": "0",
+    "20": "0.2",
+    "40": "0.4",
+    "60": "0.6",
+    "80": "0.8",
+    "100": "1"
+  },
+  "border_radius": {
+    "none": "0",
+    "sm": "4px",
+    "md": "6px",
+    "lg": "8px",
+    "xl": "8px",
+    "full": "9999px"
+  },
+  "shadows": {
+    "sm": "0 1px 2px oklch(22% 0.025 250 / 0.08)",
+    "md": "0 8px 20px oklch(22% 0.025 250 / 0.10)",
+    "focus": "0 0 0 3px oklch(54% 0.15 168 / 0.22)"
+  },
+  "component_styles": {
+    "button": {
+      "primary": { "bg": "brand.primary", "hover_bg": "brand.primary_hover", "color": "text.inverse", "padding": "0.5rem 0.75rem", "radius": "md", "weight": "600" },
+      "secondary": { "bg": "surface.elevated", "hover_bg": "surface.subtle", "color": "text.primary", "border": "border.default", "padding": "0.5rem 0.75rem", "radius": "md", "weight": "600" },
+      "danger": { "bg": "semantic.error", "color": "text.inverse", "padding": "0.5rem 0.75rem", "radius": "md", "weight": "600" }
+    },
+    "card": {
+      "default": { "bg": "surface.card", "padding": "1rem", "radius": "lg", "border": "border.default", "shadow": "sm" },
+      "dense": { "bg": "surface.card", "padding": "0.75rem", "radius": "md", "border": "border.subtle", "shadow": "none" }
+    },
+    "input": {
+      "default": { "border": "border.default", "padding": "0.5rem 0.625rem", "radius": "md", "bg": "surface.elevated" },
+      "focus": { "border": "border.focus", "shadow": "focus" },
+      "error": { "border": "semantic.error", "bg": "semantic.error_bg" }
+    },
+    "status": {
+      "success": { "bg": "semantic.success_bg", "color": "semantic.success" },
+      "warning": { "bg": "semantic.warning_bg", "color": "semantic.warning" },
+      "error": { "bg": "semantic.error_bg", "color": "semantic.error" },
+      "info": { "bg": "semantic.info_bg", "color": "semantic.info" }
+    }
+  },
+  "breakpoints": {
+    "sm": "640px",
+    "md": "768px",
+    "lg": "1024px",
+    "xl": "1280px",
+    "2xl": "1536px"
+  }
+}

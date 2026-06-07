@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SiteFlow Release Console - Operations Ledger</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="prototype.css">
+  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar"><div class="brand"><span class="brand-mark"><i data-lucide="workflow"></i></span>SiteFlow</div><nav class="nav"><a><i data-lucide="folder-kanban"></i>Projects</a><a class="active"><i data-lucide="rocket"></i>Release</a><a><i data-lucide="shield-alert"></i>Rollback</a></nav></aside>
+    <div>
+      <header class="topbar"><div><div class="eyebrow">docs-portal / production</div><h1 class="page-title">Promote deployment</h1></div><span class="status warning">requires reason</span></header>
+      <main class="main release-grid">
+        <section class="stack">
+          <div class="panel"><div class="panel-header"><h2 class="panel-title">Candidate deployment</h2><span class="status success">verified</span></div><div class="panel-body summary-grid">
+            <div><span class="label">Candidate</span><div class="metric-value mono">dpl_4831</div><div class="meta">main · 9aa31be · built 6m ago</div></div>
+            <div><span class="label">Current production</span><div class="metric-value mono">dpl_4829</div><div class="meta">route rev-118</div></div>
+            <div><span class="label">Artifact delta</span><div class="metric-value">+42</div><div class="meta">files changed, checksum verified</div></div>
+          </div></div>
+          <div class="panel"><div class="panel-header"><h2 class="panel-title">Safety checks</h2></div><div class="panel-body stack">
+            <div class="row"><span>Artifact manifest exists and checksum matches</span><span class="status success">pass</span></div>
+            <div class="row"><span>Nginx dry-run generated valid config</span><span class="status success">pass</span></div>
+            <div class="row"><span>Rollback target remains protected</span><span class="status success">pass</span></div>
+            <div class="row"><span>CDN adapter</span><span class="status info">disabled</span></div>
+          </div></div>
+        </section>
+        <aside class="panel"><div class="panel-header"><h2 class="panel-title">Audit reason</h2></div><div class="panel-body stack">
+          <label class="label" for="reason">Promotion reason</label>
+          <textarea id="reason" class="input" rows="5">Docs release 2026.05 with corrected deployment guide and new artifact retention section.</textarea>
+          <div class="row"><span>Operator</span><strong>chen</strong></div>
+          <div class="row"><span>Channel move</span><span class="mono">prod: dpl_4829 -> dpl_4831</span></div>
+          <div class="sticky-actions"><button class="btn primary"><i data-lucide="rocket"></i>Promote and apply route</button></div>
+        </div></aside>
+      </main>
+    </div>
+  </div>
+  <script>lucide.createIcons();</script>
+</body>
+</html>

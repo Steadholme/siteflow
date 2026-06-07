@@ -1,0 +1,104 @@
+import { GitBranch, GitCommit, PackageCheck, Rocket, Route } from "lucide-react";
+import type { ReactNode } from "react";
+
+import { Panel } from "@components/ui/Panel";
+import { StatusPill, type StatusTone } from "@components/ui/StatusPill";
+import type { DeploymentLineageReadModel } from "@domain/readModels";
+import {
+  artifactVerificationLabel,
+  artifactVerificationTone,
+  buildJobStatusLabel,
+  buildJobStatusTone,
+  deploymentStatusLabel,
+  deploymentStatusTone,
+  formatBytes,
+  formatDuration,
+  routeRevisionStatusLabel,
+  routeRevisionStatusTone,
+  shortenSha
+} from "../deploymentStatus";
+
+interface LineageStep {
+  id: string;
+  label: string;
+  title: string;
+  meta: string;
+  status: string;
+  tone: StatusTone;
+  icon: ReactNode;
+}
+
+export interface LineageChainProps {
+  lineage: DeploymentLineageReadModel;
+}
+
+export function LineageChain({ lineage }: LineageChainProps) {
+  const { sourceEvent, buildJob, artifact, deployment, routeRevision } = lineage;
+  const steps: LineageStep[] = [
+    {
+      id: "source_event",
+      label: "Source event",
+      title: sourceEvent.kind,
+      meta: `${sourceEvent.branch} ${shortenSha(sourceEvent.commitSha)} / delivery ${sourceEvent.providerDeliveryId}`,
+      status: sourceEvent.status === "accepted" ? "Accepted" : sourceEvent.status,
+      tone: sourceEvent.status === "accepted" ? "success" : "error",
+      icon: <GitCommit aria-hidden="true" size={18} />
+    },
+    {
+      id: "build_job",
+      label: "Build job",
+      title: buildJob.id,
+      meta: `${buildJob.framework} / ${formatDuration(buildJob.startedAt, buildJob.finishedAt)}`,
+      status: buildJobStatusLabel(buildJob.status),
+      tone: buildJobStatusTone(buildJob.status),
+      icon: <GitBranch aria-hidden="true" size={18} />
+    },
+    {
+      id: "artifact",
+      label: "Artifact",
+      title: shortenSha(artifact.manifest.checksum, 16),
+      meta: `${artifact.manifest.fileCount} files / ${formatBytes(artifact.manifest.totalBytes)}`,
+      status: artifactVerificationLabel(artifact.verificationStatus),
+      tone: artifactVerificationTone(artifact.verificationStatus),
+      icon: <PackageCheck aria-hidden="true" size={18} />
+    },
+    {
+      id: "deployment",
+      label: "Deployment",
+      title: deployment.id,
+      meta: `${deployment.environment} / ${formatDuration(deployment.createdAt, deployment.readyAt)}`,
+      status: deploymentStatusLabel(deployment.status),
+      tone: deploymentStatusTone(deployment.status),
+      icon: <Rocket aria-hidden="true" size={18} />
+    },
+    {
+      id: "route_revision",
+      label: "Route revision",
+      title: routeRevision?.id ?? "Not created",
+      meta: routeRevision ? `${routeRevision.channel} / previous ${routeRevision.previousDeploymentId ?? "none"}` : "Waiting for route planner",
+      status: routeRevisionStatusLabel(routeRevision?.status),
+      tone: routeRevisionStatusTone(routeRevision?.status),
+      icon: <Route aria-hidden="true" size={18} />
+    }
+  ];
+
+  return (
+    <Panel title="Deployment lineage" eyebrow="Evidence chain" className="deployment-lineage-panel">
+      <div className="deployment-lineage__scroll">
+        <ol className="deployment-lineage" aria-label="Deployment lineage">
+          {steps.map((step) => (
+            <li key={step.id} className="deployment-lineage__step" data-lineage-id={step.id}>
+              <div className="deployment-lineage__icon">{step.icon}</div>
+              <div>
+                <span className="deployment-lineage__label">{step.label}</span>
+                <strong className="deployment-lineage__title">{step.title}</strong>
+                <span className="deployment-lineage__meta">{step.meta}</span>
+              </div>
+              <StatusPill tone={step.tone}>{step.status}</StatusPill>
+            </li>
+          ))}
+        </ol>
+      </div>
+    </Panel>
+  );
+}
