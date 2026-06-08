@@ -1,4 +1,5 @@
 import type { ReleaseChannelName, SiteFlowId } from "@domain/siteflow";
+import { redactString } from "@lib/redaction";
 import type {
   AnalyticsDashboardReadModel,
   AnalyticsIngestReadModel,
@@ -98,13 +99,19 @@ import type {
 } from "./siteflowClient";
 
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+type AuthTokenProvider = () => string | null | undefined | Promise<string | null | undefined>;
 
 export interface HttpSiteFlowClientOptions {
   baseUrl: string;
+  authToken?: string;
   fetch?: FetchLike;
+  getAuthToken?: AuthTokenProvider;
 }
 
 export class SiteFlowHttpError extends Error {
+  readonly isUnauthorized: boolean;
+  readonly isForbidden: boolean;
+
   constructor(
     readonly status: number,
     readonly path: string,
@@ -112,6 +119,8 @@ export class SiteFlowHttpError extends Error {
   ) {
     super(message);
     this.name = "SiteFlowHttpError";
+    this.isUnauthorized = status === 401;
+    this.isForbidden = status === 403;
   }
 }
 
@@ -123,21 +132,33 @@ function endpoint(path: string) {
   return path.startsWith("/") ? path : `/${path}`;
 }
 
+function isMutatingMethod(method: string | undefined) {
+  const normalizedMethod = (method ?? "GET").toUpperCase();
+  return normalizedMethod === "POST" || normalizedMethod === "PUT" || normalizedMethod === "PATCH" || normalizedMethod === "DELETE";
+}
+
 async function responseMessage(response: Response) {
   const contentType = response.headers.get("content-type") ?? "";
 
-  if (contentType.includes("application/json")) {
-    const body = (await response.json().catch(() => undefined)) as { message?: string; error?: string } | undefined;
-    return body?.message ?? body?.error ?? response.statusText;
+  if (contentType.includes("application/json") || contentType.includes("+json")) {
+    const body = (await response.json().catch(() => undefined)) as { message?: unknown; error?: unknown } | undefined;
+    const message = typeof body?.message === "string"
+      ? body.message
+      : typeof body?.error === "string"
+        ? body.error
+        : response.statusText;
+    return redactString(message);
   }
 
   const body = await response.text().catch(() => "");
-  return body || response.statusText;
+  return redactString(body || response.statusText);
 }
 
 export class HttpSiteFlowClient implements SiteFlowClient {
   private readonly baseUrl: string;
   private readonly fetchImpl: FetchLike;
+  private readonly authToken?: string;
+  private readonly getAuthToken?: AuthTokenProvider;
 
   constructor(options: HttpSiteFlowClientOptions) {
     if (!options.baseUrl.trim()) {
@@ -146,6 +167,8 @@ export class HttpSiteFlowClient implements SiteFlowClient {
 
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
     this.fetchImpl = options.fetch ?? fetch.bind(globalThis);
+    this.authToken = options.authToken;
+    this.getAuthToken = options.getAuthToken;
   }
 
   listProjects(): Promise<ProjectListReadModel> {
@@ -633,6 +656,8 @@ export class HttpSiteFlowClient implements SiteFlowClient {
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const url = new URL(endpoint(path), `${this.baseUrl}/`);
     const headers = new Headers(init.headers);
+    const authToken = await this.resolveAuthToken();
+    const credentials = init.credentials ?? "same-origin";
 
     headers.set("accept", "application/json");
 
@@ -640,10 +665,18 @@ export class HttpSiteFlowClient implements SiteFlowClient {
       headers.set("content-type", "application/json");
     }
 
+    if (authToken && !headers.has("authorization")) {
+      headers.set("authorization", `Bearer ${authToken}`);
+    }
+
+    if (isMutatingMethod(init.method) && credentials !== "omit" && !headers.has("authorization") && !headers.has("x-siteflow-csrf")) {
+      headers.set("x-siteflow-csrf", "same-origin");
+    }
+
     const response = await this.fetchImpl(url, {
       ...init,
       headers,
-      credentials: init.credentials ?? "same-origin"
+      credentials
     });
 
     if (!response.ok) {
@@ -655,5 +688,18 @@ export class HttpSiteFlowClient implements SiteFlowClient {
     }
 
     return (await response.json()) as T;
+  }
+
+  private async resolveAuthToken() {
+    const configuredToken = this.authToken?.trim();
+
+    if (configuredToken) {
+      return configuredToken;
+    }
+
+    const token = await this.getAuthToken?.();
+    const trimmed = token?.trim();
+
+    return trimmed || undefined;
   }
 }

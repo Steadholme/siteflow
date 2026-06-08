@@ -28,6 +28,34 @@ interface BuildJobClaimRow {
   environment_variables: Record<string, string> | null;
 }
 
+export interface PostgresBuildQueueOptions {
+  leaseMs?: number;
+}
+
+interface ClaimedBuildLease {
+  workerId: string;
+}
+
+interface BuildJobAttemptRow {
+  attempt_count: number;
+  max_attempts: number;
+}
+
+const DEFAULT_BUILD_JOB_LEASE_MS = 30 * 60 * 1000;
+const EXHAUSTED_BUILD_LEASE_FAILURE_REASON = "Build lease expired after max attempts.";
+
+function normalizeLeaseMs(value: number | undefined) {
+  if (value === undefined) {
+    return DEFAULT_BUILD_JOB_LEASE_MS;
+  }
+
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error("Postgres build queue leaseMs must be a positive number.");
+  }
+
+  return Math.ceil(value);
+}
+
 function defaultRepository(row: BuildJobClaimRow): RepositoryBinding {
   return {
     provider: "generic",
@@ -201,13 +229,43 @@ async function upsertBuildCronJob(client: { query: (text: string, values?: unkno
 }
 
 export class PostgresBuildQueue implements BuildQueue {
-  constructor(private readonly pool: Pool) {}
+  private readonly leaseMs: number;
+  private readonly claimedBuildLeases = new WeakMap<QueuedBuildJob, ClaimedBuildLease>();
+
+  constructor(private readonly pool: Pool, options: PostgresBuildQueueOptions = {}) {
+    this.leaseMs = normalizeLeaseMs(options.leaseMs);
+  }
+
+  private claimedWorkerId(job: QueuedBuildJob, action: string) {
+    const lease = this.claimedBuildLeases.get(job);
+
+    if (!lease?.workerId) {
+      throw new Error(`Cannot ${action} build job ${job.id} without an active local worker lease.`);
+    }
+
+    return lease.workerId;
+  }
 
   async claimNextJob(workerId: string): Promise<QueuedBuildJob | undefined> {
     const client = await this.pool.connect();
 
     try {
       await client.query("BEGIN");
+
+      await client.query(
+        `
+          UPDATE siteflow_build_jobs
+          SET status = 'failed',
+              finished_at = now(),
+              locked_until = NULL,
+              heartbeat_at = now(),
+              failure_reason = $1
+          WHERE status = 'running'
+            AND (locked_until IS NULL OR locked_until <= now())
+            AND attempt_count >= max_attempts
+        `,
+        [EXHAUSTED_BUILD_LEASE_FAILURE_REASON]
+      );
 
       const result = await client.query<BuildJobClaimRow>(
         `
@@ -249,7 +307,14 @@ export class PostgresBuildQueue implements BuildQueue {
           FROM siteflow_build_jobs build
           JOIN siteflow_projects project ON project.id = build.project_id
           JOIN siteflow_source_events source ON source.id = build.source_event_id
-          WHERE build.status = 'queued'
+          WHERE (
+              build.status = 'queued'
+              OR (
+                build.status = 'running'
+                AND (build.locked_until IS NULL OR build.locked_until <= now())
+              )
+            )
+            AND build.attempt_count < build.max_attempts
           ORDER BY build.queued_at ASC
           FOR UPDATE OF build SKIP LOCKED
           LIMIT 1
@@ -267,15 +332,21 @@ export class PostgresBuildQueue implements BuildQueue {
           UPDATE siteflow_build_jobs
           SET status = 'running',
               worker_id = $2,
-              started_at = COALESCE(started_at, now()),
+              started_at = now(),
+              heartbeat_at = now(),
+              locked_until = now() + ($3::integer * interval '1 millisecond'),
+              attempt_count = attempt_count + 1,
+              finished_at = NULL,
               failure_reason = NULL
           WHERE id = $1
         `,
-        [row.job_id, workerId]
+        [row.job_id, workerId, this.leaseMs]
       );
 
       await client.query("COMMIT");
-      return queueJobFromRow(row);
+      const job = queueJobFromRow(row);
+      this.claimedBuildLeases.set(job, { workerId });
+      return job;
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
@@ -294,21 +365,48 @@ export class PostgresBuildQueue implements BuildQueue {
     );
   }
 
+  async heartbeatJob(job: QueuedBuildJob): Promise<void> {
+    const workerId = this.claimedWorkerId(job, "renew");
+
+    await this.pool.query(
+      `
+        UPDATE siteflow_build_jobs
+        SET heartbeat_at = now(),
+            locked_until = now() + ($2::integer * interval '1 millisecond')
+        WHERE id = $1
+          AND status = 'running'
+          AND worker_id = $3
+      `,
+      [job.id, this.leaseMs, workerId]
+    );
+  }
+
   async completeJob(job: QueuedBuildJob, result: BuildJobResult): Promise<void> {
+    const workerId = this.claimedWorkerId(job, "complete");
     const client = await this.pool.connect();
 
     try {
       await client.query("BEGIN");
-      await client.query(
+      const markSucceeded = await client.query(
         `
           UPDATE siteflow_build_jobs
           SET status = 'succeeded',
               finished_at = now(),
+              locked_until = NULL,
+              heartbeat_at = now(),
               failure_reason = NULL
           WHERE id = $1
+            AND status = 'running'
+            AND worker_id = $2
         `,
-        [job.id]
+        [job.id, workerId]
       );
+
+      if (markSucceeded.rowCount === 0) {
+        await client.query("COMMIT");
+        this.claimedBuildLeases.delete(job);
+        return;
+      }
 
       await client.query(
         `
@@ -359,6 +457,7 @@ export class PostgresBuildQueue implements BuildQueue {
       }
 
       await client.query("COMMIT");
+      this.claimedBuildLeases.delete(job);
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
@@ -368,28 +467,91 @@ export class PostgresBuildQueue implements BuildQueue {
   }
 
   async skipJob(job: QueuedBuildJob, reason: string): Promise<void> {
+    const workerId = this.claimedWorkerId(job, "skip");
+
     await this.pool.query(
       `
         UPDATE siteflow_build_jobs
         SET status = 'skipped',
             finished_at = now(),
+            locked_until = NULL,
+            heartbeat_at = now(),
             failure_reason = $2
         WHERE id = $1
+          AND status = 'running'
+          AND worker_id = $3
       `,
-      [job.id, redactLogLine(reason)]
+      [job.id, redactLogLine(reason), workerId]
     );
+    this.claimedBuildLeases.delete(job);
   }
 
   async failJob(job: QueuedBuildJob, reason: string): Promise<void> {
-    await this.pool.query(
-      `
-        UPDATE siteflow_build_jobs
-        SET status = 'failed',
-            finished_at = now(),
-            failure_reason = $2
-        WHERE id = $1
-      `,
-      [job.id, redactLogLine(reason)]
-    );
+    const workerId = this.claimedWorkerId(job, "fail");
+    const client = await this.pool.connect();
+    const failureReason = redactLogLine(reason);
+
+    try {
+      await client.query("BEGIN");
+
+      const attemptResult = await client.query<BuildJobAttemptRow>(
+        `
+          SELECT attempt_count, max_attempts
+          FROM siteflow_build_jobs
+          WHERE id = $1
+            AND status = 'running'
+            AND worker_id = $2
+          FOR UPDATE
+        `,
+        [job.id, workerId]
+      );
+      const attempt = attemptResult.rows[0];
+
+      if (!attempt) {
+        await client.query("COMMIT");
+        this.claimedBuildLeases.delete(job);
+        return;
+      }
+
+      if (attempt.attempt_count < attempt.max_attempts) {
+        await client.query(
+          `
+            UPDATE siteflow_build_jobs
+            SET status = 'queued',
+                queued_at = now(),
+                finished_at = NULL,
+                worker_id = NULL,
+                locked_until = NULL,
+                heartbeat_at = now(),
+                failure_reason = $2
+            WHERE id = $1
+              AND worker_id = $3
+          `,
+          [job.id, failureReason, workerId]
+        );
+      } else {
+        await client.query(
+          `
+            UPDATE siteflow_build_jobs
+            SET status = 'failed',
+                finished_at = now(),
+                locked_until = NULL,
+                heartbeat_at = now(),
+                failure_reason = $2
+            WHERE id = $1
+              AND worker_id = $3
+          `,
+          [job.id, failureReason, workerId]
+        );
+      }
+
+      await client.query("COMMIT");
+      this.claimedBuildLeases.delete(job);
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 }

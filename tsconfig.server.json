@@ -20,6 +20,7 @@
     "src/domain/readModels.ts",
     "src/lib/api/siteflowClient.ts",
     "src/lib/environmentTarget.ts",
+    "src/lib/observabilityMetrics.ts",
     "src/lib/sealedSecrets.ts"
   ],
   "exclude": ["server/**/*.test.ts", "src/**/*.test.tsx", "src/**/*.test.ts"]

@@ -22,6 +22,7 @@ export type DeployHookStatus = "active" | "revoked";
 export type CronJobStatus = "active" | "disabled";
 export type CronDispatchStatus = "queued" | "succeeded" | "failed";
 export type FunctionRuntime = "nodejs20.x";
+export type FunctionRuntimeIsolation = "same_process" | "isolated_process";
 export type FunctionInvocationStatus = "succeeded" | "failed";
 export type AnalyticsEventKind = "pageview" | "custom" | "web_vital";
 export type WebVitalName = "CLS" | "FCP" | "FID" | "INP" | "LCP" | "TTFB";
@@ -32,6 +33,7 @@ export type LogDrainDeliveryStatus = "delivered" | "failed";
 export type TeamRole = "owner" | "member" | "developer" | "viewer";
 export type PermissionScope = "read" | "write" | "admin";
 export type ApiTokenStatus = "active" | "revoked";
+export type OperatorSessionStatus = "active" | "revoked" | "expired";
 export type FirewallRuleAction = "allow" | "block" | "challenge";
 export type FirewallRuleStatus = "active" | "disabled";
 export type FirewallDecision = "allow" | "block" | "challenge";
@@ -281,6 +283,18 @@ export interface CdnOperation {
   message?: string;
 }
 
+export interface ReleaseEvidenceMetadata {
+  evidencePath: string;
+  checkedAt: IsoTimestamp;
+  status: "passed";
+  commitRef: string;
+  repository: string;
+  branch: string;
+  targetEnvironment: string;
+  releaseTicket?: string;
+  operatorName?: string;
+}
+
 export interface RouteRevision {
   id: SiteFlowId;
   projectId: SiteFlowId;
@@ -290,6 +304,7 @@ export interface RouteRevision {
   previousDeploymentId?: SiteFlowId;
   generatedConfig: string;
   validationSummary: string;
+  releaseEvidence?: ReleaseEvidenceMetadata;
   createdAt: IsoTimestamp;
   appliedAt?: IsoTimestamp;
   failedReason?: string;
@@ -378,6 +393,7 @@ export interface FunctionEntrypoint {
   path: string;
   sourcePath: string;
   runtime: FunctionRuntime;
+  runtimeIsolation?: FunctionRuntimeIsolation;
   handler: "default" | "handler";
   methods?: string[];
   timeoutMs?: number;
@@ -495,6 +511,20 @@ export interface ApiToken {
   createdBy?: Actor;
   createdAt: IsoTimestamp;
   updatedAt: IsoTimestamp;
+  revokedAt?: IsoTimestamp;
+  lastUsedAt?: IsoTimestamp;
+}
+
+export interface OperatorSession {
+  id: SiteFlowId;
+  subject: string;
+  actor?: Actor;
+  tokenPrefix: string;
+  scopes: PermissionScope[];
+  projectIds?: SiteFlowId[];
+  status: OperatorSessionStatus;
+  createdAt: IsoTimestamp;
+  expiresAt: IsoTimestamp;
   revokedAt?: IsoTimestamp;
   lastUsedAt?: IsoTimestamp;
 }

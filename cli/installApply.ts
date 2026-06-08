@@ -264,7 +264,7 @@ function apiPort(plan: InstallPlan) {
 }
 
 function healthUrl(plan: InstallPlan) {
-  return `http://127.0.0.1:${apiPort(plan)}/healthz`;
+  return `http://127.0.0.1:${apiPort(plan)}/readyz`;
 }
 
 function sleep(milliseconds: number) {

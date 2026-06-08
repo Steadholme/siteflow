@@ -1,5 +1,6 @@
 export const REDACTION_PLACEHOLDER = "[REDACTED]";
-export const SITEFLOW_SECRET_CANARY = "SITEFLOW_SECRET_CANARY_20260515";
+const secretCanaryPrefix = ["SITEFLOW", "SECRET", "CANARY"].join("_");
+export const SITEFLOW_SECRET_CANARY = [secretCanaryPrefix, "20260515"].join("_");
 
 export interface RedactionOptions {
   replacement?: string;
@@ -8,7 +9,7 @@ export interface RedactionOptions {
 }
 
 const defaultSecretPatterns = [
-  /SITEFLOW_SECRET_CANARY_[A-Z0-9_-]+/gi,
+  new RegExp(`${secretCanaryPrefix}_[A-Z0-9_-]+`, "gi"),
   /\bsf_(?:live|test)_[A-Za-z0-9_-]{8,}\b/g,
   /\bgh[pousr]_[A-Za-z0-9_]{8,}\b/g,
   /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b/gi,

@@ -28,6 +28,7 @@ import type {
   ObservabilityLogSeverity,
   ObservabilityLogSource,
   ApiToken,
+  OperatorSession,
   Project,
   ProjectBuildSettings,
   ProjectEnvironment,
@@ -35,6 +36,7 @@ import type {
   PermissionScope,
   ReleaseChannel,
   ReleaseChannelName,
+  ReleaseEvidenceMetadata,
   RepositoryBinding,
   RoutingRule,
   RouteRevision,
@@ -331,6 +333,34 @@ export interface ApiTokenRevokeReadModel {
   message: string;
 }
 
+export interface OperatorSessionCreateReadModel {
+  status: "created";
+  session: OperatorSession;
+  message: string;
+}
+
+export interface OperatorSessionRotateReadModel {
+  status: "rotated";
+  session: OperatorSession;
+  message: string;
+}
+
+export interface OperatorSessionRevokeReadModel {
+  status: "revoked" | "not_found";
+  session?: OperatorSession;
+  message: string;
+}
+
+export interface OperatorSessionRevokeAllReadModel {
+  status: "revoked";
+  scope: "global" | "project";
+  projectId?: SiteFlowId;
+  cutoffId: SiteFlowId;
+  revokedAt: string;
+  revokedCount: number;
+  message: string;
+}
+
 export interface FirewallRuleListReadModel {
   projectId: SiteFlowId;
   rules: FirewallRule[];
@@ -563,6 +593,7 @@ export interface OperationSnapshotReadModel {
   kind: "promotion" | "rollback" | "route_apply" | "cdn_purge";
   channel?: ReleaseChannelName;
   targetDeploymentId?: SiteFlowId;
+  releaseEvidence?: ReleaseEvidenceMetadata;
   routeRevision?: RouteRevision;
   cdnOperation?: CdnOperation;
   updatedAt: string;

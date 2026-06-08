@@ -1,0 +1,364 @@
+name: Release Preflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_ref:
+        description: Exact release commit SHA to verify.
+        required: true
+        type: string
+      repo:
+        description: Repository in owner/name form.
+        required: true
+        type: string
+      branch:
+        description: Protected release branch.
+        required: true
+        default: main
+        type: string
+      target_environment:
+        description: Release evidence target environment.
+        required: true
+        default: production
+        type: choice
+        options:
+          - production
+          - staging
+          - preview
+      public_base_url:
+        description: Public SiteFlow base URL used by target evidence collectors.
+        required: true
+        type: string
+      direct_api_url:
+        description: Direct API URL used to prove ingress isolation and direct-port blocking.
+        required: true
+        type: string
+      siteflow_api_url:
+        description: SiteFlow API base URL used to inspect the candidate deployment artifact lineage.
+        required: true
+        type: string
+      candidate_deployment_id:
+        description: Candidate deployment id whose artifact manifest is being promoted.
+        required: true
+        type: string
+      release_image_run_id:
+        description: GitHub Actions run id that uploaded release-image-evidence for this exact commit.
+        required: true
+        type: string
+      trust_proxy_policy:
+        description: Expected SITEFLOW_TRUST_PROXY policy for ingress evidence.
+        required: true
+        default: loopback
+        type: string
+      api_instance_count:
+        description: API service instance or replica count behind the target ingress.
+        required: true
+        default: "1"
+        type: string
+      api_process_count:
+        description: API process count serving the target release.
+        required: true
+        default: "1"
+        type: string
+      ingress_count:
+        description: Ingress or proxy entrypoint count for the target release.
+        required: true
+        default: "1"
+        type: string
+      api_rate_limit_scope:
+        description: API limiter scope, for example edge, shared, global, distributed, or process_local.
+        required: true
+        default: edge
+        type: string
+      api_rate_limit_enforcement_point:
+        description: API limiter enforcement point, for example edge, proxy, load_balancer, gateway, ingress, cdn, or api.
+        required: true
+        default: ingress
+        type: string
+      build_image:
+        description: Target worker Docker build image for release build rehearsal. Must be pinned with @sha256.
+        required: true
+        type: string
+      docker_socket_profile_accepted:
+        description: Explicit acceptance that the target worker uses the trusted single-host Docker socket profile.
+        required: true
+        default: false
+        type: boolean
+      observability_target_stack_api_url:
+        description: Optional target observability stack API URL for Prometheus/Grafana/Alertmanager proof.
+        required: false
+        type: string
+      operator_name:
+        description: Operator name recorded in the evidence pack.
+        required: true
+        type: string
+      release_ticket:
+        description: Change ticket or release ticket recorded in the evidence pack.
+        required: true
+        type: string
+      required_status_check:
+        description: Protected CI check name required on the release branch.
+        required: false
+        default: Install, test, and build
+        type: string
+
+permissions:
+  contents: read
+  checks: read
+  actions: read
+
+jobs:
+  preflight:
+    name: Release promotion preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ inputs.target_environment }}
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_ref }}
+
+      - name: Validate release inputs
+        env:
+          INPUT_REPO: ${{ inputs.repo }}
+          INPUT_COMMIT_REF: ${{ inputs.commit_ref }}
+          INPUT_BUILD_IMAGE: ${{ inputs.build_image }}
+          INPUT_DOCKER_SOCKET_PROFILE_ACCEPTED: ${{ inputs.docker_socket_profile_accepted }}
+          CHECKOUT_REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ "$INPUT_REPO" != "$CHECKOUT_REPOSITORY" ]; then
+            echo "repo input must match the checked-out GitHub repository: $CHECKOUT_REPOSITORY." >&2
+            exit 1
+          fi
+
+          checked_out_commit="$(git rev-parse HEAD)"
+          if [ "$checked_out_commit" != "$INPUT_COMMIT_REF" ]; then
+            echo "commit_ref must be the exact checked-out commit SHA." >&2
+            echo "checked out: $checked_out_commit" >&2
+            echo "input:       $INPUT_COMMIT_REF" >&2
+            exit 1
+          fi
+
+          case "$INPUT_BUILD_IMAGE" in
+            *@sha256:*) ;;
+            *)
+              echo "build_image must be pinned by digest, for example node:20-bookworm-slim@sha256:<digest>." >&2
+              exit 1
+              ;;
+          esac
+
+          if [ "$INPUT_DOCKER_SOCKET_PROFILE_ACCEPTED" != "true" ]; then
+            echo "docker_socket_profile_accepted must be true to run target evidence with the trusted single-host Docker socket worker profile." >&2
+            exit 1
+          fi
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Release dependency policy
+        run: npm run --silent release:dependency:policy -- --json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Assert release source tree policy
+        run: npm run --silent release:source:check -- --json
+
+      - name: Build release tooling and app
+        run: npm run build
+
+      - name: Assert build leaves release source clean
+        run: |
+          status="$(git status --short)"
+          if [ -n "$status" ]; then
+            echo "Release preflight requires npm ci and npm run build to leave the checkout clean before secrets are decoded." >&2
+            echo "$status" >&2
+            exit 1
+          fi
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run release safeguards E2E
+        run: npm run test:e2e
+
+      - name: Prepare evidence directory
+        run: |
+          SITEFLOW_PREFLIGHT_DIR="$RUNNER_TEMP/siteflow-release-preflight"
+          SITEFLOW_PRIVATE_DIR="$RUNNER_TEMP/siteflow-release-private"
+          SITEFLOW_SECRET_DIR="$RUNNER_TEMP/siteflow-release-secrets"
+          SITEFLOW_TARGET_ENV_FILE="$SITEFLOW_SECRET_DIR/target.env"
+          echo "SITEFLOW_PREFLIGHT_DIR=$SITEFLOW_PREFLIGHT_DIR" >> "$GITHUB_ENV"
+          echo "SITEFLOW_PRIVATE_DIR=$SITEFLOW_PRIVATE_DIR" >> "$GITHUB_ENV"
+          echo "SITEFLOW_TARGET_ENV_FILE=$SITEFLOW_TARGET_ENV_FILE" >> "$GITHUB_ENV"
+          mkdir -p "$SITEFLOW_PREFLIGHT_DIR" "$SITEFLOW_PRIVATE_DIR" "$SITEFLOW_SECRET_DIR"
+          chmod 700 "$SITEFLOW_PRIVATE_DIR" "$SITEFLOW_SECRET_DIR"
+
+      - name: Collect candidate deployment detail
+        env:
+          SITEFLOW_API_TOKEN: ${{ secrets.SITEFLOW_API_TOKEN }}
+        run: |
+          if [ -z "$SITEFLOW_API_TOKEN" ]; then
+            echo "SITEFLOW_API_TOKEN secret is required to inspect the candidate deployment." >&2
+            exit 1
+          fi
+          npm run siteflow -- inspect "${{ inputs.candidate_deployment_id }}" \
+            --server "${{ inputs.siteflow_api_url }}" \
+            --json > "$SITEFLOW_PRIVATE_DIR/deployment-detail.json"
+
+      - name: Check release artifacts
+        run: |
+          npm run --silent release:artifacts:check -- \
+            --json \
+            --manifest "$SITEFLOW_PREFLIGHT_DIR/release-artifact-manifest.json" \
+            --deployment-detail "$SITEFLOW_PRIVATE_DIR/deployment-detail.json" \
+            --write-deployment-artifact-manifest "$SITEFLOW_PREFLIGHT_DIR/deployment-artifact-manifest.json" \
+            --commit-ref "${{ inputs.commit_ref }}" \
+            --repo "${{ inputs.repo }}" \
+            --branch "${{ inputs.branch }}" \
+            --target-environment "${{ inputs.target_environment }}" \
+            > "$SITEFLOW_PREFLIGHT_DIR/release-artifact-evidence.json"
+
+      - name: Write target env file from secret
+        env:
+          SITEFLOW_RELEASE_ENV_FILE_B64: ${{ secrets.SITEFLOW_RELEASE_ENV_FILE_B64 }}
+        run: |
+          if [ -z "$SITEFLOW_RELEASE_ENV_FILE_B64" ]; then
+            echo "SITEFLOW_RELEASE_ENV_FILE_B64 secret is required for promotion preflight." >&2
+            exit 1
+          fi
+          printf '%s' "$SITEFLOW_RELEASE_ENV_FILE_B64" | base64 --decode > "$SITEFLOW_TARGET_ENV_FILE"
+          chmod 600 "$SITEFLOW_TARGET_ENV_FILE"
+
+      - name: Collect release gate promotion evidence
+        env:
+          GITHUB_TOKEN: ${{ secrets.SITEFLOW_RELEASE_GITHUB_TOKEN || github.token }}
+          GITHUB_REPOSITORY: ${{ inputs.repo }}
+        run: |
+          npm run siteflow -- release-gate \
+            --promotion \
+            --env-file "$SITEFLOW_TARGET_ENV_FILE" \
+            --repo "${{ inputs.repo }}" \
+            --branch "${{ inputs.branch }}" \
+            --commit-ref "${{ inputs.commit_ref }}" \
+            --required-status-check "${{ inputs.required_status_check }}" \
+            --require-commit-status \
+            --json > "$SITEFLOW_PREFLIGHT_DIR/release-gate.json"
+
+      - name: Generate release evidence rehearsal pack
+        env:
+          OBSERVABILITY_TARGET_STACK_API_URL: ${{ inputs.observability_target_stack_api_url }}
+        run: |
+          args=(
+            npm run --silent release:evidence:rehearsal-pack --
+            --commit-ref "${{ inputs.commit_ref }}"
+            --repo "${{ inputs.repo }}"
+            --branch "${{ inputs.branch }}"
+            --target-env-file "$SITEFLOW_TARGET_ENV_FILE"
+            --target-environment "${{ inputs.target_environment }}"
+            --public-base-url "${{ inputs.public_base_url }}"
+            --operator-name "${{ inputs.operator_name }}"
+            --release-ticket "${{ inputs.release_ticket }}"
+            --required-status-check "${{ inputs.required_status_check }}"
+            --docker-socket-profile-accepted
+            --output-dir "$SITEFLOW_PREFLIGHT_DIR"
+            --json
+          )
+          if [ -n "$OBSERVABILITY_TARGET_STACK_API_URL" ]; then
+            args+=(--observability-target-stack-api-url "$OBSERVABILITY_TARGET_STACK_API_URL")
+            args+=(--observability-target-stack-token-env SITEFLOW_OBSERVABILITY_STACK_TOKEN)
+          fi
+          "${args[@]}" > "$SITEFLOW_PREFLIGHT_DIR/release-evidence-rehearsal-pack.out.json"
+
+      - name: Execute release evidence target run
+        env:
+          GITHUB_TOKEN: ${{ secrets.SITEFLOW_RELEASE_GITHUB_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.SITEFLOW_RELEASE_GITHUB_TOKEN || github.token }}
+          GITHUB_REPOSITORY: ${{ inputs.repo }}
+          SITEFLOW_RUN_DOCKER_BUILD_REHEARSAL: "1"
+          SITEFLOW_BUILD_IMAGE: ${{ inputs.build_image }}
+          SITEFLOW_BUILD_IMAGE_ALLOWLIST: ${{ inputs.build_image }}
+          SITEFLOW_RUN_POSTGRES_INTEGRATION: "1"
+          TEST_DATABASE_URL: ${{ secrets.SITEFLOW_TEST_DATABASE_URL }}
+          SITEFLOW_METRICS_TOKEN: ${{ secrets.SITEFLOW_METRICS_TOKEN }}
+          SITEFLOW_OBSERVABILITY_STACK_TOKEN: ${{ secrets.SITEFLOW_OBSERVABILITY_STACK_TOKEN }}
+          SITEFLOW_DIRECT_API_URL: ${{ inputs.direct_api_url }}
+          SITEFLOW_RELEASE_IMAGE_RUN_ID: ${{ inputs.release_image_run_id }}
+          SITEFLOW_TRUST_PROXY: ${{ inputs.trust_proxy_policy }}
+          SITEFLOW_API_INSTANCE_COUNT: ${{ inputs.api_instance_count }}
+          SITEFLOW_API_PROCESS_COUNT: ${{ inputs.api_process_count }}
+          SITEFLOW_INGRESS_COUNT: ${{ inputs.ingress_count }}
+          SITEFLOW_API_RATE_LIMIT_SCOPE: ${{ inputs.api_rate_limit_scope }}
+          SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT: ${{ inputs.api_rate_limit_enforcement_point }}
+        run: |
+          npm run --silent release:evidence:target-run -- \
+            --pack "$SITEFLOW_PREFLIGHT_DIR/release-evidence-rehearsal-pack.json" \
+            --confirm-target-environment "${{ inputs.target_environment }}" \
+            --run-record "$SITEFLOW_PREFLIGHT_DIR/release-evidence-target-run.json" \
+            --gap-report-dir "$SITEFLOW_PREFLIGHT_DIR/gap-reports" \
+            --set-env direct-api-url=SITEFLOW_DIRECT_API_URL \
+            --set-env release-image-run-id=SITEFLOW_RELEASE_IMAGE_RUN_ID \
+            --set-env SITEFLOW_TRUST_PROXY=SITEFLOW_TRUST_PROXY \
+            --set-env api-instance-count=SITEFLOW_API_INSTANCE_COUNT \
+            --set-env api-process-count=SITEFLOW_API_PROCESS_COUNT \
+            --set-env ingress-count=SITEFLOW_INGRESS_COUNT \
+            --set-env api-rate-limit-scope=SITEFLOW_API_RATE_LIMIT_SCOPE \
+            --set-env api-rate-limit-enforcement-point=SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT \
+            --json > "$SITEFLOW_PREFLIGHT_DIR/release-evidence-target-run.out.json"
+
+      - name: Generate release evidence gap report
+        if: always()
+        env:
+          SITEFLOW_DIRECT_API_URL: ${{ inputs.direct_api_url }}
+          SITEFLOW_RELEASE_IMAGE_RUN_ID: ${{ inputs.release_image_run_id }}
+          SITEFLOW_TRUST_PROXY: ${{ inputs.trust_proxy_policy }}
+          SITEFLOW_API_INSTANCE_COUNT: ${{ inputs.api_instance_count }}
+          SITEFLOW_API_PROCESS_COUNT: ${{ inputs.api_process_count }}
+          SITEFLOW_INGRESS_COUNT: ${{ inputs.ingress_count }}
+          SITEFLOW_API_RATE_LIMIT_SCOPE: ${{ inputs.api_rate_limit_scope }}
+          SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT: ${{ inputs.api_rate_limit_enforcement_point }}
+        run: |
+          set +e
+          npm run --silent release:evidence:gaps -- \
+            --pack "$SITEFLOW_PREFLIGHT_DIR/release-evidence-rehearsal-pack.json" \
+            --set-env direct-api-url=SITEFLOW_DIRECT_API_URL \
+            --set-env release-image-run-id=SITEFLOW_RELEASE_IMAGE_RUN_ID \
+            --set-env SITEFLOW_TRUST_PROXY=SITEFLOW_TRUST_PROXY \
+            --set-env api-instance-count=SITEFLOW_API_INSTANCE_COUNT \
+            --set-env api-process-count=SITEFLOW_API_PROCESS_COUNT \
+            --set-env ingress-count=SITEFLOW_INGRESS_COUNT \
+            --set-env api-rate-limit-scope=SITEFLOW_API_RATE_LIMIT_SCOPE \
+            --set-env api-rate-limit-enforcement-point=SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT \
+            --json > "$SITEFLOW_PREFLIGHT_DIR/release-evidence-gaps.stdout.json" \
+            2> "$SITEFLOW_PREFLIGHT_DIR/release-evidence-gaps.stderr.json"
+          status=$?
+          if [ -s "$SITEFLOW_PREFLIGHT_DIR/release-evidence-gaps.stdout.json" ]; then
+            mv "$SITEFLOW_PREFLIGHT_DIR/release-evidence-gaps.stdout.json" "$SITEFLOW_PREFLIGHT_DIR/release-evidence-gaps.json"
+            rm -f "$SITEFLOW_PREFLIGHT_DIR/release-evidence-gaps.stderr.json"
+          else
+            mv "$SITEFLOW_PREFLIGHT_DIR/release-evidence-gaps.stderr.json" "$SITEFLOW_PREFLIGHT_DIR/release-evidence-gaps.json"
+            rm -f "$SITEFLOW_PREFLIGHT_DIR/release-evidence-gaps.stdout.json"
+          fi
+          exit "$status"
+
+      - name: Remove target env file before artifact upload
+        if: always()
+        run: |
+          rm -f "$SITEFLOW_TARGET_ENV_FILE"
+          rm -rf "$SITEFLOW_PRIVATE_DIR"
+
+      - name: Upload release preflight evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-preflight-${{ inputs.commit_ref }}
+          path: |
+            ${{ runner.temp }}/siteflow-release-preflight/**
+            playwright-report/**
+            test-results/**
+          if-no-files-found: ignore

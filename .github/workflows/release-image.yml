@@ -1,0 +1,239 @@
+name: Release Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_name:
+        description: GHCR image name. The default matches the installer default.
+        required: true
+        default: ghcr.io/siteflow/siteflow
+        type: string
+      image_tag:
+        description: Image tag to publish. Defaults to package version.
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: Build and publish release image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Release dependency policy
+        run: npm run --silent release:dependency:policy -- --json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Release source tree check
+        run: npm run --silent release:source:check -- --json
+
+      - name: Run tests
+        run: npm test -- --run
+
+      - name: Build
+        run: npm run build
+
+      - name: Release artifact gate
+        run: |
+          npm run --silent release:artifacts:check -- \
+            --json \
+            --manifest release-artifact-manifest.image.json \
+            --commit-ref "${{ github.sha }}" \
+            --repo "${{ github.repository }}" \
+            --branch "${{ github.ref_name }}" \
+            --target-environment image
+
+      - name: Resolve image metadata
+        id: image
+        env:
+          INPUT_IMAGE_NAME: ${{ inputs.image_name }}
+          INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          image_name="${INPUT_IMAGE_NAME:-ghcr.io/siteflow/siteflow}"
+          image_tag="$INPUT_IMAGE_TAG"
+          if [ -z "$image_tag" ]; then
+            image_tag="$(node -p "JSON.parse(require('fs').readFileSync('package.json', 'utf8')).version")"
+          fi
+          image_tag="${image_tag#v}"
+          echo "name=$image_name" >> "$GITHUB_OUTPUT"
+          echo "tag=$image_tag" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=$image_name:sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "version_tag=$image_name:$image_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          provenance: true
+          sbom: true
+          tags: |
+            ${{ steps.image.outputs.version_tag }}
+            ${{ steps.image.outputs.sha_tag }}
+
+      - name: Inspect image attestations
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          node <<'NODE'
+          const { execFileSync } = require("node:child_process");
+          const { writeFileSync } = require("node:fs");
+
+          const imageName = process.env.IMAGE_NAME;
+          const imageDigest = process.env.IMAGE_DIGEST;
+          const imageRef = `${imageName}@${imageDigest}`;
+
+          function inspectRaw(ref) {
+            return JSON.parse(execFileSync("docker", ["buildx", "imagetools", "inspect", "--raw", ref], {
+              encoding: "utf8",
+              maxBuffer: 16 * 1024 * 1024
+            }));
+          }
+
+          function descriptorsFromIndex(root) {
+            return Array.isArray(root?.manifests) ? root.manifests : [];
+          }
+
+          const index = inspectRaw(imageRef);
+          const attestationDescriptors = descriptorsFromIndex(index).filter((descriptor) => {
+            const annotations = descriptor?.annotations ?? {};
+            return annotations["vnd.docker.reference.type"] === "attestation-manifest" &&
+              typeof descriptor.digest === "string" &&
+              descriptor.digest.startsWith("sha256:");
+          });
+
+          const inspected = attestationDescriptors.map((descriptor) => {
+            const manifest = inspectRaw(`${imageName}@${descriptor.digest}`);
+            const predicateTypes = (Array.isArray(manifest.layers) ? manifest.layers : [])
+              .map((layer) => layer?.annotations?.["in-toto.io/predicate-type"])
+              .filter((predicateType) => typeof predicateType === "string" && predicateType);
+            return {
+              digest: descriptor.digest,
+              predicateTypes
+            };
+          });
+
+          const provenance = inspected.find((entry) =>
+            entry.predicateTypes.some((predicateType) => predicateType.startsWith("https://slsa.dev/provenance/"))
+          );
+          const sbom = inspected.find((entry) =>
+            entry.predicateTypes.some((predicateType) =>
+              predicateType.startsWith("https://spdx.dev/") || predicateType.startsWith("https://cyclonedx.org/")
+            )
+          );
+
+          if (!provenance || !sbom) {
+            throw new Error("Published image is missing registry SLSA provenance or SBOM attestation manifests.");
+          }
+
+          const evidence = {
+            mode: "registry",
+            subjectDigest: imageDigest,
+            inspector: "docker buildx imagetools inspect --raw",
+            inspectedAt: new Date().toISOString(),
+            provenance: {
+              requested: true,
+              present: true,
+              predicateType: provenance.predicateTypes.find((predicateType) => predicateType.startsWith("https://slsa.dev/provenance/")),
+              manifestDigest: provenance.digest
+            },
+            sbom: {
+              requested: true,
+              present: true,
+              predicateType: sbom.predicateTypes.find((predicateType) =>
+                predicateType.startsWith("https://spdx.dev/") || predicateType.startsWith("https://cyclonedx.org/")
+              ),
+              manifestDigest: sbom.digest
+            }
+          };
+
+          writeFileSync("release-image-attestations.json", `${JSON.stringify(evidence, null, 2)}\n`);
+          NODE
+
+      - name: Write image evidence
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          VERSION_TAG: ${{ steps.image.outputs.version_tag }}
+          SHA_TAG: ${{ steps.image.outputs.sha_tag }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_REF: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          node <<'NODE'
+          const { readFileSync, writeFileSync } = require("node:fs");
+          const attestations = JSON.parse(readFileSync("release-image-attestations.json", "utf8"));
+          const evidence = {
+            schemaVersion: "siteflow.releaseImageEvidence.v1",
+            name: "siteflow-release-image-evidence",
+            image: {
+              name: process.env.IMAGE_NAME,
+              versionTag: process.env.VERSION_TAG,
+              commitTag: process.env.SHA_TAG,
+              digest: process.env.IMAGE_DIGEST
+            },
+            source: {
+              repository: process.env.REPOSITORY,
+              commitRef: process.env.COMMIT_REF,
+              refName: process.env.REF_NAME
+            },
+            github: {
+              runId: process.env.RUN_ID,
+              runAttempt: process.env.RUN_ATTEMPT
+            },
+            attestations,
+            checkedAt: new Date().toISOString()
+          };
+          writeFileSync("release-image-evidence.json", `${JSON.stringify(evidence, null, 2)}\n`);
+          NODE
+
+      - name: Upload image evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-image-evidence
+          path: release-image-evidence.json
+          if-no-files-found: error
+
+      - name: Write digest summary
+        run: |
+          {
+            echo "### SiteFlow release image"
+            echo ""
+            echo "- Image: \`${{ steps.image.outputs.name }}\`"
+            echo "- Version tag: \`${{ steps.image.outputs.version_tag }}\`"
+            echo "- Commit tag: \`${{ steps.image.outputs.sha_tag }}\`"
+            echo "- Digest: \`${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

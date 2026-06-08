@@ -1,9 +1,12 @@
+import { createHash } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 
 interface Migration {
   version: string;
   sql: string;
 }
+
+export const migrationAdvisoryLockKeys = [0x53464d47, 1] as const;
 
 export const migrations: Migration[] = [
   {
@@ -675,6 +678,110 @@ export const migrations: Migration[] = [
         ADD CONSTRAINT siteflow_build_jobs_status_check
         CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'canceled', 'timed_out', 'skipped'));
     `
+  },
+  {
+    version: "019_build_job_leases",
+    sql: `
+      ALTER TABLE siteflow_build_jobs
+        ADD COLUMN IF NOT EXISTS attempt_count integer NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS max_attempts integer NOT NULL DEFAULT 3,
+        ADD COLUMN IF NOT EXISTS locked_until timestamptz,
+        ADD COLUMN IF NOT EXISTS heartbeat_at timestamptz;
+
+      ALTER TABLE siteflow_build_jobs
+        DROP CONSTRAINT IF EXISTS siteflow_build_jobs_attempt_count_check;
+
+      ALTER TABLE siteflow_build_jobs
+        ADD CONSTRAINT siteflow_build_jobs_attempt_count_check
+        CHECK (attempt_count >= 0);
+
+      ALTER TABLE siteflow_build_jobs
+        DROP CONSTRAINT IF EXISTS siteflow_build_jobs_max_attempts_check;
+
+      ALTER TABLE siteflow_build_jobs
+        ADD CONSTRAINT siteflow_build_jobs_max_attempts_check
+        CHECK (max_attempts > 0);
+
+      CREATE INDEX IF NOT EXISTS idx_siteflow_build_jobs_claimable
+        ON siteflow_build_jobs (status, queued_at, locked_until)
+        WHERE status IN ('queued', 'running');
+    `
+  },
+  {
+    version: "020_operator_sessions",
+    sql: `
+      CREATE TABLE IF NOT EXISTS siteflow_operator_sessions (
+        id text PRIMARY KEY,
+        subject text NOT NULL,
+        actor jsonb,
+        token_hash text NOT NULL UNIQUE,
+        token_prefix text NOT NULL,
+        scopes text[] NOT NULL,
+        status text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked', 'expired')),
+        created_at timestamptz NOT NULL DEFAULT now(),
+        expires_at timestamptz NOT NULL,
+        revoked_at timestamptz,
+        last_used_at timestamptz,
+        CHECK (array_length(scopes, 1) > 0),
+        CHECK (scopes <@ ARRAY['read', 'write', 'admin']::text[])
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_siteflow_operator_sessions_hash
+        ON siteflow_operator_sessions (token_hash);
+
+      CREATE INDEX IF NOT EXISTS idx_siteflow_operator_sessions_status_expires
+        ON siteflow_operator_sessions (status, expires_at);
+    `
+  },
+  {
+    version: "021_operator_session_project_scope",
+    sql: `
+      ALTER TABLE siteflow_operator_sessions
+        ADD COLUMN IF NOT EXISTS project_ids text[];
+
+      ALTER TABLE siteflow_operator_sessions
+        DROP CONSTRAINT IF EXISTS siteflow_operator_sessions_project_ids_non_empty;
+
+      ALTER TABLE siteflow_operator_sessions
+        ADD CONSTRAINT siteflow_operator_sessions_project_ids_non_empty
+        CHECK (
+          project_ids IS NULL
+          OR (array_length(project_ids, 1) > 0 AND array_position(project_ids, '') IS NULL)
+        );
+
+      CREATE INDEX IF NOT EXISTS idx_siteflow_operator_sessions_project_ids
+        ON siteflow_operator_sessions USING GIN (project_ids);
+    `
+  },
+  {
+    version: "022_operator_session_cutoffs",
+    sql: `
+      CREATE TABLE IF NOT EXISTS siteflow_operator_session_cutoffs (
+        id text PRIMARY KEY,
+        project_id text,
+        actor jsonb,
+        reason text,
+        revoked_count integer NOT NULL CHECK (revoked_count >= 0),
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_siteflow_operator_session_cutoffs_created_at
+        ON siteflow_operator_session_cutoffs (created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_siteflow_operator_session_cutoffs_project_created_at
+        ON siteflow_operator_session_cutoffs (project_id, created_at DESC)
+        WHERE project_id IS NOT NULL;
+    `
+  },
+  {
+    version: "023_release_evidence_lineage",
+    sql: `
+      ALTER TABLE siteflow_release_commands
+        ADD COLUMN IF NOT EXISTS release_evidence jsonb;
+
+      ALTER TABLE siteflow_route_revisions
+        ADD COLUMN IF NOT EXISTS release_evidence jsonb;
+    `
   }
 ];
 
@@ -685,6 +792,14 @@ async function ensureMigrationTable(client: PoolClient) {
       applied_at timestamptz NOT NULL DEFAULT now()
     );
   `);
+  await client.query(`
+    ALTER TABLE siteflow_schema_migrations
+      ADD COLUMN IF NOT EXISTS checksum_sha256 text;
+  `);
+}
+
+function checksumMigrationSql(sql: string) {
+  return createHash("sha256").update(sql, "utf8").digest("hex");
 }
 
 export async function runMigrations(pool: Pool) {
@@ -692,14 +807,34 @@ export async function runMigrations(pool: Pool) {
 
   try {
     await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock($1::integer, $2::integer)", [...migrationAdvisoryLockKeys]);
     await ensureMigrationTable(client);
 
     for (const migration of migrations) {
-      const applied = await client.query("SELECT 1 FROM siteflow_schema_migrations WHERE version = $1", [migration.version]);
+      const checksum = checksumMigrationSql(migration.sql);
+      const applied = await client.query<{ checksum_sha256: string | null }>(
+        "SELECT checksum_sha256 FROM siteflow_schema_migrations WHERE version = $1",
+        [migration.version]
+      );
 
       if (applied.rowCount === 0) {
         await client.query(migration.sql);
-        await client.query("INSERT INTO siteflow_schema_migrations (version) VALUES ($1)", [migration.version]);
+        await client.query(
+          "INSERT INTO siteflow_schema_migrations (version, checksum_sha256) VALUES ($1, $2)",
+          [migration.version, checksum]
+        );
+        continue;
+      }
+
+      const appliedChecksum = applied.rows[0]?.checksum_sha256;
+
+      if (appliedChecksum === undefined || appliedChecksum === null || appliedChecksum === "") {
+        await client.query(
+          "UPDATE siteflow_schema_migrations SET checksum_sha256 = $2 WHERE version = $1 AND (checksum_sha256 IS NULL OR checksum_sha256 = '')",
+          [migration.version, checksum]
+        );
+      } else if (appliedChecksum !== checksum) {
+        throw new Error(`Migration drift detected for ${migration.version}: applied checksum ${appliedChecksum} does not match current checksum ${checksum}.`);
       }
     }
 

@@ -1,6 +1,4 @@
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, statfs } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ProjectBuildSettings, ReleaseChannelName, RepositoryBinding, RoutingHeader, SiteFlowId, SourceEvent } from "../src/domain/siteflow.js";
@@ -8,6 +6,7 @@ import { redactLogLine } from "../src/lib/redaction.js";
 import { sealSecretValue } from "../src/lib/sealedSecrets.js";
 import type { PrebuiltImageConfig } from "../src/lib/api/deployContracts.js";
 import { publishBuildArtifact, type ArtifactExtraFileInput, type FunctionArtifactInput, type PublishedBuildArtifact } from "./artifactPublisher.js";
+import { runBuildCommand, type BuildRunner, type DockerBuildRunnerConfig } from "./buildSandbox.js";
 import { detectBuildSettings } from "./frameworkDetector.js";
 
 export interface QueuedBuildJob {
@@ -34,6 +33,7 @@ export interface BuildJobResult {
 export interface BuildQueue {
   claimNextJob(workerId: string): Promise<QueuedBuildJob | undefined>;
   appendLog(jobId: SiteFlowId, line: string): Promise<void>;
+  heartbeatJob?(job: QueuedBuildJob): Promise<void>;
   completeJob(job: QueuedBuildJob, result: BuildJobResult): Promise<void>;
   skipJob(job: QueuedBuildJob, reason: string): Promise<void>;
   failJob(job: QueuedBuildJob, reason: string): Promise<void>;
@@ -57,6 +57,14 @@ export interface BuildWorkerOptions {
   baseDomain: string;
   publicScheme?: "http" | "https";
   entrypoint?: string;
+  jobHeartbeatIntervalMs?: number;
+  allowUnsandboxedSourceBuilds?: boolean;
+  buildRunner?: BuildRunner;
+  dockerBuild?: DockerBuildRunnerConfig;
+  buildStepTimeoutMs?: number;
+  maxArtifactBytes?: number;
+  maxArtifactFiles?: number;
+  minBuildFreeBytes?: number;
 }
 
 export interface BuildExecutionOptions {
@@ -66,11 +74,14 @@ export interface BuildExecutionOptions {
   baseDomain: string;
   publicScheme?: "http" | "https";
   entrypoint?: string;
+  allowUnsandboxedSourceBuilds?: boolean;
+  buildRunner?: BuildRunner;
+  dockerBuild?: DockerBuildRunnerConfig;
+  buildStepTimeoutMs?: number;
+  maxArtifactBytes?: number;
+  maxArtifactFiles?: number;
+  minBuildFreeBytes?: number;
   appendLog?: (line: string) => Promise<void>;
-}
-
-interface CommandResult {
-  exitCode: number;
 }
 
 export interface BuildCronJob {
@@ -134,7 +145,14 @@ class BuildSkippedError extends Error {
   }
 }
 
-const allowedCommands = new Set(["npm ci", "npm install", "npm run build", "npm test", "npm run test"]);
+const defaultJobHeartbeatIntervalMs = 60_000;
+const unsafeSourceBuildGuardMessage =
+  "Production source build rejected: no sandboxed build runner is configured. " +
+  "Set SITEFLOW_TRUSTED_SOURCE_BUILDS=1 or SITEFLOW_ALLOW_UNSANDBOXED_BUILDS=1 only for trusted source builds.";
+
+function shouldRejectUnsandboxedSourceBuild(options: { allowUnsandboxedSourceBuilds?: boolean; buildRunner?: BuildRunner }) {
+  return options.allowUnsandboxedSourceBuilds === false && options.buildRunner !== "docker";
+}
 
 function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -144,6 +162,106 @@ function redactionPatternsFor(values: Record<string, string> | undefined) {
   return Object.values(values ?? {})
     .filter((value) => value.length >= 4)
     .map((value) => new RegExp(escapeRegExp(value), "g"));
+}
+
+function isSensitiveBuildEnvKey(key: string) {
+  if (/^(?:NEXT_PUBLIC_|VITE_|PUBLIC_)/.test(key)) {
+    return false;
+  }
+
+  return /(?:^|_)(?:SECRET|TOKEN|PASSWORD|PASS|PRIVATE_KEY|API_KEY|AUTH)(?:_|$)/i.test(key);
+}
+
+function blockedArtifactContentValues(values: Record<string, string> | undefined) {
+  return Object.entries(values ?? {})
+    .filter(([key, value]) => isSensitiveBuildEnvKey(key) || /SITEFLOW_SECRET_CANARY/i.test(value))
+    .map(([label, value]) => ({ label, value }));
+}
+
+function sensitiveBuildEnvKeys(values: Record<string, string> | undefined) {
+  return Object.keys(values ?? {})
+    .filter(isSensitiveBuildEnvKey)
+    .sort();
+}
+
+function assertNetworkedDockerBuildEnvAllowed(
+  options: { buildRunner?: BuildRunner; dockerBuild?: DockerBuildRunnerConfig },
+  values: Record<string, string> | undefined
+) {
+  if (options.buildRunner !== "docker" || options.dockerBuild?.network !== "bridge") {
+    return;
+  }
+
+  const sensitiveKeys = sensitiveBuildEnvKeys(values);
+
+  if (sensitiveKeys.length > 0) {
+    throw new Error(
+      `Networked Docker builds cannot receive sensitive build environment variables: ${sensitiveKeys.join(", ")}. ` +
+      "Set SITEFLOW_BUILD_NETWORK=none or remove sensitive build env."
+    );
+  }
+}
+
+export interface BuildStoragePreflightOptions {
+  workspaceRoot: string;
+  artifactRoot: string;
+  tempRoot?: string;
+  minFreeBytes?: number;
+}
+
+function positiveMinFreeBytes(value: number | undefined) {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error("SITEFLOW_BUILD_MIN_FREE_BYTES must be a positive integer.");
+  }
+
+  return value;
+}
+
+function availableBytes(stats: Awaited<ReturnType<typeof statfs>>) {
+  return Number(stats.bavail) * Number(stats.bsize);
+}
+
+export async function assertBuildStoragePreflight(options: BuildStoragePreflightOptions) {
+  const minFreeBytes = positiveMinFreeBytes(options.minFreeBytes);
+
+  if (minFreeBytes === undefined) {
+    return;
+  }
+
+  await mkdir(options.workspaceRoot, { recursive: true });
+  await mkdir(options.artifactRoot, { recursive: true });
+
+  const roots = [
+    { label: "workspaceRoot", path: options.workspaceRoot },
+    { label: "artifactRoot", path: options.artifactRoot },
+    { label: "tempRoot", path: options.tempRoot ?? os.tmpdir() }
+  ];
+  const checkedPaths = new Set<string>();
+  const failures: string[] = [];
+
+  for (const root of roots) {
+    const resolvedPath = path.resolve(root.path);
+
+    if (checkedPaths.has(resolvedPath)) {
+      continue;
+    }
+
+    checkedPaths.add(resolvedPath);
+
+    const freeBytes = availableBytes(await statfs(resolvedPath));
+
+    if (freeBytes < minFreeBytes) {
+      failures.push(`${root.label} ${resolvedPath} has ${freeBytes} available bytes, requires ${minFreeBytes}`);
+    }
+  }
+
+  if (failures.length > 0) {
+    throw new Error(`SITEFLOW_BUILD_MIN_FREE_BYTES preflight failed: ${failures.join("; ")}.`);
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -311,6 +429,18 @@ function nonNegativeInteger(value: unknown) {
   return Number.isInteger(value) && typeof value === "number" && value >= 0 ? value : undefined;
 }
 
+function positiveHeartbeatIntervalMs(value: number | undefined) {
+  if (value === undefined) {
+    return defaultJobHeartbeatIntervalMs;
+  }
+
+  if (!Number.isFinite(value) || value < 1) {
+    throw new Error("Build job heartbeat interval must be a positive number.");
+  }
+
+  return Math.ceil(value);
+}
+
 function imageConfig(value: unknown): PrebuiltImageConfig | undefined {
   if (!isRecord(value)) {
     return undefined;
@@ -430,115 +560,6 @@ async function readSourceVercelConfig(projectRoot: string): Promise<SourceVercel
   };
 }
 
-function npmCommand(parts: string[]) {
-  if (process.platform !== "win32") {
-    return {
-      command: "npm",
-      args: parts.slice(1)
-    };
-  }
-
-  const npmCli = process.env.npm_execpath ??
-    path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
-
-  if (existsSync(npmCli)) {
-    return {
-      command: process.execPath,
-      args: [npmCli, ...parts.slice(1)]
-    };
-  }
-
-  return {
-    command: "cmd.exe",
-    args: ["/d", "/s", "/c", "npm", ...parts.slice(1)]
-  };
-}
-
-function commandParts(command: string) {
-  const trimmed = command.trim();
-
-  if (!trimmed) {
-    return undefined;
-  }
-
-  const parts = trimmed.split(/\s+/);
-  const normalized = parts.slice(0, Math.min(parts.length, 3)).join(" ");
-
-  if (!allowedCommands.has(normalized)) {
-    throw new Error(`Build command is not allowed: ${command}`);
-  }
-
-  if (parts[0] === "npm") {
-    return npmCommand(parts);
-  }
-
-  return {
-    command: parts[0],
-    args: parts.slice(1)
-  };
-}
-
-async function runCommand(
-  command: string,
-  cwd: string,
-  appendLog: (line: string) => Promise<void>,
-  environmentVariables: Record<string, string> | undefined,
-  secretPatterns: RegExp[]
-): Promise<CommandResult> {
-  const parts = commandParts(command);
-
-  if (!parts) {
-    return { exitCode: 0 };
-  }
-
-  await appendLog(`$ ${command}`);
-
-  return await new Promise<CommandResult>((resolve, reject) => {
-    const child = spawn(parts.command, parts.args, {
-      cwd,
-      shell: false,
-      env: {
-        ...process.env,
-        ...(environmentVariables ?? {}),
-        CI: environmentVariables?.CI ?? process.env.CI ?? "1"
-      }
-    });
-    let stdoutTail = "";
-    let stderrTail = "";
-    const logWrites: Promise<void>[] = [];
-
-    const flushLine = async (line: string) => {
-      if (line.trim()) {
-        await appendLog(redactLogLine(line, { extraPatterns: secretPatterns }));
-      }
-    };
-
-    const collect = (chunk: Buffer, stream: "stdout" | "stderr") => {
-      const next = `${stream === "stdout" ? stdoutTail : stderrTail}${chunk.toString("utf8")}`;
-      const lines = next.split(/\r?\n/);
-      const tail = lines.pop() ?? "";
-
-      if (stream === "stdout") {
-        stdoutTail = tail;
-      } else {
-        stderrTail = tail;
-      }
-
-      logWrites.push(...lines.map(flushLine));
-    };
-
-    child.stdout.on("data", (chunk: Buffer) => collect(chunk, "stdout"));
-    child.stderr.on("data", (chunk: Buffer) => collect(chunk, "stderr"));
-    child.on("error", reject);
-    child.on("close", (exitCode) => {
-      logWrites.push(...[stdoutTail, stderrTail].filter(Boolean).map(flushLine));
-      void Promise.all(logWrites)
-        .then(() => resolve({ exitCode: exitCode ?? 1 }))
-        .catch(reject);
-    });
-  });
-}
-
 function routeChannelFor(sourceEvent: SourceEvent, productionBranch: string): ReleaseChannelName {
   return sourceEvent.branch === productionBranch ? "production" : "preview";
 }
@@ -559,11 +580,34 @@ function resolveProjectRoot(sourceDirectory: string, rootDirectory: string | und
   return root;
 }
 
-function resolveOutputDirectory(projectRoot: string, outputDirectory: string) {
+function isPathWithinRoot(root: string, candidate: string) {
+  const relative = path.relative(root, candidate);
+
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+async function resolveOutputDirectory(projectRoot: string, outputDirectory: string) {
   const output = path.resolve(projectRoot, outputDirectory);
 
-  if (output !== projectRoot && !output.startsWith(`${projectRoot}${path.sep}`)) {
+  if (!isPathWithinRoot(projectRoot, output)) {
     throw new Error("Build output directory escapes the project root.");
+  }
+
+  const realProjectRoot = await realpath(projectRoot);
+  let realOutput: string;
+
+  try {
+    realOutput = await realpath(output);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new Error(`Build output directory does not exist: ${outputDirectory}.`);
+    }
+
+    throw error;
+  }
+
+  if (!isPathWithinRoot(realProjectRoot, realOutput)) {
+    throw new Error(`Build output directory resolves outside the project root: ${outputDirectory}.`);
   }
 
   return output;
@@ -696,12 +740,69 @@ function resolveProjectFile(projectRoot: string, relativePath: string) {
   return fullPath;
 }
 
+function pathStaysInside(parent: string, candidate: string) {
+  const relative = path.relative(parent, candidate);
+
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function functionIncludeFileDenyReason(relativePath: string) {
+  const normalized = relativePath.split(path.sep).join("/");
+  const segments = normalized.split("/").map((segment) => segment.toLowerCase());
+  const basename = segments[segments.length - 1] ?? "";
+  const extension = path.posix.extname(basename);
+
+  if (segments.some((segment) => segment === "secrets" || segment === ".secrets")) {
+    return "secrets directory";
+  }
+
+  if (segments.includes(".ssh")) {
+    return ".ssh directory";
+  }
+
+  if (segments.includes(".aws")) {
+    return ".aws directory";
+  }
+
+  if (basename === ".env" || basename.startsWith(".env.")) {
+    return ".env file";
+  }
+
+  if (basename === ".npmrc" || basename === ".pypirc" || basename === ".netrc") {
+    return "credential config file";
+  }
+
+  if (["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"].includes(basename)) {
+    return "private key file";
+  }
+
+  if (basename.includes("private-key") || basename.includes("private_key")) {
+    return "private key file";
+  }
+
+  if ([".pem", ".key", ".p12", ".pfx"].includes(extension)) {
+    return "private key or certificate file";
+  }
+
+  return undefined;
+}
+
 async function collectIncludedFilesFromRoot(
   projectRoot: string,
   current: string,
   allowNodeModules: boolean,
   files: string[]
 ) {
+  const currentStat = await lstat(current);
+
+  if (currentStat.isSymbolicLink()) {
+    throw new Error(`Function includeFiles search root must not be a symlink: ${path.relative(projectRoot, current).split(path.sep).join("/") || "."}.`);
+  }
+
+  if (!currentStat.isDirectory()) {
+    throw new Error(`Function includeFiles search root must be a directory: ${path.relative(projectRoot, current).split(path.sep).join("/") || "."}.`);
+  }
+
   const entries = await readdir(current, { withFileTypes: true });
 
   for (const entry of entries) {
@@ -710,6 +811,11 @@ async function collectIncludedFilesFromRoot(
     }
 
     const fullPath = path.join(current, entry.name);
+    const relativePath = path.relative(projectRoot, fullPath).split(path.sep).join("/");
+
+    if (entry.isSymbolicLink()) {
+      throw new Error(`Function includeFiles entry must not be a symlink: ${relativePath}.`);
+    }
 
     if (entry.isDirectory()) {
       await collectIncludedFilesFromRoot(projectRoot, fullPath, allowNodeModules, files);
@@ -720,7 +826,7 @@ async function collectIncludedFilesFromRoot(
       continue;
     }
 
-    files.push(path.relative(projectRoot, fullPath).split(path.sep).join("/"));
+    files.push(relativePath);
   }
 }
 
@@ -747,10 +853,14 @@ async function collectFunctionIncludeFiles(
 
   for (const prefix of searchPrefixes) {
     const searchRoot = resolveProjectFile(projectRoot, prefix);
-    const searchStat = await stat(searchRoot).catch(() => undefined);
+    const searchStat = await lstat(searchRoot).catch(() => undefined);
 
     if (!searchStat) {
       continue;
+    }
+
+    if (searchStat.isSymbolicLink()) {
+      throw new Error(`Function includeFiles entry must not be a symlink: ${prefix || "."}.`);
     }
 
     if (searchStat.isFile()) {
@@ -776,15 +886,28 @@ async function collectFunctionIncludeFiles(
       continue;
     }
 
+    const deniedReason = functionIncludeFileDenyReason(relativePath);
+
+    if (deniedReason) {
+      throw new Error(`Function includeFiles entry is blocked because it looks like a ${deniedReason}: ${relativePath}.`);
+    }
+
     const artifactPath = `.siteflow/functions/${relativePath}`;
 
     if (occupiedArtifactPaths.has(artifactPath)) {
       continue;
     }
 
+    const sourcePath = resolveProjectFile(projectRoot, relativePath);
+    const sourceStat = await lstat(sourcePath);
+
+    if (sourceStat.isSymbolicLink() || !sourceStat.isFile()) {
+      throw new Error(`Function includeFiles entry must be a regular file: ${relativePath}.`);
+    }
+
     extraFiles.push({
       artifactPath,
-      contents: await readFile(resolveProjectFile(projectRoot, relativePath))
+      contents: await readFile(sourcePath)
     });
     occupiedArtifactPaths.add(artifactPath);
   }
@@ -792,14 +915,24 @@ async function collectFunctionIncludeFiles(
   return extraFiles;
 }
 
-async function collectFunctionEntrypoints(apiRoot: string, current: string, entries: FunctionArtifactInput[]) {
+async function collectFunctionEntrypoints(
+  projectRootRealPath: string,
+  apiRoot: string,
+  current: string,
+  entries: FunctionArtifactInput[]
+) {
   const children = await readdir(current, { withFileTypes: true });
 
   for (const child of children) {
     const fullPath = path.join(current, child.name);
+    const relativePath = path.relative(apiRoot, fullPath).split(path.sep).join("/");
+
+    if (child.isSymbolicLink()) {
+      throw new Error(`Function source entry must not be a symlink: api/${relativePath}.`);
+    }
 
     if (child.isDirectory()) {
-      await collectFunctionEntrypoints(apiRoot, fullPath, entries);
+      await collectFunctionEntrypoints(projectRootRealPath, apiRoot, fullPath, entries);
       continue;
     }
 
@@ -807,7 +940,11 @@ async function collectFunctionEntrypoints(apiRoot: string, current: string, entr
       continue;
     }
 
-    const relativePath = path.relative(apiRoot, fullPath).split(path.sep).join("/");
+    const sourceRealPath = await realpath(fullPath);
+
+    if (!pathStaysInside(projectRootRealPath, sourceRealPath)) {
+      throw new Error(`Function source entry escapes the project root: api/${relativePath}.`);
+    }
 
     entries.push({
       path: functionRoutePath(relativePath),
@@ -821,13 +958,29 @@ async function collectFunctionEntrypoints(apiRoot: string, current: string, entr
 
 async function detectFunctionEntrypoints(projectRoot: string) {
   const apiRoot = path.resolve(projectRoot, "api");
+  const apiRootStat = await lstat(apiRoot).catch(() => undefined);
 
-  if (!existsSync(apiRoot)) {
+  if (!apiRootStat) {
     return [];
   }
 
+  if (apiRootStat.isSymbolicLink()) {
+    throw new Error("Function api directory must not be a symlink: api.");
+  }
+
+  if (!apiRootStat.isDirectory()) {
+    throw new Error("Function api path must be a directory: api.");
+  }
+
+  const projectRootRealPath = await realpath(projectRoot);
+  const apiRootRealPath = await realpath(apiRoot);
+
+  if (!pathStaysInside(projectRootRealPath, apiRootRealPath)) {
+    throw new Error("Function api directory escapes the project root: api.");
+  }
+
   const entries: FunctionArtifactInput[] = [];
-  await collectFunctionEntrypoints(apiRoot, apiRoot, entries);
+  await collectFunctionEntrypoints(projectRootRealPath, apiRoot, apiRoot, entries);
   return entries.sort((left, right) => left.path.localeCompare(right.path));
 }
 
@@ -869,13 +1022,24 @@ async function functionBundleExtraFiles(
 }
 
 export async function executeBuildJob(job: QueuedBuildJob, options: BuildExecutionOptions): Promise<BuildJobResult> {
-  const workspaceRoot = path.resolve(options.workspaceRoot ?? await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-")));
-  await mkdir(workspaceRoot, { recursive: true });
+  if (shouldRejectUnsandboxedSourceBuild(options)) {
+    await options.appendLog?.(redactLogLine(unsafeSourceBuildGuardMessage));
+    throw new BuildSkippedError(unsafeSourceBuildGuardMessage);
+  }
 
-  const checkout = await options.sourceResolver.checkout(job, workspaceRoot);
-  const sourceDirectory = path.resolve(checkout.sourceDirectory);
+  const createdWorkspaceRoot = options.workspaceRoot === undefined;
+  const workspaceRoot = path.resolve(options.workspaceRoot ?? await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-")));
+  let checkout: SourceCheckout | undefined;
 
   try {
+    await mkdir(workspaceRoot, { recursive: true });
+    await assertBuildStoragePreflight({
+      workspaceRoot,
+      artifactRoot: options.artifactRoot,
+      minFreeBytes: options.minBuildFreeBytes
+    });
+    checkout = await options.sourceResolver.checkout(job, workspaceRoot);
+    const sourceDirectory = path.resolve(checkout.sourceDirectory);
     const buildSettings = await detectBuildSettings(sourceDirectory, job.buildSettings);
     const projectRoot = resolveProjectRoot(sourceDirectory, buildSettings.rootDirectory);
     const sourceConfig = await readSourceVercelConfig(projectRoot);
@@ -883,10 +1047,21 @@ export async function executeBuildJob(job: QueuedBuildJob, options: BuildExecuti
       ...(sourceConfig.buildEnv ?? {}),
       ...(job.environmentVariables ?? {})
     };
+    assertNetworkedDockerBuildEnvAllowed(options, buildEnvironmentVariables);
     const appendLog = async (line: string) => {
       await options.appendLog?.(line);
     };
     const secretPatterns = redactionPatternsFor(buildEnvironmentVariables);
+    const runBuildStep = (command: string) =>
+      runBuildCommand(command, {
+        cwd: projectRoot,
+        appendLog,
+        environmentVariables: buildEnvironmentVariables,
+        secretPatterns,
+        runner: options.buildRunner,
+        docker: options.dockerBuild,
+        timeoutMs: options.buildStepTimeoutMs
+      });
 
     await appendLog(`SiteFlow worker picked build ${job.id}.`);
     await appendLog(`Resolved build settings: framework=${buildSettings.framework ?? "unknown"}, output=${buildSettings.outputDirectory}.`);
@@ -896,7 +1071,7 @@ export async function executeBuildJob(job: QueuedBuildJob, options: BuildExecuti
     }
 
     if (buildSettings.ignoreCommand) {
-      const ignore = await runCommand(buildSettings.ignoreCommand, projectRoot, appendLog, buildEnvironmentVariables, secretPatterns);
+      const ignore = await runBuildStep(buildSettings.ignoreCommand);
 
       if (ignore.exitCode === 0) {
         throw new BuildSkippedError(`Build skipped by ignoreCommand: ${buildSettings.ignoreCommand}.`);
@@ -905,13 +1080,13 @@ export async function executeBuildJob(job: QueuedBuildJob, options: BuildExecuti
       await appendLog(`ignoreCommand exited with code ${ignore.exitCode}; continuing build.`);
     }
 
-    const install = await runCommand(buildSettings.installCommand, projectRoot, appendLog, buildEnvironmentVariables, secretPatterns);
+    const install = await runBuildStep(buildSettings.installCommand);
 
     if (install.exitCode !== 0) {
       throw new Error(`Install command exited with code ${install.exitCode}.`);
     }
 
-    const build = await runCommand(buildSettings.buildCommand, projectRoot, appendLog, buildEnvironmentVariables, secretPatterns);
+    const build = await runBuildStep(buildSettings.buildCommand);
 
     if (build.exitCode !== 0) {
       throw new Error(`Build command exited with code ${build.exitCode}.`);
@@ -935,11 +1110,14 @@ export async function executeBuildJob(job: QueuedBuildJob, options: BuildExecuti
     const artifact = await publishBuildArtifact({
       buildJobId: job.id,
       sourceEventId: job.sourceEventId,
-      outputDirectory: resolveOutputDirectory(projectRoot, buildSettings.outputDirectory),
+      outputDirectory: await resolveOutputDirectory(projectRoot, buildSettings.outputDirectory),
       artifactRoot: options.artifactRoot,
       entrypoint: options.entrypoint,
       functions,
       extraFiles,
+      maxArtifactBytes: options.maxArtifactBytes,
+      maxArtifactFiles: options.maxArtifactFiles,
+      blockedContentValues: blockedArtifactContentValues(buildEnvironmentVariables),
       metadata: {
         framework: buildSettings.framework ?? job.repository.provider,
         repository: `${job.repository.owner}/${job.repository.name}`,
@@ -969,7 +1147,13 @@ export async function executeBuildJob(job: QueuedBuildJob, options: BuildExecuti
       crons: sourceConfig.crons
     };
   } finally {
-    await checkout.cleanup?.();
+    try {
+      await checkout?.cleanup?.();
+    } finally {
+      if (createdWorkspaceRoot) {
+        await rm(workspaceRoot, { recursive: true, force: true });
+      }
+    }
   }
 }
 
@@ -980,6 +1164,24 @@ export async function runBuildWorkerOnce(options: BuildWorkerOptions): Promise<B
     return undefined;
   }
 
+  if (shouldRejectUnsandboxedSourceBuild(options)) {
+    await options.queue.appendLog(job.id, redactLogLine(unsafeSourceBuildGuardMessage));
+    await options.queue.skipJob(job, unsafeSourceBuildGuardMessage);
+    return undefined;
+  }
+
+  const heartbeatIntervalMs = positiveHeartbeatIntervalMs(options.jobHeartbeatIntervalMs);
+  const heartbeatTimer = options.queue.heartbeatJob
+    ? setInterval(() => {
+      void options.queue.heartbeatJob?.(job).catch(async (error: unknown) => {
+        const message = error instanceof Error ? error.message : "Build job heartbeat failed.";
+        await options.queue.appendLog(job.id, redactLogLine(`Build job heartbeat failed: ${message}`));
+      });
+    }, heartbeatIntervalMs)
+    : undefined;
+
+  heartbeatTimer?.unref?.();
+
   try {
     const result = await executeBuildJob(job, {
       sourceResolver: options.sourceResolver,
@@ -988,6 +1190,13 @@ export async function runBuildWorkerOnce(options: BuildWorkerOptions): Promise<B
       baseDomain: options.baseDomain,
       publicScheme: options.publicScheme,
       entrypoint: options.entrypoint,
+      allowUnsandboxedSourceBuilds: options.allowUnsandboxedSourceBuilds,
+      buildRunner: options.buildRunner,
+      dockerBuild: options.dockerBuild,
+      buildStepTimeoutMs: options.buildStepTimeoutMs,
+      maxArtifactBytes: options.maxArtifactBytes,
+      maxArtifactFiles: options.maxArtifactFiles,
+      minBuildFreeBytes: options.minBuildFreeBytes,
       appendLog: (line) => options.queue.appendLog(job.id, line)
     });
     await options.queue.completeJob(job, result);
@@ -1001,6 +1210,10 @@ export async function runBuildWorkerOnce(options: BuildWorkerOptions): Promise<B
     }
     await options.queue.failJob(job, message);
     throw error;
+  } finally {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+    }
   }
 }
 

@@ -76,7 +76,7 @@ import {
   siteflowFixtures,
   type FixtureScenarioData
 } from "@lib/fixtures/siteflow.fixtures";
-import { isSiteFlowScenarioName, type SiteFlowScenarioName } from "@lib/fixtures/scenarios";
+import { isSiteFlowScenarioName, type SiteFlowScenarioName } from "./scenarioContracts";
 import type {
   AbortRollingReleaseCommand,
   AdvanceRollingReleaseCommand,
@@ -1761,7 +1761,14 @@ export class FixtureSiteFlowClient implements SiteFlowClient {
       generatedConfig: [
         `project=${command.projectId}`,
         `channel=${command.channel}`,
-        `candidate_percentage=${percentage}`
+        `candidate_percentage=${percentage}`,
+        ...("releaseEvidenceException" in command && command.releaseEvidenceException
+          ? [
+              `release_evidence_exception=${command.releaseEvidenceException.type}`,
+              `release_evidence_exception_target_environment=${command.releaseEvidenceException.targetEnvironment}`,
+              `release_evidence_exception_reason=${command.releaseEvidenceException.reason.replace(/\s+/g, " ").trim()}`
+            ]
+          : [])
       ].join("\n"),
       validationSummary: `Fixture rolling route prepared at ${percentage}%.`,
       createdAt: now,

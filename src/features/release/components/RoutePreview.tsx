@@ -2,6 +2,7 @@ import { Panel } from "@components/ui/Panel";
 import { StatusPill, type StatusTone } from "@components/ui/StatusPill";
 import type { CdnOperationState, RouteRevisionStatus } from "@domain/siteflow";
 import type { RouteRevisionEvidenceReadModel } from "@domain/readModels";
+import { redactRouteConfig } from "@lib/redaction";
 
 interface RoutePreviewProps {
   preview?: RouteRevisionEvidenceReadModel;
@@ -43,6 +44,7 @@ export function RoutePreview({ preview }: RoutePreviewProps) {
   const routeRevision = preview.routeRevision;
   const cdnOperation = routeRevision.cdnOperation;
   const routeFailed = routeRevision.status === "failed";
+  const generatedConfig = redactRouteConfig(routeRevision.generatedConfig);
 
   return (
     <Panel
@@ -78,7 +80,7 @@ export function RoutePreview({ preview }: RoutePreviewProps) {
         </div>
       )}
       <pre className="release-code" aria-label="Generated route config preview">
-        {routeRevision.generatedConfig}
+        {generatedConfig}
       </pre>
     </Panel>
   );

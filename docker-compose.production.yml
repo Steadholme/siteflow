@@ -1,0 +1,181 @@
+# Production single-host profile for release evidence and operator review.
+# The API runs without the Docker socket and drops root. The worker keeps the
+# trusted single-host Docker socket profile because source builds need the host
+# daemon until a stronger build isolation boundary exists.
+
+services:
+  postgres:
+    image: ${SITEFLOW_POSTGRES_IMAGE:?SITEFLOW_POSTGRES_IMAGE must be pinned by digest for production}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${SITEFLOW_POSTGRES_DB:-siteflow}
+      POSTGRES_USER: ${SITEFLOW_POSTGRES_USER:-siteflow}
+      POSTGRES_PASSWORD_FILE: /run/secrets/siteflow_postgres_password
+    volumes:
+      - type: bind
+        source: ${SITEFLOW_POSTGRES_DATA:-/var/lib/siteflow/postgres}
+        target: /var/lib/postgresql/data
+    secrets:
+      - siteflow_postgres_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  api:
+    image: ${SITEFLOW_IMAGE:?SITEFLOW_IMAGE must be the digest-pinned release image for production}
+    restart: unless-stopped
+    user: "1000:1000"
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      SITEFLOW_ENV: production
+      SITEFLOW_POSTGRES_DB: ${SITEFLOW_POSTGRES_DB:-siteflow}
+      SITEFLOW_POSTGRES_USER: ${SITEFLOW_POSTGRES_USER:-siteflow}
+      DATABASE_URL: "postgres://${SITEFLOW_POSTGRES_USER:-siteflow}@postgres:5432/${SITEFLOW_POSTGRES_DB:-siteflow}"
+      SITEFLOW_API_PORT: "8787"
+      SITEFLOW_ARTIFACT_ROOT: ${SITEFLOW_ARTIFACT_ROOT:-/var/lib/siteflow/artifacts}
+      SITEFLOW_BACKUP_AUTOMATION_RUN_RECORD: ${SITEFLOW_BACKUP_AUTOMATION_RUN_RECORD:-/var/lib/siteflow/evidence/backup-automation-run.json}
+      SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES: ${SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES:-536870912}
+      SITEFLOW_PREBUILT_MAX_FILES: ${SITEFLOW_PREBUILT_MAX_FILES:-20000}
+      SITEFLOW_PUBLIC_SCHEME: ${SITEFLOW_PUBLIC_SCHEME:-https}
+      SITEFLOW_TRUST_PROXY: ${SITEFLOW_TRUST_PROXY:-loopback}
+      SITEFLOW_BASE_DOMAIN: ${SITEFLOW_BASE_DOMAIN:?SITEFLOW_BASE_DOMAIN is required for production preview routes}
+      SITEFLOW_ALLOWED_ORIGIN: ${SITEFLOW_ALLOWED_ORIGIN:-}
+      SITEFLOW_APP_SECRET_FILE: /run/secrets/siteflow_app_secret
+      SITEFLOW_API_TOKEN_FILE: /run/secrets/siteflow_api_token
+      SITEFLOW_METRICS_TOKEN_FILE: /run/secrets/siteflow_metrics_token
+      SITEFLOW_POSTGRES_PASSWORD_FILE: /run/secrets/siteflow_postgres_password
+      SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_github_webhook_secret
+      SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_gitlab_webhook_secret
+      SITEFLOW_GITEA_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_gitea_webhook_secret
+      SITEFLOW_GENERIC_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_generic_webhook_secret
+    ports:
+      - "${SITEFLOW_API_BIND:-127.0.0.1}:8787:8787"
+    volumes:
+      - type: bind
+        source: ${SITEFLOW_ARTIFACT_ROOT:-/var/lib/siteflow/artifacts}
+        target: ${SITEFLOW_ARTIFACT_ROOT:-/var/lib/siteflow/artifacts}
+      - type: bind
+        source: ${SITEFLOW_EVIDENCE_ROOT:-/var/lib/siteflow/evidence}
+        target: ${SITEFLOW_EVIDENCE_ROOT:-/var/lib/siteflow/evidence}
+        read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    secrets:
+      - siteflow_app_secret
+      - siteflow_api_token
+      - siteflow_metrics_token
+      - siteflow_postgres_password
+      - siteflow_github_webhook_secret
+      - siteflow_gitlab_webhook_secret
+      - siteflow_gitea_webhook_secret
+      - siteflow_generic_webhook_secret
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8787/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  worker:
+    image: ${SITEFLOW_IMAGE:?SITEFLOW_IMAGE must be the digest-pinned release image for production}
+    restart: unless-stopped
+    user: "${SITEFLOW_WORKER_USER:-0:0}"
+    group_add:
+      - "${SITEFLOW_DOCKER_SOCKET_GID:-0}"
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      SITEFLOW_ENV: production
+      SITEFLOW_POSTGRES_DB: ${SITEFLOW_POSTGRES_DB:-siteflow}
+      SITEFLOW_POSTGRES_USER: ${SITEFLOW_POSTGRES_USER:-siteflow}
+      DATABASE_URL: "postgres://${SITEFLOW_POSTGRES_USER:-siteflow}@postgres:5432/${SITEFLOW_POSTGRES_DB:-siteflow}"
+      SITEFLOW_ARTIFACT_ROOT: ${SITEFLOW_ARTIFACT_ROOT:-/var/lib/siteflow/artifacts}
+      SITEFLOW_PUBLIC_SCHEME: ${SITEFLOW_PUBLIC_SCHEME:-https}
+      SITEFLOW_BASE_DOMAIN: ${SITEFLOW_BASE_DOMAIN:?SITEFLOW_BASE_DOMAIN is required for production preview routes}
+      SITEFLOW_BUILD_RUNNER: docker
+      SITEFLOW_BUILD_NETWORK: ${SITEFLOW_BUILD_NETWORK:-none}
+      SITEFLOW_BUILD_IMAGE: ${SITEFLOW_BUILD_IMAGE:?SITEFLOW_BUILD_IMAGE must be pinned for production Docker builds}
+      SITEFLOW_BUILD_IMAGE_ALLOWLIST: ${SITEFLOW_BUILD_IMAGE_ALLOWLIST:-}
+      SITEFLOW_BUILD_MEMORY: ${SITEFLOW_BUILD_MEMORY:-1g}
+      SITEFLOW_BUILD_CPUS: ${SITEFLOW_BUILD_CPUS:-2}
+      SITEFLOW_BUILD_PIDS_LIMIT: ${SITEFLOW_BUILD_PIDS_LIMIT:-256}
+      SITEFLOW_BUILD_USER: ${SITEFLOW_BUILD_USER:-1000:1000}
+      SITEFLOW_BUILD_MAX_ARTIFACT_BYTES: ${SITEFLOW_BUILD_MAX_ARTIFACT_BYTES:-536870912}
+      SITEFLOW_BUILD_MAX_ARTIFACT_FILES: ${SITEFLOW_BUILD_MAX_ARTIFACT_FILES:-20000}
+      SITEFLOW_BUILD_MIN_FREE_BYTES: ${SITEFLOW_BUILD_MIN_FREE_BYTES:?SITEFLOW_BUILD_MIN_FREE_BYTES is required for production promotion evidence}
+      SITEFLOW_WORKER_POLL_INTERVAL_MS: ${SITEFLOW_WORKER_POLL_INTERVAL_MS:-5000}
+      TMPDIR: ${SITEFLOW_ARTIFACT_ROOT:-/var/lib/siteflow/artifacts}
+      SITEFLOW_APP_SECRET_FILE: /run/secrets/siteflow_app_secret
+      SITEFLOW_POSTGRES_PASSWORD_FILE: /run/secrets/siteflow_postgres_password
+    command:
+      - sh
+      - -ec
+      - |
+        if ! command -v docker >/dev/null 2>&1; then
+          echo "SITEFLOW_BUILD_RUNNER=docker requires the Docker CLI inside the worker image." >&2
+          exit 1
+        fi
+        if ! docker info >/dev/null 2>&1; then
+          echo "SITEFLOW_BUILD_RUNNER=docker requires access to the trusted single-host Docker socket." >&2
+          exit 1
+        fi
+        exec node dist-worker/worker/index.js
+    healthcheck:
+      test: ["CMD", "node", "dist-worker/worker/index.js", "--healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    volumes:
+      - type: bind
+        source: ${SITEFLOW_ARTIFACT_ROOT:-/var/lib/siteflow/artifacts}
+        target: ${SITEFLOW_ARTIFACT_ROOT:-/var/lib/siteflow/artifacts}
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=512m
+    secrets:
+      - siteflow_app_secret
+      - siteflow_postgres_password
+    # Trusted single-host operator profile: the socket-mounted worker controls
+    # the host Docker daemon and is not a multi-tenant sandbox boundary.
+
+secrets:
+  siteflow_app_secret:
+    file: ${SITEFLOW_CONFIG_DIR:-/etc/siteflow}/secrets/app-secret.secret
+  siteflow_api_token:
+    file: ${SITEFLOW_CONFIG_DIR:-/etc/siteflow}/secrets/api-token.secret
+  siteflow_metrics_token:
+    file: ${SITEFLOW_CONFIG_DIR:-/etc/siteflow}/secrets/metrics-token.secret
+  siteflow_postgres_password:
+    file: ${SITEFLOW_CONFIG_DIR:-/etc/siteflow}/secrets/postgres-password.secret
+  siteflow_github_webhook_secret:
+    file: ${SITEFLOW_CONFIG_DIR:-/etc/siteflow}/secrets/github-webhook.secret
+  siteflow_gitlab_webhook_secret:
+    file: ${SITEFLOW_CONFIG_DIR:-/etc/siteflow}/secrets/gitlab-webhook.secret
+  siteflow_gitea_webhook_secret:
+    file: ${SITEFLOW_CONFIG_DIR:-/etc/siteflow}/secrets/gitea-webhook.secret
+  siteflow_generic_webhook_secret:
+    file: ${SITEFLOW_CONFIG_DIR:-/etc/siteflow}/secrets/generic-webhook.secret

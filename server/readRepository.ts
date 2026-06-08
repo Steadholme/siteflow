@@ -1,4 +1,4 @@
-import type { FunctionEntrypoint, FunctionInvocation, LogDrain, ObservabilityLogEntry, PermissionScope, ReleaseChannelName, RoutingRule, SiteFlowId } from "../src/domain/siteflow.js";
+import type { Actor, ApiToken, FunctionEntrypoint, FunctionInvocation, LogDrain, ObservabilityLogEntry, OperatorSession, PermissionScope, ReleaseChannelName, RoutingRule, SiteFlowId } from "../src/domain/siteflow.js";
 import type {
   AnalyticsDashboardReadModel,
   AnalyticsIngestReadModel,
@@ -35,6 +35,10 @@ import type {
   OperationSnapshotReadModel,
   ApiTokenCreateReadModel,
   ApiTokenRevokeReadModel,
+  OperatorSessionCreateReadModel,
+  OperatorSessionRotateReadModel,
+  OperatorSessionRevokeAllReadModel,
+  OperatorSessionRevokeReadModel,
   ProjectDetailReadModel,
   ProjectEnvironmentSettingsReadModel,
   ProjectEnvironmentVariableUpsertReadModel,
@@ -76,6 +80,7 @@ import type {
   MatchRoutingRulesCommand,
   CreateApiTokenCommand,
   CreateFirewallRuleCommand,
+  CreateOperatorSessionCommand,
   DeleteEdgeConfigCommand,
   PutBlobCommand,
   PurgeCacheCommand,
@@ -83,6 +88,7 @@ import type {
   RemoveTeamMemberCommand,
   DisableFirewallRuleCommand,
   RevokeDeployHookCommand,
+  RevokeAllOperatorSessionsCommand,
   RevokeApiTokenCommand,
   RollbackDeploymentCommand,
   RunCronJobCommand,
@@ -104,9 +110,44 @@ export class SiteFlowNotFoundError extends Error {
   }
 }
 
+export type SiteFlowAuthPrincipal =
+  | {
+    kind: "root_api_token";
+    scopes: PermissionScope[];
+    actor: Actor;
+  }
+  | {
+    kind: "api_token";
+    scopes: PermissionScope[];
+    token?: ApiToken;
+    actor: Actor;
+  }
+  | {
+    kind: "operator_session";
+    scopes: PermissionScope[];
+    session?: OperatorSession;
+    actor: Actor;
+  };
+
+export interface OperatorSessionCreateResult extends OperatorSessionCreateReadModel {
+  secret: string;
+}
+
+export interface OperatorSessionRotateResult extends OperatorSessionRotateReadModel {
+  secret: string;
+  maxAgeSeconds: number;
+}
+
 export interface SiteFlowReadRepository {
   authorizeToken(token: string, permission: PermissionScope, projectId?: SiteFlowId): Promise<boolean>;
   resolveTokenPermissions(token: string, projectId?: SiteFlowId): Promise<PermissionScope[] | undefined>;
+  resolveSessionPermissions(token: string, projectId?: SiteFlowId): Promise<PermissionScope[] | undefined>;
+  resolveTokenPrincipal?(token: string, projectId?: SiteFlowId): Promise<SiteFlowAuthPrincipal | undefined>;
+  resolveSessionPrincipal?(token: string, projectId?: SiteFlowId): Promise<SiteFlowAuthPrincipal | undefined>;
+  createOperatorSession(command: CreateOperatorSessionCommand): Promise<OperatorSessionCreateResult>;
+  rotateOperatorSession(token: string): Promise<OperatorSessionRotateResult | undefined>;
+  revokeOperatorSession(token: string): Promise<OperatorSessionRevokeReadModel>;
+  revokeAllOperatorSessions(command: RevokeAllOperatorSessionsCommand): Promise<OperatorSessionRevokeAllReadModel>;
   listProjects(): Promise<ProjectListReadModel>;
   getProject(projectId: SiteFlowId): Promise<ProjectDetailReadModel>;
   getProjectSettings(projectId: SiteFlowId): Promise<ProjectSettingsReadModel>;

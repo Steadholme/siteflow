@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test-build:
+    name: Install, test, and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Release dependency policy
+        run: npm run --silent release:dependency:policy -- --json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Release source tree check
+        run: npm run --silent release:source:check -- --json
+
+      - name: Release commit readiness plan (advisory)
+        run: npm run --silent release:commit:plan -- --json
+
+      - name: Production Docker compose config check
+        env:
+          SITEFLOW_CONFIG_DIR: ${{ runner.temp }}/siteflow-config
+          SITEFLOW_BASE_DOMAIN: ci.example.invalid
+          SITEFLOW_IMAGE: ghcr.io/siteflow/siteflow@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          SITEFLOW_POSTGRES_IMAGE: postgres@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          SITEFLOW_BUILD_IMAGE: node:22-alpine@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+          SITEFLOW_BUILD_IMAGE_ALLOWLIST: node:22-alpine@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+          SITEFLOW_BUILD_MIN_FREE_BYTES: "1"
+        run: |
+          if docker compose version >/dev/null 2>&1; then
+            mkdir -p "$SITEFLOW_CONFIG_DIR/secrets"
+            for secret_name in \
+              app-secret \
+              api-token \
+              metrics-token \
+              postgres-password \
+              github-webhook \
+              gitlab-webhook \
+              gitea-webhook \
+              generic-webhook
+            do
+              printf '%s\n' "ci-placeholder-${secret_name}" > "$SITEFLOW_CONFIG_DIR/secrets/${secret_name}.secret"
+            done
+            docker compose -f docker-compose.production.yml config --quiet
+          else
+            echo "docker compose is not available; skipping production compose config validation."
+          fi
+
+      - name: Run tests
+        run: npm test -- --run
+
+      - name: Build
+        run: npm run build
+
+      - name: Release artifact gate
+        run: |
+          npm run --silent release:artifacts:check -- \
+            --json \
+            --manifest release-artifact-manifest.json \
+            --commit-ref "${{ github.sha }}" \
+            --repo "${{ github.repository }}" \
+            --branch "${{ github.ref_name }}" \
+            --target-environment ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run E2E tests
+        run: npm run test:e2e
+
+      - name: Upload Playwright artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts
+          path: |
+            playwright-report/**
+            test-results/**
+          if-no-files-found: ignore
+
+      - name: Release gate static sanity check (not promotion evidence)
+        run: npm run siteflow -- release-gate --allow-dirty --allow-manual-branch-protection

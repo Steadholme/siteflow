@@ -10,7 +10,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function localPathFromPayload(payload: unknown) {
+export function localPathFromPayload(payload: unknown) {
   if (!isRecord(payload)) {
     return undefined;
   }
@@ -50,6 +50,21 @@ function shouldCopy(sourcePath: string) {
   return !parts.includes(".git") && !parts.includes("node_modules");
 }
 
+export function workspaceJobRoot(workspaceRoot: string, jobId: string) {
+  if (!/^[A-Za-z0-9_-]+$/.test(jobId)) {
+    throw new Error("Source checkout job id must be a safe path segment.");
+  }
+
+  const resolvedWorkspaceRoot = path.resolve(workspaceRoot);
+  const resolvedJobRoot = path.resolve(resolvedWorkspaceRoot, jobId);
+
+  if (!resolvedJobRoot.startsWith(`${resolvedWorkspaceRoot}${path.sep}`)) {
+    throw new Error("Source checkout job root escapes the workspace root.");
+  }
+
+  return resolvedJobRoot;
+}
+
 export class LocalSourceResolver implements SourceResolver {
   private readonly sourceRoot?: string;
 
@@ -65,19 +80,26 @@ export class LocalSourceResolver implements SourceResolver {
       throw new Error(`Local source path is not a directory: ${sourceDirectory}`);
     }
 
-    const checkoutRoot = path.resolve(workspaceRoot, job.id, "source");
-    await rm(checkoutRoot, { recursive: true, force: true });
-    await mkdir(path.dirname(checkoutRoot), { recursive: true });
-    await cp(sourceDirectory, checkoutRoot, {
-      recursive: true,
-      force: true,
-      filter: shouldCopy
-    });
+    const jobRoot = workspaceJobRoot(workspaceRoot, job.id);
+    const checkoutRoot = path.join(jobRoot, "source");
+
+    try {
+      await rm(checkoutRoot, { recursive: true, force: true });
+      await mkdir(path.dirname(checkoutRoot), { recursive: true });
+      await cp(sourceDirectory, checkoutRoot, {
+        recursive: true,
+        force: true,
+        filter: shouldCopy
+      });
+    } catch (error) {
+      await rm(jobRoot, { recursive: true, force: true });
+      throw error;
+    }
 
     return {
       sourceDirectory: checkoutRoot,
       cleanup: async () => {
-        await rm(path.resolve(workspaceRoot, job.id), { recursive: true, force: true });
+        await rm(jobRoot, { recursive: true, force: true });
       }
     };
   }

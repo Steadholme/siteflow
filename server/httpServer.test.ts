@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { ApiToken, BlobObject, EdgeConfigEntry, FirewallRule, FunctionInvocation, LogDrain, ObservabilityLogEntry, PermissionScope, ReleaseChannelName, RoutingRule, SiteFlowId, TeamMember } from "../src/domain/siteflow";
+import type { Actor, ApiToken, BlobObject, EdgeConfigEntry, FirewallRule, FunctionInvocation, LogDrain, ObservabilityLogEntry, OperatorSession, PermissionScope, ReleaseChannelName, RoutingRule, SiteFlowId, SourceProvider, TeamMember } from "../src/domain/siteflow";
 import type {
   AnalyticsDashboardReadModel,
   AnalyticsIngestReadModel,
@@ -42,6 +42,8 @@ import type {
   OperationSnapshotReadModel,
   ApiTokenCreateReadModel,
   ApiTokenRevokeReadModel,
+  OperatorSessionRevokeAllReadModel,
+  OperatorSessionRevokeReadModel,
   ProjectDetailReadModel,
   ProjectEnvironmentSettingsReadModel,
   ProjectEnvironmentVariableUpsertReadModel,
@@ -64,6 +66,7 @@ import type {
   AdvanceRollingReleaseCommand,
   AnalyticsEventCommand,
   CompleteRollingReleaseCommand,
+  CreateApiTokenCommand,
   CreateCronJobCommand,
   CreateFirewallRuleCommand,
   CreateLogDrainCommand,
@@ -88,6 +91,7 @@ import type {
   PutBlobCommand,
   PurgeCacheCommand,
   RevokeDeployHookCommand,
+  RevokeAllOperatorSessionsCommand,
   RollbackDeploymentCommand,
   RunCronJobCommand,
   SaveLogQueryCommand,
@@ -102,8 +106,9 @@ import type { PrebuiltDeployCommand, PrebuiltDeployResult } from "../src/lib/api
 import { normalizeAnalyticsEventInput } from "../src/lib/analytics";
 import { siteflowFixtures } from "../src/lib/fixtures/siteflow.fixtures";
 import { SITEFLOW_SECRET_CANARY } from "../src/lib/redaction";
-import { createSiteFlowServer, type DrainFetch, type FunctionModuleLoader } from "./httpServer";
-import { SiteFlowNotFoundError, type ArtifactRoute, type RecordLogDrainDeliveryCommand, type SiteFlowReadRepository } from "./readRepository";
+import { createSiteFlowServer, type DrainFetch, type FunctionModuleLoader, type ReleaseEvidenceEvaluator, type SiteFlowReadinessCheck, type SiteFlowRequestLogEntry, type SiteFlowRuntimeMetricsCollector, type SiteFlowTrustedProxyPolicy } from "./httpServer";
+import { createDefaultRequestLogger, createProductionMetricsCollector, createStdoutRequestLogger, defaultAllowSameProcessFunctionRuntime, defaultOperatorSessionIdleTimeoutSeconds, defaultSecureCookies, defaultTrustProxy, gitWebhookSecretsFromEnv, requireProductionApiToken, requireProductionMetricsToken, resolveDatabaseUrl } from "./index";
+import { SiteFlowNotFoundError, type ArtifactRoute, type OperatorSessionCreateResult, type OperatorSessionRotateResult, type RecordLogDrainDeliveryCommand, type SiteFlowAuthPrincipal, type SiteFlowReadRepository } from "./readRepository";
 
 async function rawHttpGet(
   baseUrl: string,
@@ -156,18 +161,171 @@ function rawHeaderValues(rawHeaders: string[], name: string) {
   return values;
 }
 
+function releaseEvidenceMetadata(overrides: Record<string, unknown> = {}) {
+  return {
+    evidencePath: "evidence/release-evidence.json",
+    checkedAt: new Date().toISOString(),
+    status: "passed" as const,
+    commitRef: "abc123def4567890",
+    repository: "acme/siteflow",
+    branch: "main",
+    targetEnvironment: "production",
+    releaseTicket: "REL-2026-0608",
+    operatorName: "release-operator",
+    ...overrides
+  };
+}
+
+function releaseEvidenceBundle(overrides: Record<string, unknown> = {}) {
+  return {
+    schemaVersion: "siteflow.releaseEvidence.v1",
+    name: "siteflow-release-evidence-bundle",
+    checkedAt: new Date().toISOString(),
+    targetEnvironment: "production",
+    release: {
+      commitRef: "abc123def4567890",
+      repository: "acme/siteflow",
+      branch: "main",
+      targetEnvironment: "production",
+      releaseTicket: "REL-2026-0608",
+      operatorName: "release-operator"
+    },
+    ...overrides
+  };
+}
+
+function releaseEvidenceRequest(overrides: Record<string, unknown> = {}) {
+  return {
+    evidencePath: "evidence/release-evidence.json",
+    bundle: releaseEvidenceBundle(),
+    ...overrides
+  };
+}
+
+function passingReleaseEvidenceEvaluator(calls: Array<{ rawEvidence: unknown; evidencePath: string }> = []): ReleaseEvidenceEvaluator {
+  return (rawEvidence, options) => {
+    calls.push({ rawEvidence, evidencePath: options.evidencePath });
+
+    return {
+      name: "siteflow-release-evidence-bundle-check",
+      status: "passed",
+      checkedAt: new Date().toISOString(),
+      evidencePath: options.evidencePath,
+      thresholds: {
+        maxEvidenceAgeHours: 168,
+        allowHostBuildException: false
+      },
+      selectedEvidence: {
+        releaseCommitRef: "abc123def4567890",
+        repository: "acme/siteflow",
+        branch: "main",
+        releaseGateStatus: "pass",
+        dockerBuildRehearsalStatus: "passed",
+        postgresRehearsalStatus: "passed",
+        artifactEvidenceStatus: "passed",
+        releaseImageDigest: `sha256:${"f".repeat(64)}`,
+        backupEvidenceStatus: "passed",
+        observabilityEvidenceStatus: "passed",
+        operatorAccessEvidenceStatus: "passed",
+        nonSessionCredentialEvidenceStatus: "passed",
+        ingressEvidenceStatus: "passed",
+        upgradeRollbackDrillStatus: "passed"
+      },
+      checks: [
+        {
+          name: "bundle",
+          status: "pass",
+          message: "Bundle passed."
+        }
+      ],
+      exitCode: 0
+    };
+  };
+}
+
 function fixtureRepository(): SiteFlowReadRepository {
   const fixture = siteflowFixtures.healthy;
   const tokenScopes: Record<string, PermissionScope[]> = {
     "read-token": ["read"],
     "operator-token": ["read", "write"],
-    "admin-token": ["read", "write", "admin"]
+    "admin-token": ["read", "write", "admin"],
+    "project-admin-token": ["read", "write", "admin"]
   };
-  const canUseToken = (token: string, permission: PermissionScope) => {
+  const tokenActors: Record<string, Actor | undefined> = {
+    "read-token": { id: "token-read", name: "Read token", role: "system" },
+    "operator-token": { id: "token-operator", name: "Operator token", role: "operator" },
+    "project-admin-token": { id: "token-project-admin", name: "Project admin token", role: "operator" }
+  };
+  const tokenProjectIds: Record<string, SiteFlowId | undefined> = {
+    "project-admin-token": "project-acme-dashboard"
+  };
+  const sessionScopes: Record<string, PermissionScope[] | undefined> = {
+    "session-read-token": ["read"],
+    "session-admin-token": ["read", "write", "admin"],
+    "expired-session-token": undefined
+  };
+  const sessionProjectIds: Record<string, SiteFlowId[] | undefined> = {
+    "session-admin-token": undefined
+  };
+  const sessionSubjects: Record<string, string | undefined> = {
+    "session-admin-token": "ops@example.com",
+    "session-read-token": "reader@example.com"
+  };
+  const sessionActors: Record<string, Actor | undefined> = {
+    "session-admin-token": { id: "session-operator", name: "Session Operator", role: "operator" }
+  };
+  let sessionSequence = 0;
+  const canUseToken = (token: string, permission: PermissionScope, projectId?: SiteFlowId) => {
+    const tokenProjectId = tokenProjectIds[token];
+
+    if (tokenProjectId && tokenProjectId !== projectId) {
+      return false;
+    }
+
     const scopes = tokenScopes[token] ?? [];
     const level = (scope: PermissionScope) => scope === "read" ? 0 : scope === "write" ? 1 : 2;
 
     return scopes.some((scope) => level(scope) >= level(permission));
+  };
+  const operatorSession = (
+    secret: string,
+    subject: string,
+    scopes: PermissionScope[],
+    projectIds?: SiteFlowId[],
+    status: OperatorSession["status"] = "active"
+  ): OperatorSession => ({
+    id: `session-${secret.replace(/[^a-z0-9]+/gi, "-")}`,
+    subject,
+    tokenPrefix: secret.slice(0, 12),
+    scopes,
+    projectIds,
+    status,
+    createdAt: "2026-06-07T00:00:00.000Z",
+    expiresAt: "2026-06-07T01:00:00.000Z",
+    revokedAt: status === "revoked" ? "2026-06-07T00:30:00.000Z" : undefined,
+    lastUsedAt: "2026-06-07T00:10:00.000Z"
+  });
+  const apiToken = (token: string, scopes: PermissionScope[]): ApiToken => ({
+    id: `token-${token.replace(/[^a-z0-9]+/gi, "-")}`,
+    projectId: tokenProjectIds[token],
+    name: `${token} fixture`,
+    tokenPrefix: token.slice(0, 12),
+    scopes,
+    status: "active",
+    createdBy: tokenActors[token],
+    createdAt: "2026-06-07T00:00:00.000Z",
+    updatedAt: "2026-06-07T00:00:00.000Z",
+    lastUsedAt: "2026-06-07T00:10:00.000Z"
+  });
+  const fallbackApiTokenActor = (token: ApiToken): Actor => token.createdBy ?? {
+    id: `api-token:${token.id}`,
+    name: token.name,
+    role: "system"
+  };
+  const fallbackSessionActor = (session: OperatorSession): Actor => session.actor ?? {
+    id: `operator-session:${session.id}`,
+    name: session.subject,
+    role: "operator"
   };
   const fixtureBlob = (projectId: SiteFlowId, pathname = "assets/fixture.txt"): BlobObject => ({
     id: `blob_${projectId}_${pathname.replace(/[^a-z0-9]+/gi, "_")}`,
@@ -185,8 +343,162 @@ function fixtureRepository(): SiteFlowReadRepository {
   });
 
   return {
-    resolveTokenPermissions: async (token: string): Promise<PermissionScope[] | undefined> => tokenScopes[token],
-    authorizeToken: async (token: string, permission: PermissionScope): Promise<boolean> => canUseToken(token, permission),
+    resolveTokenPrincipal: async (token: string, projectId?: SiteFlowId): Promise<SiteFlowAuthPrincipal | undefined> => {
+      const tokenProjectId = tokenProjectIds[token];
+
+      if (tokenProjectId && tokenProjectId !== projectId) {
+        return undefined;
+      }
+
+      const scopes = tokenScopes[token];
+
+      if (!scopes) {
+        return undefined;
+      }
+
+      const resolvedToken = apiToken(token, scopes);
+
+      return {
+        kind: "api_token",
+        scopes,
+        token: resolvedToken,
+        actor: fallbackApiTokenActor(resolvedToken)
+      };
+    },
+    resolveTokenPermissions: async (token: string, projectId?: SiteFlowId): Promise<PermissionScope[] | undefined> =>
+      canUseToken(token, "read", projectId) ? tokenScopes[token] : undefined,
+    authorizeToken: async (token: string, permission: PermissionScope, projectId?: SiteFlowId): Promise<boolean> => canUseToken(token, permission, projectId),
+    resolveSessionPrincipal: async (token: string, projectId?: SiteFlowId): Promise<SiteFlowAuthPrincipal | undefined> => {
+      const scopes = sessionScopes[token];
+
+      if (!scopes) {
+        return undefined;
+      }
+
+      const session = {
+        ...operatorSession(token, sessionSubjects[token] ?? "operator", scopes, sessionProjectIds[token]),
+        actor: sessionActors[token]
+      };
+      const scoped = !session.projectIds || (projectId !== undefined && session.projectIds.includes(projectId));
+
+      return {
+        kind: "operator_session",
+        scopes: scoped ? scopes : [],
+        session,
+        actor: fallbackSessionActor(session)
+      };
+    },
+    resolveSessionPermissions: async (token: string): Promise<PermissionScope[] | undefined> => sessionScopes[token],
+    createOperatorSession: async (command): Promise<OperatorSessionCreateResult> => {
+      const secret = `sfs_fixture_session_${++sessionSequence}`;
+      const scopes = command.scopes as PermissionScope[];
+      sessionScopes[secret] = scopes;
+      sessionProjectIds[secret] = command.projectIds;
+      sessionSubjects[secret] = command.subject ?? "operator";
+      sessionActors[secret] = command.actor;
+
+      return {
+        status: "created",
+        session: {
+          ...operatorSession(secret, command.subject ?? "operator", scopes, command.projectIds),
+          actor: command.actor,
+          expiresAt: "2026-06-07T01:00:00.000Z"
+        },
+        secret,
+        message: "Operator session created."
+      };
+    },
+    rotateOperatorSession: async (token: string): Promise<OperatorSessionRotateResult | undefined> => {
+      const scopes = sessionScopes[token];
+
+      if (!scopes) {
+        return undefined;
+      }
+
+      const secret = `sfs_fixture_session_${++sessionSequence}`;
+      const projectIds = sessionProjectIds[token];
+      const subject = sessionSubjects[token] ?? "operator";
+      const actor = sessionActors[token];
+
+      delete sessionScopes[token];
+      delete sessionProjectIds[token];
+      delete sessionSubjects[token];
+      delete sessionActors[token];
+
+      sessionScopes[secret] = scopes;
+      sessionProjectIds[secret] = projectIds;
+      sessionSubjects[secret] = subject;
+      sessionActors[secret] = actor;
+
+      return {
+        status: "rotated",
+        session: {
+          ...operatorSession(secret, subject, scopes, projectIds),
+          actor,
+          expiresAt: "2026-06-07T01:00:00.000Z"
+        },
+        secret,
+        maxAgeSeconds: 900,
+        message: "Operator session rotated."
+      };
+    },
+    revokeOperatorSession: async (token: string): Promise<OperatorSessionRevokeReadModel> => {
+      const scopes = sessionScopes[token];
+      delete sessionScopes[token];
+      delete sessionProjectIds[token];
+      delete sessionSubjects[token];
+      delete sessionActors[token];
+
+      if (!scopes) {
+        return {
+          status: "not_found",
+          message: "Operator session was not found."
+        };
+      }
+
+      return {
+        status: "revoked",
+        session: operatorSession(token, "operator", scopes, undefined, "revoked"),
+        message: "Operator session revoked."
+      };
+    },
+    revokeAllOperatorSessions: async (command: RevokeAllOperatorSessionsCommand): Promise<OperatorSessionRevokeAllReadModel> => {
+      const scope = command.projectId ? "project" : "global";
+      let revokedCount = 0;
+
+      for (const token of Object.keys(sessionScopes)) {
+        const scopes = sessionScopes[token];
+
+        if (!scopes) {
+          continue;
+        }
+
+        const projectIds = sessionProjectIds[token];
+        const inScope = command.projectId ? Boolean(projectIds?.includes(command.projectId)) : true;
+
+        if (!inScope) {
+          continue;
+        }
+
+        delete sessionScopes[token];
+        delete sessionProjectIds[token];
+        delete sessionSubjects[token];
+        delete sessionActors[token];
+        revokedCount += 1;
+      }
+
+      return {
+        status: "revoked",
+        scope,
+        projectId: command.projectId,
+        cutoffId: `sessioncutoff_fixture_${++sessionSequence}`,
+        revokedAt: "2026-06-07T00:40:00.000Z",
+        revokedCount,
+        message: command.projectId
+          ? "Project operator sessions were revoked."
+          : "All existing operator sessions were revoked."
+      };
+    },
     listProjects: async (): Promise<ProjectListReadModel> => fixture.projectList,
     getProject: async (projectId: SiteFlowId): Promise<ProjectDetailReadModel> => {
       const project = fixture.projects[projectId];
@@ -1368,19 +1680,51 @@ async function withServer<T>(
     allowedOrigin?: string;
     baseDomain?: string;
     githubWebhookSecret?: string;
+    gitWebhookSecrets?: Partial<Record<SourceProvider, string>>;
+    maxBodyBytes?: number;
+    prebuiltMaxUploadBytes?: number;
+    prebuiltMaxFiles?: number;
+    rateLimit?: false | {
+      maxRequests?: number;
+      windowMs?: number;
+      now?: () => number;
+    };
     functionModuleLoader?: FunctionModuleLoader;
     drainFetch?: DrainFetch;
+    requestLogger?: (entry: SiteFlowRequestLogEntry) => void;
+    readinessCheck?: SiteFlowReadinessCheck;
+    metricsToken?: string;
+    runtimeMetricsCollector?: SiteFlowRuntimeMetricsCollector;
+    secureCookies?: boolean;
+    trustProxy?: SiteFlowTrustedProxyPolicy;
+    releaseEvidenceEvaluator?: ReleaseEvidenceEvaluator;
+    productionRuntime?: boolean;
+    allowSameProcessFunctionRuntime?: boolean;
   } = {}
 ) {
   const server = createSiteFlowServer({
     repository,
     version: "0.1.0-test",
     apiToken: options.apiToken,
+    metricsToken: options.metricsToken,
     allowedOrigin: options.allowedOrigin,
     baseDomain: options.baseDomain,
     githubWebhookSecret: options.githubWebhookSecret,
+    gitWebhookSecrets: options.gitWebhookSecrets,
+    maxBodyBytes: options.maxBodyBytes,
+    prebuiltMaxUploadBytes: options.prebuiltMaxUploadBytes,
+    prebuiltMaxFiles: options.prebuiltMaxFiles,
+    rateLimit: options.rateLimit,
     functionModuleLoader: options.functionModuleLoader,
-    drainFetch: options.drainFetch
+    drainFetch: options.drainFetch,
+    requestLogger: options.requestLogger,
+    readinessCheck: options.readinessCheck,
+    runtimeMetricsCollector: options.runtimeMetricsCollector,
+    secureCookies: options.secureCookies,
+    trustProxy: options.trustProxy ?? true,
+    releaseEvidenceEvaluator: options.releaseEvidenceEvaluator,
+    productionRuntime: options.productionRuntime,
+    allowSameProcessFunctionRuntime: options.allowSameProcessFunctionRuntime
   });
 
   await new Promise<void>((resolve) => {
@@ -1409,6 +1753,26 @@ function signGitHubBody(rawBody: string, secret: string) {
   return `sha256=${createHmac("sha256", secret).update(rawBody).digest("hex")}`;
 }
 
+function gitLabSigningKey(secret: string) {
+  return secret.startsWith("whsec_") ? Buffer.from(secret.slice("whsec_".length), "base64") : secret;
+}
+
+function signGitLabBody(rawBody: string, secret: string, deliveryId: string, timestamp: string) {
+  return `v1,${createHmac("sha256", gitLabSigningKey(secret)).update(`${deliveryId}.${timestamp}.${rawBody}`).digest("base64")}`;
+}
+
+function currentGitLabWebhookTimestamp() {
+  return Math.floor(Date.now() / 1000).toString();
+}
+
+function signGiteaBody(rawBody: string, secret: string) {
+  return createHmac("sha256", secret).update(rawBody).digest("hex");
+}
+
+function signSiteFlowBody(rawBody: string, secret: string) {
+  return `sha256=${createHmac("sha256", secret).update(rawBody).digest("hex")}`;
+}
+
 function githubPushPayload() {
   return {
     ref: "refs/heads/main",
@@ -1428,6 +1792,7 @@ function githubPushPayload() {
       full_name: "acme/docs-portal",
       default_branch: "main",
       html_url: "https://github.com/acme/docs-portal",
+      ssh_url: "git@github.com:acme/docs-portal.git",
       owner: {
         login: "acme"
       }
@@ -1438,15 +1803,99 @@ function githubPushPayload() {
   };
 }
 
+function gitLabPushPayload() {
+  return {
+    object_kind: "push",
+    ref: "refs/heads/main",
+    before: "8ac4e0d77a9f",
+    after: "7f3a9c2d1b0e",
+    user_username: "gitlab-ada",
+    project: {
+      id: 84,
+      name: "docs-portal",
+      path_with_namespace: "acme/docs-portal",
+      default_branch: "main",
+      web_url: "https://gitlab.example.com/acme/docs-portal",
+      git_ssh_url: "git@gitlab.example.com:acme/docs-portal.git"
+    },
+    commits: [
+      {
+        id: "7f3a9c2d1b0e",
+        message: "Ship GitLab docs portal",
+        author: {
+          name: "Ada GitLab"
+        }
+      }
+    ]
+  };
+}
+
+function giteaPullRequestPayload() {
+  return {
+    action: "opened",
+    number: 12,
+    repository: {
+      id: 128,
+      name: "docs-portal",
+      full_name: "acme/docs-portal",
+      default_branch: "main",
+      html_url: "https://gitea.example.com/acme/docs-portal",
+      ssh_url: "git@gitea.example.com:acme/docs-portal.git",
+      owner: {
+        login: "acme"
+      }
+    },
+    pull_request: {
+      number: 12,
+      title: "Ship Gitea docs portal",
+      html_url: "https://gitea.example.com/acme/docs-portal/pulls/12",
+      head: {
+        ref: "feature/docs",
+        sha: "9f3a9c2d1b0e"
+      },
+      user: {
+        login: "gitea-ada"
+      }
+    },
+    sender: {
+      login: "gitea-ada"
+    }
+  };
+}
+
+function genericPushPayload() {
+  return {
+    kind: "push",
+    ref: "refs/heads/main",
+    commitSha: "6f3a9c2d1b0e",
+    commitMessage: "Ship generic docs portal",
+    commitAuthor: "Generic Ada",
+    repository: {
+      owner: "acme",
+      name: "docs-portal",
+      defaultBranch: "main",
+      remoteUrl: "ssh://git.example.com/acme/docs-portal.git"
+    },
+    actor: {
+      id: "generic:ada",
+      name: "generic-ada"
+    }
+  };
+}
+
 describe("SiteFlow control-plane HTTP server", () => {
   it("serves health and project read models", async () => {
     await withServer(fixtureRepository(), async (baseUrl) => {
       const health = await fetch(`${baseUrl}/healthz`).then((response) => response.json());
-      const projects = await fetch(`${baseUrl}/api/projects`).then((response) => response.json());
+      const projects = await fetch(`${baseUrl}/api/projects`, {
+        headers: {
+          authorization: "Bearer read-token"
+        }
+      }).then((response) => response.json());
 
       expect(health).toEqual({ status: "ok", version: "0.1.0-test" });
       expect(projects.summary.totalProjects).toBe(1);
-    });
+    }, { apiToken: "deploy-token" });
   });
 
   it("omits JSON bodies for HEAD read-only control-plane endpoints", async () => {
@@ -1476,9 +1925,90 @@ describe("SiteFlow control-plane HTTP server", () => {
     );
   });
 
+  it("serves readiness as ready by default and includes whitelisted readiness details", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const defaultReady = await fetch(`${baseUrl}/readyz`).then(async (response) => ({
+          status: response.status,
+          body: await response.json()
+        }));
+        const headReady = await rawHttpGet(baseUrl, "/readyz", {}, "HEAD");
+
+        expect(defaultReady).toEqual({
+          status: 200,
+          body: {
+            status: "ready",
+            details: {}
+          }
+        });
+        expect(headReady.status).toBe(200);
+        expect(headReady.headers["content-type"]).toBe("application/json; charset=utf-8");
+        expect(headReady.headers["content-length"]).toBeUndefined();
+        expect(headReady.body.byteLength).toBe(0);
+      }
+    );
+
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/readyz`);
+        const body = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(body).toEqual({
+          status: "ready",
+          details: {
+            database: "ok",
+            artifactRoot: "ok"
+          }
+        });
+      },
+      {
+        readinessCheck: async () => ({
+          status: "ready",
+          details: {
+            database: "ok",
+            artifactRoot: "ok",
+            unsafe: SITEFLOW_SECRET_CANARY
+          }
+        })
+      }
+    );
+  });
+
+  it("returns 503 for failed readiness checks without exposing internal errors", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/readyz`);
+        const body = await response.json();
+        const serialized = JSON.stringify(body);
+
+        expect(response.status).toBe(503);
+        expect(Object.keys(body).sort()).toEqual(["details", "status"]);
+        expect(body).toEqual({
+          status: "not_ready",
+          details: {}
+        });
+        expect(serialized).not.toContain(SITEFLOW_SECRET_CANARY);
+        expect(serialized).not.toContain("database password");
+      },
+      {
+        readinessCheck: async () => {
+          throw new Error(`database password ${SITEFLOW_SECRET_CANARY}`);
+        }
+      }
+    );
+  });
+
   it("serves deployment inventory with a project filter", async () => {
     await withServer(fixtureRepository(), async (baseUrl) => {
-      const response = await fetch(`${baseUrl}/api/deployments?projectId=project-acme-dashboard`);
+      const response = await fetch(`${baseUrl}/api/deployments?projectId=project-acme-dashboard`, {
+        headers: {
+          authorization: "Bearer read-token"
+        }
+      });
       const body = await response.json();
 
       expect(response.status).toBe(200);
@@ -1487,14 +2017,15 @@ describe("SiteFlow control-plane HTTP server", () => {
         projectId: "project-acme-dashboard"
       });
       expect(body.deployments.map((deployment: { id: string }) => deployment.id)).toContain("dep-healthy");
-    });
+    }, { apiToken: "deploy-token" });
   });
 
   it("omits JSON bodies for HEAD deployment read endpoints", async () => {
     await withServer(fixtureRepository(), async (baseUrl) => {
-      const inventory = await rawHttpGet(baseUrl, "/api/deployments?projectId=project-acme-dashboard", {}, "HEAD");
-      const deployment = await rawHttpGet(baseUrl, "/api/deployments/dep-healthy", {}, "HEAD");
-      const logs = await rawHttpGet(baseUrl, "/api/deployments/dep-healthy/logs", {}, "HEAD");
+      const authHeaders = { authorization: "Bearer read-token" };
+      const inventory = await rawHttpGet(baseUrl, "/api/deployments?projectId=project-acme-dashboard", authHeaders, "HEAD");
+      const deployment = await rawHttpGet(baseUrl, "/api/deployments/dep-healthy", authHeaders, "HEAD");
+      const logs = await rawHttpGet(baseUrl, "/api/deployments/dep-healthy/logs", authHeaders, "HEAD");
 
       expect(inventory.status).toBe(200);
       expect(inventory.headers["content-type"]).toBe("application/json; charset=utf-8");
@@ -1508,15 +2039,16 @@ describe("SiteFlow control-plane HTTP server", () => {
       expect(logs.headers["content-type"]).toBe("application/json; charset=utf-8");
       expect(logs.headers["content-length"]).toBeUndefined();
       expect(logs.body.byteLength).toBe(0);
-    });
+    }, { apiToken: "deploy-token" });
   });
 
   it("omits JSON bodies for HEAD project read endpoints", async () => {
     await withServer(
       fixtureRepository(),
       async (baseUrl) => {
-        const projects = await rawHttpGet(baseUrl, "/api/projects", {}, "HEAD");
-        const project = await rawHttpGet(baseUrl, "/api/projects/project-acme-dashboard", {}, "HEAD");
+        const authHeaders = { authorization: "Bearer deploy-token" };
+        const projects = await rawHttpGet(baseUrl, "/api/projects", authHeaders, "HEAD");
+        const project = await rawHttpGet(baseUrl, "/api/projects/project-acme-dashboard", authHeaders, "HEAD");
         const settings = await rawHttpGet(baseUrl, "/api/projects/project-acme-dashboard/settings", {
           authorization: "Bearer deploy-token"
         }, "HEAD");
@@ -1545,12 +2077,14 @@ describe("SiteFlow control-plane HTTP server", () => {
 
   it("omits JSON bodies for HEAD project observability read endpoints", async () => {
     await withServer(fixtureRepository(), async (baseUrl) => {
-      const environments = await rawHttpGet(baseUrl, "/api/projects/project-acme-dashboard/environments", {}, "HEAD");
-      const analytics = await rawHttpGet(baseUrl, "/api/projects/project-acme-dashboard/analytics", {}, "HEAD");
+      const authHeaders = { authorization: "Bearer read-token" };
+      const environments = await rawHttpGet(baseUrl, "/api/projects/project-acme-dashboard/environments", authHeaders, "HEAD");
+      const analytics = await rawHttpGet(baseUrl, "/api/projects/project-acme-dashboard/analytics", authHeaders, "HEAD");
+      const unauthorizedAnalytics = await rawHttpGet(baseUrl, "/api/projects/project-acme-dashboard/analytics", {}, "HEAD");
       const logs = await rawHttpGet(
         baseUrl,
         "/api/projects/project-acme-dashboard/logs?source=build&severity=warning",
-        {},
+        authHeaders,
         "HEAD"
       );
 
@@ -1562,11 +2096,15 @@ describe("SiteFlow control-plane HTTP server", () => {
       expect(analytics.headers["content-type"]).toBe("application/json; charset=utf-8");
       expect(analytics.headers["content-length"]).toBeUndefined();
       expect(analytics.body.byteLength).toBe(0);
+      expect(unauthorizedAnalytics.status).toBe(401);
+      expect(unauthorizedAnalytics.headers["content-type"]).toBe("application/json; charset=utf-8");
+      expect(unauthorizedAnalytics.headers["content-length"]).toBeUndefined();
+      expect(unauthorizedAnalytics.body.byteLength).toBe(0);
       expect(logs.status).toBe(200);
       expect(logs.headers["content-type"]).toBe("application/json; charset=utf-8");
       expect(logs.headers["content-length"]).toBeUndefined();
       expect(logs.body.byteLength).toBe(0);
-    });
+    }, { apiToken: "deploy-token" });
   });
 
   it("omits JSON bodies for HEAD protected project resource read endpoints", async () => {
@@ -1688,8 +2226,8 @@ describe("SiteFlow control-plane HTTP server", () => {
         const deployHooks = await rawHttpGet(baseUrl, "/api/projects/project-acme-dashboard/deploy-hooks", authHeaders, "HEAD");
         const cronJobs = await rawHttpGet(baseUrl, "/api/projects/project-acme-dashboard/cron-jobs", authHeaders, "HEAD");
         const rolling = await rawHttpGet(baseUrl, "/api/projects/project-acme-dashboard/rolling/production", authHeaders, "HEAD");
-        const release = await rawHttpGet(baseUrl, "/api/projects/project-acme-dashboard/release/production", {}, "HEAD");
-        const rollback = await rawHttpGet(baseUrl, "/api/projects/project-acme-dashboard/rollback/production", {}, "HEAD");
+        const release = await rawHttpGet(baseUrl, "/api/projects/project-acme-dashboard/release/production", authHeaders, "HEAD");
+        const rollback = await rawHttpGet(baseUrl, "/api/projects/project-acme-dashboard/rollback/production", authHeaders, "HEAD");
         const unauthorizedHooks = await rawHttpGet(baseUrl, "/api/projects/project-acme-dashboard/deploy-hooks", {}, "HEAD");
 
         for (const response of [deployHooks, cronJobs, rolling, release, rollback]) {
@@ -1710,13 +2248,15 @@ describe("SiteFlow control-plane HTTP server", () => {
 
   it("omits JSON bodies for HEAD operation polling endpoints", async () => {
     await withServer(fixtureRepository(), async (baseUrl) => {
-      const response = await rawHttpGet(baseUrl, "/api/operations/op-healthy-promote", {}, "HEAD");
+      const response = await rawHttpGet(baseUrl, "/api/operations/op-healthy-promote", {
+        authorization: "Bearer read-token"
+      }, "HEAD");
 
       expect(response.status).toBe(200);
       expect(response.headers["content-type"]).toBe("application/json; charset=utf-8");
       expect(response.headers["content-length"]).toBeUndefined();
       expect(response.body.byteLength).toBe(0);
-    });
+    }, { apiToken: "deploy-token" });
   });
 
   it("advertises supported read and mutation methods in CORS allow-method metadata", async () => {
@@ -1724,7 +2264,9 @@ describe("SiteFlow control-plane HTTP server", () => {
       fixtureRepository(),
       async (baseUrl) => {
         const preflight = await rawHttpGet(baseUrl, "/api/projects", {}, "OPTIONS");
-        const head = await rawHttpGet(baseUrl, "/api/projects", {}, "HEAD");
+        const head = await rawHttpGet(baseUrl, "/api/projects", {
+          authorization: "Bearer deploy-token"
+        }, "HEAD");
 
         for (const response of [preflight, head]) {
           expect(response.headers["access-control-allow-origin"]).toBe("https://console.example.test");
@@ -1740,6 +2282,7 @@ describe("SiteFlow control-plane HTTP server", () => {
           expect(allowedHeaders).toContain("if-match");
           expect(allowedHeaders).toContain("if-unmodified-since");
           expect(allowedHeaders).toContain("if-range");
+          expect(allowedHeaders).toContain("x-siteflow-csrf");
           expect(exposedHeaders).toContain("etag");
           expect(exposedHeaders).toContain("last-modified");
           expect(exposedHeaders).toContain("content-range");
@@ -1756,18 +2299,22 @@ describe("SiteFlow control-plane HTTP server", () => {
         expect(head.headers["access-control-max-age"]).toBeUndefined();
         expect(head.body.byteLength).toBe(0);
       },
-      { allowedOrigin: "https://console.example.test" }
+      { allowedOrigin: "https://console.example.test", apiToken: "deploy-token" }
     );
   });
 
   it("maps not-found repository errors to 404", async () => {
     await withServer(fixtureRepository(), async (baseUrl) => {
-      const response = await fetch(`${baseUrl}/api/projects/missing`);
+      const response = await fetch(`${baseUrl}/api/projects/missing`, {
+        headers: {
+          authorization: "Bearer read-token"
+        }
+      });
       const body = await response.json();
 
       expect(response.status).toBe(404);
       expect(body.message).toContain("Unknown project");
-    });
+    }, { apiToken: "deploy-token" });
   });
 
   it("omits JSON bodies for HEAD not-found responses", async () => {
@@ -1882,7 +2429,7 @@ describe("SiteFlow control-plane HTTP server", () => {
     );
   });
 
-  it("serves analytics dashboard and ingests privacy-sanitized events without bearer auth", async () => {
+  it("protects analytics dashboard reads while allowing privacy-sanitized event ingest without bearer auth", async () => {
     let dashboardProjectId: SiteFlowId | undefined;
     let ingestedCommand: AnalyticsEventCommand | undefined;
     const repository: SiteFlowReadRepository = {
@@ -1900,9 +2447,15 @@ describe("SiteFlow control-plane HTTP server", () => {
     await withServer(
       repository,
       async (baseUrl) => {
-        const dashboardResponse = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/analytics`);
+        const unauthorizedDashboardResponse = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/analytics`);
+        const dashboardResponse = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/analytics`, {
+          headers: {
+            authorization: "Bearer read-token"
+          }
+        });
         const dashboard = await dashboardResponse.json();
 
+        expect(unauthorizedDashboardResponse.status).toBe(401);
         expect(dashboardResponse.status).toBe(200);
         expect(dashboard).toMatchObject({
           projectId: "project-acme-dashboard",
@@ -1975,7 +2528,11 @@ describe("SiteFlow control-plane HTTP server", () => {
     await withServer(
       fixtureRepository(),
       async (baseUrl) => {
-        const logsResponse = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/logs?source=build&severity=warning`);
+        const logsResponse = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/logs?source=build&severity=warning`, {
+          headers: {
+            authorization: "Bearer read-token"
+          }
+        });
         const logs = await logsResponse.json();
 
         expect(logsResponse.status).toBe(200);
@@ -2183,6 +2740,34 @@ describe("SiteFlow control-plane HTTP server", () => {
       hookId: "hook_preview",
       reason: "rotated"
     });
+  });
+
+  it("ignores forwarded host and proto for deploy hook URLs when proxy trust is disabled", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const createResponse = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/deploy-hooks`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer deploy-token",
+            "x-forwarded-host": "console.siteflow.test",
+            "x-forwarded-proto": "https"
+          },
+          body: JSON.stringify({
+            name: "CMS rebuild",
+            branch: "main",
+            targetEnvironment: "preview"
+          })
+        });
+        const created = await createResponse.json();
+
+        expect(createResponse.status).toBe(201);
+        expect(created.hookUrl).toBe(`${baseUrl}/api/deploy-hooks/sfh_test_token/trigger`);
+        expect(created.hookUrl).not.toContain("console.siteflow.test");
+      },
+      { apiToken: "deploy-token", trustProxy: false }
+    );
   });
 
   it("manages firewall rules and Edge Config through project routes", async () => {
@@ -2926,6 +3511,7 @@ describe("SiteFlow control-plane HTTP server", () => {
 
   it("triggers deploy hooks without requiring the management bearer token", async () => {
     let triggeredCommand: TriggerDeployHookCommand | undefined;
+    const requestLogs: SiteFlowRequestLogEntry[] = [];
     const repository: SiteFlowReadRepository = {
       ...fixtureRepository(),
       triggerDeployHook: async (command: TriggerDeployHookCommand): Promise<DeployHookTriggerReadModel> => {
@@ -2946,7 +3532,8 @@ describe("SiteFlow control-plane HTTP server", () => {
             branch: "main",
             commitSha: "4f3a9c2d1b0e",
             commitMessage: "CMS published",
-            idempotencyKey: "cms-42"
+            idempotencyKey: "cms-42",
+            canary: SITEFLOW_SECRET_CANARY
           })
         });
         const body = await response.json();
@@ -2962,7 +3549,12 @@ describe("SiteFlow control-plane HTTP server", () => {
           }
         });
       },
-      { apiToken: "deploy-token" }
+      {
+        apiToken: "deploy-token",
+        requestLogger: (entry) => {
+          requestLogs.push(entry);
+        }
+      }
     );
 
     expect(triggeredCommand).toMatchObject({
@@ -2972,6 +3564,14 @@ describe("SiteFlow control-plane HTTP server", () => {
       commitMessage: "CMS published",
       idempotencyKey: "cms-42"
     });
+    expect(requestLogs).toHaveLength(1);
+    expect(requestLogs[0]).toMatchObject({
+      method: "POST",
+      path: "/api/deploy-hooks/[token]/trigger",
+      status: 202
+    });
+    expect(JSON.stringify(requestLogs)).not.toContain("sfh_test_token");
+    expect(JSON.stringify(requestLogs)).not.toContain(SITEFLOW_SECRET_CANARY);
   });
 
   it("accepts signed GitHub push webhooks and queues a build", async () => {
@@ -3142,6 +3742,367 @@ describe("SiteFlow control-plane HTTP server", () => {
     expect(ingestCalls).toBe(0);
   });
 
+  it("accepts signed GitLab push webhooks and stores clone metadata", async () => {
+    const secret = `whsec_${Buffer.from("gitlab-webhook-secret").toString("base64")}`;
+    let receivedCommand: GitWebhookCommand | undefined;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      ingestGitWebhook: async (command: GitWebhookCommand): Promise<GitWebhookIngestReadModel> => {
+        receivedCommand = command;
+        return fixtureRepository().ingestGitWebhook(command);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const deliveryId = "gitlab-delivery-1";
+        const timestamp = currentGitLabWebhookTimestamp();
+        const rawBody = JSON.stringify(gitLabPushPayload());
+        const response = await fetch(`${baseUrl}/api/webhooks/git/gitlab`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "webhook-id": deliveryId,
+            "webhook-timestamp": timestamp,
+            "webhook-signature": signGitLabBody(rawBody, secret, deliveryId, timestamp),
+            "x-gitlab-event": "Push Hook"
+          },
+          body: rawBody
+        });
+
+        expect(response.status).toBe(202);
+      },
+      { gitWebhookSecrets: { gitlab: secret } }
+    );
+
+    expect(receivedCommand).toMatchObject({
+      provider: "gitlab",
+      deliveryId: "gitlab-delivery-1",
+      event: {
+        provider: "gitlab",
+        kind: "push",
+        branch: "main",
+        commitSha: "7f3a9c2d1b0e",
+        commitMessage: "Ship GitLab docs portal",
+        commitAuthor: "Ada GitLab",
+        actor: {
+          id: "gitlab:gitlab-ada",
+          name: "gitlab-ada"
+        },
+        repository: {
+          provider: "gitlab",
+          owner: "acme",
+          name: "docs-portal",
+          providerPayload: {
+            remoteUrl: "git@gitlab.example.com:acme/docs-portal.git"
+          }
+        }
+      }
+    });
+  });
+
+  it("accepts signed Gitea pull request webhooks", async () => {
+    const secret = "gitea-webhook-secret";
+    let receivedCommand: GitWebhookCommand | undefined;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      ingestGitWebhook: async (command: GitWebhookCommand): Promise<GitWebhookIngestReadModel> => {
+        receivedCommand = command;
+        return fixtureRepository().ingestGitWebhook(command);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const rawBody = JSON.stringify(giteaPullRequestPayload());
+        const response = await fetch(`${baseUrl}/api/webhooks/git/gitea`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-gitea-delivery": "gitea-delivery-1",
+            "x-gitea-event": "pull_request",
+            "x-gitea-signature": signGiteaBody(rawBody, secret)
+          },
+          body: rawBody
+        });
+
+        expect(response.status).toBe(202);
+      },
+      { gitWebhookSecrets: { gitea: secret } }
+    );
+
+    expect(receivedCommand).toMatchObject({
+      provider: "gitea",
+      deliveryId: "gitea-delivery-1",
+      event: {
+        provider: "gitea",
+        kind: "pull_request",
+        branch: "feature/docs",
+        commitSha: "9f3a9c2d1b0e",
+        pullRequestNumber: 12,
+        repository: {
+          provider: "gitea",
+          owner: "acme",
+          name: "docs-portal",
+          providerPayload: {
+            remoteUrl: "git@gitea.example.com:acme/docs-portal.git"
+          }
+        }
+      }
+    });
+  });
+
+  it("accepts Gitea form payload webhooks with GitHub-compatible headers", async () => {
+    const secret = "gitea-webhook-secret";
+    let receivedCommand: GitWebhookCommand | undefined;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      ingestGitWebhook: async (command: GitWebhookCommand): Promise<GitWebhookIngestReadModel> => {
+        receivedCommand = command;
+        return fixtureRepository().ingestGitWebhook(command);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const rawBody = new URLSearchParams({ payload: JSON.stringify(giteaPullRequestPayload()) }).toString();
+        const response = await fetch(`${baseUrl}/api/webhooks/git/gitea`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            "x-github-delivery": "gitea-delivery-form-1",
+            "x-github-event": "pull_request",
+            "x-hub-signature-256": signGitHubBody(rawBody, secret)
+          },
+          body: rawBody
+        });
+
+        expect(response.status).toBe(202);
+      },
+      { gitWebhookSecrets: { gitea: secret } }
+    );
+
+    expect(receivedCommand).toMatchObject({
+      provider: "gitea",
+      deliveryId: "gitea-delivery-form-1",
+      event: {
+        provider: "gitea",
+        kind: "pull_request",
+        repository: {
+          providerPayload: {
+            remoteUrl: "git@gitea.example.com:acme/docs-portal.git"
+          }
+        }
+      }
+    });
+  });
+
+  it("accepts signed generic push webhooks without trusting internal source event shapes", async () => {
+    const secret = "generic-webhook-secret";
+    let receivedCommand: GitWebhookCommand | undefined;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      ingestGitWebhook: async (command: GitWebhookCommand): Promise<GitWebhookIngestReadModel> => {
+        receivedCommand = command;
+        return fixtureRepository().ingestGitWebhook(command);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const rawBody = JSON.stringify(genericPushPayload());
+        const response = await fetch(`${baseUrl}/api/webhooks/git/generic`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-siteflow-delivery": "generic-delivery-1",
+            "x-siteflow-event": "push",
+            "x-siteflow-signature": signSiteFlowBody(rawBody, secret)
+          },
+          body: rawBody
+        });
+
+        expect(response.status).toBe(202);
+      },
+      { gitWebhookSecrets: { generic: secret } }
+    );
+
+    expect(receivedCommand).toMatchObject({
+      provider: "generic",
+      deliveryId: "generic-delivery-1",
+      event: {
+        provider: "generic",
+        kind: "push",
+        branch: "main",
+        commitSha: "6f3a9c2d1b0e",
+        commitMessage: "Ship generic docs portal",
+        commitAuthor: "Generic Ada",
+        repository: {
+          provider: "generic",
+          owner: "acme",
+          name: "docs-portal",
+          providerPayload: {
+            remoteUrl: "ssh://git.example.com/acme/docs-portal.git"
+          }
+        }
+      }
+    });
+  });
+
+  it("rejects build-triggering webhooks that do not include a clone remote URL", async () => {
+    const secret = "github-webhook-secret";
+    let ingestCalls = 0;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      ingestGitWebhook: async (command: GitWebhookCommand): Promise<GitWebhookIngestReadModel> => {
+        ingestCalls += 1;
+        return fixtureRepository().ingestGitWebhook(command);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const payload = githubPushPayload();
+        const repositoryPayload = payload.repository as Record<string, unknown>;
+        delete repositoryPayload.ssh_url;
+        delete repositoryPayload.clone_url;
+        delete repositoryPayload.git_url;
+        const rawBody = JSON.stringify(payload);
+        const response = await fetch(`${baseUrl}/api/webhooks/git/github`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-github-delivery": "delivery-missing-remote",
+            "x-github-event": "push",
+            "x-hub-signature-256": signGitHubBody(rawBody, secret)
+          },
+          body: rawBody
+        });
+        const body = await response.json();
+
+        expect(response.status).toBe(400);
+        expect(body.message).toMatch(/remoteUrl is required/);
+      },
+      { githubWebhookSecret: secret }
+    );
+
+    expect(ingestCalls).toBe(0);
+  });
+
+  it("rejects non-GitHub webhooks with invalid signatures before repository ingest", async () => {
+    const secret = "gitlab-webhook-secret";
+    let ingestCalls = 0;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      ingestGitWebhook: async (command: GitWebhookCommand): Promise<GitWebhookIngestReadModel> => {
+        ingestCalls += 1;
+        return fixtureRepository().ingestGitWebhook(command);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const deliveryId = "gitlab-delivery-1";
+        const timestamp = currentGitLabWebhookTimestamp();
+        const rawBody = JSON.stringify(gitLabPushPayload());
+        const response = await fetch(`${baseUrl}/api/webhooks/git/gitlab`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "webhook-id": deliveryId,
+            "webhook-timestamp": timestamp,
+            "webhook-signature": signGitLabBody(`${rawBody}tampered`, secret, deliveryId, timestamp),
+            "x-gitlab-event": "Push Hook"
+          },
+          body: rawBody
+        });
+        const body = await response.json();
+
+        expect(response.status).toBe(401);
+        expect(body.message).toMatch(/signature verification failed/i);
+      },
+      { gitWebhookSecrets: { gitlab: secret } }
+    );
+
+    expect(ingestCalls).toBe(0);
+  });
+
+  it("rejects stale GitLab webhook timestamps before repository ingest", async () => {
+    const secret = `whsec_${Buffer.from("gitlab-webhook-secret").toString("base64")}`;
+    let ingestCalls = 0;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      ingestGitWebhook: async (command: GitWebhookCommand): Promise<GitWebhookIngestReadModel> => {
+        ingestCalls += 1;
+        return fixtureRepository().ingestGitWebhook(command);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const deliveryId = "gitlab-delivery-stale";
+        const timestamp = "1700000000";
+        const rawBody = JSON.stringify(gitLabPushPayload());
+        const response = await fetch(`${baseUrl}/api/webhooks/git/gitlab`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "webhook-id": deliveryId,
+            "webhook-timestamp": timestamp,
+            "webhook-signature": signGitLabBody(rawBody, secret, deliveryId, timestamp),
+            "x-gitlab-event": "Push Hook"
+          },
+          body: rawBody
+        });
+        const body = await response.json();
+
+        expect(response.status).toBe(401);
+        expect(body.message).toMatch(/signature verification failed/i);
+      },
+      { gitWebhookSecrets: { gitlab: secret } }
+    );
+
+    expect(ingestCalls).toBe(0);
+  });
+
+  it("fails closed when a provider webhook secret is not configured", async () => {
+    let ingestCalls = 0;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      ingestGitWebhook: async (command: GitWebhookCommand): Promise<GitWebhookIngestReadModel> => {
+        ingestCalls += 1;
+        return fixtureRepository().ingestGitWebhook(command);
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/webhooks/git/gitlab`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "webhook-id": "gitlab-delivery-1",
+          "webhook-timestamp": currentGitLabWebhookTimestamp(),
+          "webhook-signature": "v1,invalid",
+          "x-gitlab-event": "Push Hook"
+        },
+        body: JSON.stringify(gitLabPushPayload())
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(503);
+      expect(body).toEqual({ message: "GitLab webhook secret is not configured." });
+    });
+
+    expect(ingestCalls).toBe(0);
+  });
+
   it("reports the configured wildcard base domain through auth verify", async () => {
     await withServer(
       fixtureRepository(),
@@ -3164,11 +4125,14 @@ describe("SiteFlow control-plane HTTP server", () => {
     );
   });
 
-  it("accepts promotion commands through the HTTP API", async () => {
+  it("rejects production promotion commands without release evidence metadata", async () => {
     await withServer(fixtureRepository(), async (baseUrl) => {
       const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/release/production/promote`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
         body: JSON.stringify({
           projectId: "project-acme-dashboard",
           channel: "production",
@@ -3180,9 +4144,488 @@ describe("SiteFlow control-plane HTTP server", () => {
       });
       const body = await response.json();
 
+      expect(response.status).toBe(400);
+      expect(body.message).toContain("releaseEvidence");
+    }, { apiToken: "deploy-token" });
+  });
+
+  it("rejects production promotion commands with metadata-only release evidence", async () => {
+    let promoteCalls = 0;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      promoteDeployment: async (command: PromoteDeploymentCommand): Promise<CommandResultReadModel> => {
+        promoteCalls += 1;
+        return fixtureRepository().promoteDeployment(command);
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/release/production/promote`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
+        body: JSON.stringify({
+          projectId: "project-acme-dashboard",
+          channel: "production",
+          targetDeploymentId: "dep-healthy",
+          actor: { id: "actor-1", name: "Ops", role: "operator" },
+          reason: "ship",
+          idempotencyKey: "idem-metadata-only",
+          releaseEvidence: releaseEvidenceMetadata()
+        })
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(400);
+      expect(body.message).toContain("release evidence bundle");
+    }, { apiToken: "deploy-token" });
+
+    expect(promoteCalls).toBe(0);
+  });
+
+  it("rejects production promotion commands when the release evidence bundle checker blocks", async () => {
+    let promoteCalls = 0;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      promoteDeployment: async (command: PromoteDeploymentCommand): Promise<CommandResultReadModel> => {
+        promoteCalls += 1;
+        return fixtureRepository().promoteDeployment(command);
+      }
+    };
+    const blockedEvaluator: ReleaseEvidenceEvaluator = (rawEvidence, options) => ({
+      ...passingReleaseEvidenceEvaluator()(rawEvidence, options),
+      status: "blocked",
+      checks: [
+        {
+          name: "bundle",
+          status: "fail",
+          message: "Bundle failed."
+        }
+      ],
+      exitCode: 1
+    });
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/release/production/promote`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
+        body: JSON.stringify({
+          projectId: "project-acme-dashboard",
+          channel: "production",
+          targetDeploymentId: "dep-healthy",
+          actor: { id: "actor-1", name: "Ops", role: "operator" },
+          reason: "ship",
+          idempotencyKey: "idem-blocked",
+          releaseEvidence: releaseEvidenceRequest()
+        })
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(400);
+      expect(body.message).toContain("did not pass");
+      expect(body.message).toContain("bundle");
+    }, { apiToken: "deploy-token", releaseEvidenceEvaluator: blockedEvaluator });
+
+    expect(promoteCalls).toBe(0);
+  });
+
+  it("accepts production promotion commands through the HTTP API with a checked release evidence bundle", async () => {
+    const evaluatorCalls: Array<{ rawEvidence: unknown; evidencePath: string }> = [];
+
+    await withServer(fixtureRepository(), async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/release/production/promote`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
+        body: JSON.stringify({
+          projectId: "project-acme-dashboard",
+          channel: "production",
+          targetDeploymentId: "dep-healthy",
+          actor: { id: "actor-1", name: "Ops", role: "operator" },
+          reason: "ship",
+          idempotencyKey: "idem-1",
+          releaseEvidence: releaseEvidenceRequest()
+        })
+      });
+      const body = await response.json();
+
       expect(response.status).toBe(202);
       expect(body.status).toBe("accepted");
+    }, { apiToken: "deploy-token", releaseEvidenceEvaluator: passingReleaseEvidenceEvaluator(evaluatorCalls) });
+
+    expect(evaluatorCalls).toHaveLength(1);
+    expect(evaluatorCalls[0]).toMatchObject({
+      rawEvidence: expect.objectContaining({
+        schemaVersion: "siteflow.releaseEvidence.v1",
+        name: "siteflow-release-evidence-bundle",
+        targetEnvironment: "production"
+      }),
+      evidencePath: "evidence/release-evidence.json"
     });
+  });
+
+  it("rejects production rollback commands without release evidence metadata", async () => {
+    let rollbackCalls = 0;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      rollbackDeployment: async (command: RollbackDeploymentCommand): Promise<CommandResultReadModel> => {
+        rollbackCalls += 1;
+        return fixtureRepository().rollbackDeployment(command);
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/rollback/production/rollback`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
+        body: JSON.stringify({
+          projectId: "project-acme-dashboard",
+          channel: "production",
+          currentDeploymentId: "dep-healthy",
+          targetDeploymentId: "dep-acme-20260514-088",
+          actor: { id: "actor-1", name: "Ops", role: "operator" },
+          reason: "rollback",
+          idempotencyKey: "rollback-no-evidence"
+        })
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(400);
+      expect(body.message).toContain("releaseEvidence");
+    }, { apiToken: "deploy-token" });
+
+    expect(rollbackCalls).toBe(0);
+  });
+
+  it("rejects production rollback commands with metadata-only release evidence", async () => {
+    let rollbackCalls = 0;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      rollbackDeployment: async (command: RollbackDeploymentCommand): Promise<CommandResultReadModel> => {
+        rollbackCalls += 1;
+        return fixtureRepository().rollbackDeployment(command);
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/rollback/production/rollback`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
+        body: JSON.stringify({
+          projectId: "project-acme-dashboard",
+          channel: "production",
+          currentDeploymentId: "dep-healthy",
+          targetDeploymentId: "dep-acme-20260514-088",
+          actor: { id: "actor-1", name: "Ops", role: "operator" },
+          reason: "rollback",
+          idempotencyKey: "rollback-metadata-only",
+          releaseEvidence: releaseEvidenceMetadata()
+        })
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(400);
+      expect(body.message).toContain("release evidence bundle");
+    }, { apiToken: "deploy-token" });
+
+    expect(rollbackCalls).toBe(0);
+  });
+
+  it("rejects production rollback commands when the release evidence bundle checker blocks", async () => {
+    let rollbackCalls = 0;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      rollbackDeployment: async (command: RollbackDeploymentCommand): Promise<CommandResultReadModel> => {
+        rollbackCalls += 1;
+        return fixtureRepository().rollbackDeployment(command);
+      }
+    };
+    const blockedEvaluator: ReleaseEvidenceEvaluator = (rawEvidence, options) => ({
+      ...passingReleaseEvidenceEvaluator()(rawEvidence, options),
+      status: "blocked",
+      checks: [
+        {
+          name: "bundle",
+          status: "fail",
+          message: "Bundle failed."
+        }
+      ],
+      exitCode: 1
+    });
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/rollback/production/rollback`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
+        body: JSON.stringify({
+          projectId: "project-acme-dashboard",
+          channel: "production",
+          currentDeploymentId: "dep-healthy",
+          targetDeploymentId: "dep-acme-20260514-088",
+          actor: { id: "actor-1", name: "Ops", role: "operator" },
+          reason: "rollback",
+          idempotencyKey: "rollback-blocked",
+          releaseEvidence: releaseEvidenceRequest()
+        })
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(400);
+      expect(body.message).toContain("did not pass");
+      expect(body.message).toContain("bundle");
+    }, { apiToken: "deploy-token", releaseEvidenceEvaluator: blockedEvaluator });
+
+    expect(rollbackCalls).toBe(0);
+  });
+
+  it("accepts production rollback commands through the HTTP API with a checked release evidence bundle", async () => {
+    const evaluatorCalls: Array<{ rawEvidence: unknown; evidencePath: string }> = [];
+    let receivedCommand: RollbackDeploymentCommand | undefined;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      rollbackDeployment: async (command: RollbackDeploymentCommand): Promise<CommandResultReadModel> => {
+        receivedCommand = command;
+        return fixtureRepository().rollbackDeployment(command);
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/rollback/production/rollback`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
+        body: JSON.stringify({
+          projectId: "project-acme-dashboard",
+          channel: "production",
+          currentDeploymentId: "dep-healthy",
+          targetDeploymentId: "dep-acme-20260514-088",
+          actor: { id: "actor-1", name: "Ops", role: "operator" },
+          reason: "rollback",
+          idempotencyKey: "rollback-with-evidence",
+          releaseEvidence: releaseEvidenceRequest()
+        })
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(202);
+      expect(body.status).toBe("accepted");
+    }, { apiToken: "deploy-token", releaseEvidenceEvaluator: passingReleaseEvidenceEvaluator(evaluatorCalls) });
+
+    expect(evaluatorCalls).toHaveLength(1);
+    expect(receivedCommand).toMatchObject({
+      projectId: "project-acme-dashboard",
+      channel: "production",
+      targetDeploymentId: "dep-acme-20260514-088",
+      releaseEvidence: expect.objectContaining({
+        evidencePath: "evidence/release-evidence.json",
+        status: "passed",
+        commitRef: "abc123def4567890",
+        repository: "acme/siteflow",
+        branch: "main",
+        targetEnvironment: "production"
+      })
+    });
+  });
+
+  it("allows non-production promotion commands without release evidence metadata", async () => {
+    await withServer(fixtureRepository(), async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/release/staging/promote`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
+        body: JSON.stringify({
+          projectId: "project-acme-dashboard",
+          channel: "staging",
+          targetDeploymentId: "dep-healthy",
+          actor: { id: "actor-1", name: "Ops", role: "operator" },
+          reason: "stage",
+          idempotencyKey: "idem-staging"
+        })
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(202);
+      expect(body.status).toBe("accepted");
+    }, { apiToken: "deploy-token" });
+  });
+
+  it("strips release evidence bundle requests from non-production promotion commands", async () => {
+    let receivedCommand: PromoteDeploymentCommand | undefined;
+    const evaluatorCalls: Array<{ rawEvidence: unknown; evidencePath: string }> = [];
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      promoteDeployment: async (command: PromoteDeploymentCommand): Promise<CommandResultReadModel> => {
+        receivedCommand = command;
+        return fixtureRepository().promoteDeployment(command);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/release/staging/promote`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer deploy-token"
+          },
+          body: JSON.stringify({
+            projectId: "project-acme-dashboard",
+            channel: "staging",
+            targetDeploymentId: "dep-healthy",
+            actor: { id: "actor-1", name: "Ops", role: "operator" },
+            reason: "stage",
+            idempotencyKey: "idem-staging-evidence",
+            releaseEvidence: releaseEvidenceRequest()
+          })
+        });
+
+        expect(response.status).toBe(202);
+      },
+      { apiToken: "deploy-token", releaseEvidenceEvaluator: passingReleaseEvidenceEvaluator(evaluatorCalls) }
+    );
+
+    expect(evaluatorCalls).toHaveLength(0);
+    expect(receivedCommand).toMatchObject({
+      projectId: "project-acme-dashboard",
+      channel: "staging",
+      targetDeploymentId: "dep-healthy"
+    });
+    expect(receivedCommand).not.toHaveProperty("releaseEvidence");
+  });
+
+  it("allows non-production rollback commands without release evidence metadata", async () => {
+    await withServer(fixtureRepository(), async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/rollback/staging/rollback`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
+        body: JSON.stringify({
+          projectId: "project-acme-dashboard",
+          channel: "staging",
+          currentDeploymentId: "dep-healthy",
+          targetDeploymentId: "dep-acme-20260514-088",
+          actor: { id: "actor-1", name: "Ops", role: "operator" },
+          reason: "rollback",
+          idempotencyKey: "rollback-staging"
+        })
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(202);
+      expect(body.status).toBe("accepted");
+    }, { apiToken: "deploy-token" });
+  });
+
+  it("strips release evidence bundle requests from non-production rollback commands", async () => {
+    let receivedCommand: RollbackDeploymentCommand | undefined;
+    const evaluatorCalls: Array<{ rawEvidence: unknown; evidencePath: string }> = [];
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      rollbackDeployment: async (command: RollbackDeploymentCommand): Promise<CommandResultReadModel> => {
+        receivedCommand = command;
+        return fixtureRepository().rollbackDeployment(command);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/rollback/staging/rollback`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer deploy-token"
+          },
+          body: JSON.stringify({
+            projectId: "project-acme-dashboard",
+            channel: "staging",
+            currentDeploymentId: "dep-healthy",
+            targetDeploymentId: "dep-acme-20260514-088",
+            actor: { id: "actor-1", name: "Ops", role: "operator" },
+            reason: "rollback",
+            idempotencyKey: "rollback-staging-evidence",
+            releaseEvidence: releaseEvidenceRequest()
+          })
+        });
+
+        expect(response.status).toBe(202);
+      },
+      { apiToken: "deploy-token", releaseEvidenceEvaluator: passingReleaseEvidenceEvaluator(evaluatorCalls) }
+    );
+
+    expect(evaluatorCalls).toHaveLength(0);
+    expect(receivedCommand).toMatchObject({
+      projectId: "project-acme-dashboard",
+      channel: "staging",
+      targetDeploymentId: "dep-acme-20260514-088"
+    });
+    expect(receivedCommand).not.toHaveProperty("releaseEvidence");
+  });
+
+  it("strips release evidence bundle requests from non-production rolling commands", async () => {
+    let receivedCommand: StartRollingReleaseCommand | undefined;
+    const evaluatorCalls: Array<{ rawEvidence: unknown; evidencePath: string }> = [];
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      startRollingRelease: async (command: StartRollingReleaseCommand): Promise<RollingReleaseCommandReadModel> => {
+        receivedCommand = command;
+        return fixtureRepository().startRollingRelease(command);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/rolling/staging/start`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer deploy-token"
+          },
+          body: JSON.stringify({
+            candidateDeploymentId: "dep-canary",
+            percentage: 10,
+            reason: "canary",
+            idempotencyKey: "rollout-staging-start",
+            releaseEvidence: releaseEvidenceRequest()
+          })
+        });
+
+        expect(response.status).toBe(202);
+      },
+      { apiToken: "deploy-token", releaseEvidenceEvaluator: passingReleaseEvidenceEvaluator(evaluatorCalls) }
+    );
+
+    expect(evaluatorCalls).toHaveLength(0);
+    expect(receivedCommand).toMatchObject({
+      projectId: "project-acme-dashboard",
+      channel: "staging",
+      candidateDeploymentId: "dep-canary"
+    });
+    expect(receivedCommand).not.toHaveProperty("releaseEvidence");
   });
 
   it("uses release route project and channel instead of body values", async () => {
@@ -3198,25 +4641,35 @@ describe("SiteFlow control-plane HTTP server", () => {
     await withServer(repository, async (baseUrl) => {
       const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/release/production/promote`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
         body: JSON.stringify({
           projectId: "project-other",
           channel: "preview",
           targetDeploymentId: "dep-healthy",
-          actor: { id: "actor-1", name: "Ops", role: "operator" },
+          actor: { id: "client-spoof", name: "Spoofed Client", role: "operator" },
           reason: "ship",
-          idempotencyKey: "idem-url-source"
+          idempotencyKey: "idem-url-source",
+          releaseEvidence: releaseEvidenceRequest()
         })
       });
 
       expect(response.status).toBe(202);
-    });
+    }, { apiToken: "deploy-token", releaseEvidenceEvaluator: passingReleaseEvidenceEvaluator() });
 
     expect(receivedCommand).toMatchObject({
       projectId: "project-acme-dashboard",
       channel: "production",
-      targetDeploymentId: "dep-healthy"
+      targetDeploymentId: "dep-healthy",
+      actor: {
+        id: "siteflow:server",
+        name: "SiteFlow server",
+        role: "system"
+      }
     });
+    expect(receivedCommand?.actor.id).not.toBe("client-spoof");
   });
 
   it("uses rolling route project and channel instead of body values", async () => {
@@ -3271,7 +4724,8 @@ describe("SiteFlow control-plane HTTP server", () => {
             percentage: 10,
             actor: { id: "actor-1", name: "Ops", role: "operator" },
             reason: "canary",
-            idempotencyKey: "rollout-start"
+            idempotencyKey: "rollout-start",
+            releaseEvidence: releaseEvidenceRequest()
           })
         });
         const advance = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/rolling/production/advance`, {
@@ -3283,7 +4737,8 @@ describe("SiteFlow control-plane HTTP server", () => {
             percentage: 50,
             actor: { id: "actor-1", name: "Ops", role: "operator" },
             reason: "canary",
-            idempotencyKey: "rollout-advance"
+            idempotencyKey: "rollout-advance",
+            releaseEvidence: releaseEvidenceRequest()
           })
         });
         const complete = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/rolling/production/complete`, {
@@ -3294,7 +4749,8 @@ describe("SiteFlow control-plane HTTP server", () => {
             channel: "preview",
             actor: { id: "actor-1", name: "Ops", role: "operator" },
             reason: "ship",
-            idempotencyKey: "rollout-complete"
+            idempotencyKey: "rollout-complete",
+            releaseEvidence: releaseEvidenceRequest()
           })
         });
         const abort = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/rolling/production/abort`, {
@@ -3314,35 +4770,115 @@ describe("SiteFlow control-plane HTTP server", () => {
         expect(complete.status).toBe(202);
         expect(abort.status).toBe(202);
       },
-      { apiToken: "deploy-token" }
+      { apiToken: "deploy-token", releaseEvidenceEvaluator: passingReleaseEvidenceEvaluator() }
     );
 
     expect(received.start).toMatchObject({
       projectId: "project-acme-dashboard",
       channel: "production",
       candidateDeploymentId: "dep-canary",
-      percentage: 10
+      percentage: 10,
+      releaseEvidence: expect.objectContaining({
+        status: "passed",
+        commitRef: "abc123def4567890"
+      })
     });
     expect(received.advance).toMatchObject({
       projectId: "project-acme-dashboard",
       channel: "production",
-      percentage: 50
+      percentage: 50,
+      releaseEvidence: expect.objectContaining({
+        status: "passed",
+        commitRef: "abc123def4567890"
+      })
     });
     expect(received.complete).toMatchObject({
       projectId: "project-acme-dashboard",
-      channel: "production"
+      channel: "production",
+      releaseEvidence: expect.objectContaining({
+        status: "passed",
+        commitRef: "abc123def4567890"
+      })
     });
     expect(received.abort).toMatchObject({
       projectId: "project-acme-dashboard",
-      channel: "production"
+      channel: "production",
+      reason: "stop",
+      releaseEvidenceException: {
+        type: "production_rolling_abort_stop_rollout",
+        targetEnvironment: "production",
+        acceptedWithoutReleaseEvidence: true,
+        reason: "stop"
+      }
     });
+    expect(received.abort).not.toHaveProperty("releaseEvidence");
+  });
+
+  it("rejects production rolling release changes without release evidence metadata except abort", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const headers = {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        };
+        const start = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/rolling/production/start`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            candidateDeploymentId: "dep-canary",
+            percentage: 10,
+            reason: "canary",
+            idempotencyKey: "rollout-start"
+          })
+        });
+        const complete = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/rolling/production/complete`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            reason: "ship",
+            idempotencyKey: "rollout-complete"
+          })
+        });
+        const abort = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/rolling/production/abort`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            reason: "stop",
+            idempotencyKey: "rollout-abort"
+          })
+        });
+        const abortWithoutReason = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/rolling/production/abort`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            idempotencyKey: "rollout-abort-no-reason"
+          })
+        });
+        const startBody = await start.json();
+        const completeBody = await complete.json();
+        const abortWithoutReasonBody = await abortWithoutReason.json();
+
+        expect(start.status).toBe(400);
+        expect(startBody.message).toContain("releaseEvidence");
+        expect(complete.status).toBe(400);
+        expect(completeBody.message).toContain("releaseEvidence");
+        expect(abort.status).toBe(202);
+        expect(abortWithoutReason.status).toBe(400);
+        expect(abortWithoutReasonBody.message).toContain("audit reason");
+      },
+      { apiToken: "deploy-token" }
+    );
   });
 
   it("accepts prebuilt deploy uploads through the HTTP API", async () => {
     await withServer(fixtureRepository(), async (baseUrl) => {
       const response = await fetch(`${baseUrl}/api/deployments/prebuilt`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
         body: JSON.stringify({
           projectSlug: "docs",
           baseDomain: "w33d.xyz",
@@ -3360,7 +4896,196 @@ describe("SiteFlow control-plane HTTP server", () => {
 
       expect(response.status).toBe(201);
       expect(body.previewUrl).toBe("https://abc123.w33d.xyz");
+    }, { apiToken: "deploy-token" });
+  });
+
+  it("rejects prebuilt deploy uploads that exceed the configured upload byte budget before repository writes", async () => {
+    let deployPrebuiltCalled = false;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      deployPrebuilt: async (command: PrebuiltDeployCommand): Promise<PrebuiltDeployResult> => {
+        deployPrebuiltCalled = true;
+        return fixtureRepository().deployPrebuilt(command);
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/deployments/prebuilt`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
+        body: JSON.stringify({
+          projectSlug: "docs",
+          baseDomain: "w33d.xyz",
+          files: [
+            {
+              path: "index.html",
+              contentBase64: Buffer.from("<h1>Hello</h1>").toString("base64"),
+              size: 14,
+              sha256: "unused-by-fixture"
+            }
+          ]
+        })
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(413);
+      expect(body.message).toContain("SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES");
+      expect(body.message).toContain("14 > 4");
+    }, { apiToken: "deploy-token", prebuiltMaxUploadBytes: 4 });
+
+    expect(deployPrebuiltCalled).toBe(false);
+  });
+
+  it("rejects malformed prebuilt deploy upload file sizes as bad requests", async () => {
+    let deployPrebuiltCalled = false;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      deployPrebuilt: async (command: PrebuiltDeployCommand): Promise<PrebuiltDeployResult> => {
+        deployPrebuiltCalled = true;
+        return fixtureRepository().deployPrebuilt(command);
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/deployments/prebuilt`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
+        body: JSON.stringify({
+          projectSlug: "docs",
+          baseDomain: "w33d.xyz",
+          files: [
+            {
+              path: "index.html",
+              contentBase64: Buffer.from("<h1>Hello</h1>").toString("base64"),
+              size: 999,
+              sha256: "unused-by-fixture"
+            }
+          ]
+        })
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(400);
+      expect(body.message).toContain("size does not match decoded content");
+    }, { apiToken: "deploy-token" });
+
+    expect(deployPrebuiltCalled).toBe(false);
+  });
+
+  it("validates and forwards release evidence metadata from checked bundles on prebuilt deploy uploads", async () => {
+    let receivedCommand: PrebuiltDeployCommand | undefined;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      deployPrebuilt: async (command: PrebuiltDeployCommand): Promise<PrebuiltDeployResult> => {
+        receivedCommand = command;
+        return fixtureRepository().deployPrebuilt(command);
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/deployments/prebuilt`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
+        body: JSON.stringify({
+          projectSlug: "docs",
+          baseDomain: "w33d.xyz",
+          source: {
+            repository: "acme/siteflow",
+            branch: "main",
+            commitSha: "abc123def4567890"
+          },
+          releaseEvidence: releaseEvidenceRequest(),
+          files: [
+            {
+              path: "index.html",
+              contentBase64: Buffer.from("<h1>Hello</h1>").toString("base64"),
+              size: 14,
+              sha256: "unused-by-fixture"
+            }
+          ]
+        })
+      });
+
+      expect(response.status).toBe(201);
+    }, { apiToken: "deploy-token", releaseEvidenceEvaluator: passingReleaseEvidenceEvaluator() });
+
+    expect(receivedCommand).toMatchObject({
+      projectSlug: "docs",
+      source: {
+        repository: "acme/siteflow",
+        branch: "main",
+        commitSha: "abc123def4567890"
+      },
+      releaseEvidence: expect.objectContaining({
+        status: "passed",
+        commitRef: "abc123def4567890",
+        repository: "acme/siteflow",
+        branch: "main",
+        targetEnvironment: "production"
+      })
     });
+  });
+
+  it("rejects release evidence bundles that fail checking on prebuilt deploy uploads", async () => {
+    let deployPrebuiltCalled = false;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      deployPrebuilt: async (command: PrebuiltDeployCommand): Promise<PrebuiltDeployResult> => {
+        deployPrebuiltCalled = true;
+        return fixtureRepository().deployPrebuilt(command);
+      }
+    };
+    const blockedEvaluator: ReleaseEvidenceEvaluator = (rawEvidence, options) => ({
+      ...passingReleaseEvidenceEvaluator()(rawEvidence, options),
+      status: "blocked",
+      checks: [
+        {
+          name: "bundle_checked_at",
+          status: "fail",
+          message: "Bundle is stale."
+        }
+      ],
+      exitCode: 1
+    });
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/deployments/prebuilt`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
+        body: JSON.stringify({
+          projectSlug: "docs",
+          baseDomain: "w33d.xyz",
+          releaseEvidence: releaseEvidenceRequest(),
+          files: [
+            {
+              path: "index.html",
+              contentBase64: Buffer.from("<h1>Hello</h1>").toString("base64"),
+              size: 14,
+              sha256: "unused-by-fixture"
+            }
+          ]
+        })
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(400);
+      expect(body.message).toContain("did not pass");
+      expect(body.message).toContain("bundle_checked_at");
+    }, { apiToken: "deploy-token", releaseEvidenceEvaluator: blockedEvaluator });
+
+    expect(deployPrebuiltCalled).toBe(false);
   });
 
   it("accepts prebuilt deploy uploads without baseDomain for server-owned wildcard domains", async () => {
@@ -3391,7 +5116,10 @@ describe("SiteFlow control-plane HTTP server", () => {
       async (baseUrl) => {
         const response = await fetch(`${baseUrl}/api/deployments/prebuilt`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer deploy-token"
+          },
           body: JSON.stringify({
             projectSlug: "docs",
             requestedHostPrefix: "abc123",
@@ -3425,7 +5153,7 @@ describe("SiteFlow control-plane HTTP server", () => {
         expect(response.status).toBe(201);
         expect(body.previewUrl).toBe("https://abc123.w33d.xyz");
       },
-      { baseDomain: "w33d.xyz" }
+      { baseDomain: "w33d.xyz", apiToken: "deploy-token" }
     );
 
     expect(receivedCommand).toMatchObject({
@@ -3502,9 +5230,1978 @@ describe("SiteFlow control-plane HTTP server", () => {
     );
   });
 
-  it("enforces scoped API token permissions for read, write, and admin routes", async () => {
+  it("creates operator sessions and accepts cookie auth for sensitive reads", async () => {
     await withServer(
       fixtureRepository(),
+      async (baseUrl) => {
+        const created = await fetch(`${baseUrl}/api/auth/session`, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer deploy-token",
+            "content-type": "application/json",
+            "x-forwarded-proto": "https"
+          },
+          body: JSON.stringify({
+            subject: "ops@example.com",
+            scopes: ["read"],
+            ttlSeconds: 600
+          })
+        });
+        const createdBody = await created.json() as {
+          status: "created";
+          session: OperatorSession;
+          message: string;
+          secret?: unknown;
+        };
+        const setCookie = created.headers.get("set-cookie") ?? "";
+        const cookie = setCookie.split(";")[0];
+        const cookieSecret = decodeURIComponent(cookie.replace(/^siteflow_session=/, ""));
+
+        expect(created.status).toBe(201);
+        expect(createdBody.status).toBe("created");
+        expect(createdBody.secret).toBeUndefined();
+        expect(cookieSecret).toMatch(/^sfs_/);
+        expect(createdBody.session).toMatchObject({
+          subject: "ops@example.com",
+          tokenPrefix: cookieSecret.slice(0, 12),
+          scopes: ["read"],
+          status: "active"
+        });
+        expect(JSON.stringify(createdBody)).not.toContain(cookieSecret);
+        expect(JSON.stringify(createdBody)).not.toContain("token_hash");
+        expect(setCookie).toContain("siteflow_session=");
+        expect(setCookie).toContain("HttpOnly");
+        expect(setCookie).toContain("SameSite=Lax");
+        expect(setCookie).toContain("Path=/");
+        expect(setCookie).toContain("Max-Age=600");
+        expect(setCookie).toContain("Secure");
+
+        const projects = await fetch(`${baseUrl}/api/projects`, {
+          headers: { cookie }
+        });
+        expect(projects.status).toBe(200);
+
+        const deniedWrite = await fetch(`${baseUrl}/api/projects`, {
+          method: "POST",
+          headers: {
+            cookie,
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            name: "Docs",
+            slug: "docs"
+          })
+        });
+        const deniedWriteBody = await deniedWrite.json();
+
+        expect(deniedWrite.status).toBe(403);
+        expect(deniedWriteBody).toEqual({ message: "SiteFlow operator session does not include admin permission." });
+      },
+      { apiToken: "deploy-token" }
+    );
+  });
+
+  it("rotates operator session cookies and rejects the old cookie", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const created = await fetch(`${baseUrl}/api/auth/session`, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer deploy-token",
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            subject: "rotate@example.com",
+            scopes: ["read"],
+            ttlSeconds: 900
+          })
+        });
+        const oldCookie = (created.headers.get("set-cookie") ?? "").split(";")[0];
+        const oldSecret = decodeURIComponent(oldCookie.replace(/^siteflow_session=/, ""));
+
+        const rotated = await fetch(`${baseUrl}/api/auth/session/rotate`, {
+          method: "POST",
+          headers: {
+            cookie: oldCookie,
+            "x-siteflow-csrf": "same-origin"
+          }
+        });
+        const rotatedBody = await rotated.json() as {
+          status: "rotated";
+          session: OperatorSession;
+          message: string;
+          secret?: unknown;
+        };
+        const setCookie = rotated.headers.get("set-cookie") ?? "";
+        const newCookie = setCookie.split(";")[0];
+        const newSecret = decodeURIComponent(newCookie.replace(/^siteflow_session=/, ""));
+
+        expect(rotated.status).toBe(200);
+        expect(rotatedBody.status).toBe("rotated");
+        expect(rotatedBody.secret).toBeUndefined();
+        expect(rotatedBody.session).toMatchObject({
+          subject: "rotate@example.com",
+          tokenPrefix: newSecret.slice(0, 12),
+          scopes: ["read"],
+          status: "active"
+        });
+        expect(newSecret).toMatch(/^sfs_/);
+        expect(newSecret).not.toBe(oldSecret);
+        expect(JSON.stringify(rotatedBody)).not.toContain(oldSecret);
+        expect(JSON.stringify(rotatedBody)).not.toContain(newSecret);
+        expect(JSON.stringify(rotatedBody)).not.toContain("token_hash");
+        expect(setCookie).toContain("siteflow_session=");
+        expect(setCookie).toContain("HttpOnly");
+        expect(setCookie).toContain("SameSite=Lax");
+        expect(setCookie).toContain("Path=/");
+        expect(setCookie).toContain("Max-Age=900");
+
+        const withNewCookie = await fetch(`${baseUrl}/api/projects`, {
+          headers: { cookie: newCookie }
+        });
+        const withOldCookie = await fetch(`${baseUrl}/api/projects`, {
+          headers: { cookie: oldCookie }
+        });
+
+        expect(withNewCookie.status).toBe(200);
+        expect(withOldCookie.status).toBe(401);
+        expect(await withOldCookie.json()).toEqual({ message: "SiteFlow operator session is invalid or expired." });
+      },
+      { apiToken: "deploy-token" }
+    );
+  });
+
+  it("requires CSRF protection before rotating operator sessions", async () => {
+    let rotateCalls = 0;
+    const baseRepository = fixtureRepository();
+    const repository: SiteFlowReadRepository = {
+      ...baseRepository,
+      rotateOperatorSession: async (token: string) => {
+        rotateCalls += 1;
+        return baseRepository.rotateOperatorSession(token);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const created = await fetch(`${baseUrl}/api/auth/session`, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer deploy-token",
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            subject: "csrf-rotate@example.com",
+            scopes: ["read"],
+            ttlSeconds: 900
+          })
+        });
+        const cookie = (created.headers.get("set-cookie") ?? "").split(";")[0];
+        const response = await fetch(`${baseUrl}/api/auth/session/rotate`, {
+          method: "POST",
+          headers: { cookie }
+        });
+
+        expect(response.status).toBe(403);
+        expect(await response.json()).toEqual({ message: "SiteFlow operator session writes require a same-origin CSRF header." });
+        expect(rotateCalls).toBe(0);
+      },
+      { apiToken: "deploy-token" }
+    );
+  });
+
+  it("does not rotate operator sessions from bearer-only requests", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/auth/session/rotate`, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer deploy-token",
+            "x-siteflow-csrf": "same-origin"
+          }
+        });
+
+        expect(response.status).toBe(401);
+        expect(await response.json()).toEqual({ message: "SiteFlow operator session is required." });
+        expect(response.headers.get("set-cookie")).toContain("Max-Age=0");
+      },
+      { apiToken: "deploy-token" }
+    );
+  });
+
+  it("forces secure operator session cookies when configured", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const created = await fetch(`${baseUrl}/api/auth/session`, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer deploy-token",
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            subject: "secure-cookie@example.com",
+            scopes: ["read"],
+            ttlSeconds: 600
+          })
+        });
+        const cookie = (created.headers.get("set-cookie") ?? "").split(";")[0];
+        const revoked = await fetch(`${baseUrl}/api/auth/session`, {
+          method: "DELETE",
+          headers: {
+            cookie,
+            "x-siteflow-csrf": "same-origin"
+          }
+        });
+
+        expect(created.status).toBe(201);
+        expect(created.headers.get("set-cookie")).toContain("Secure");
+        expect(revoked.status).toBe(200);
+        expect(revoked.headers.get("set-cookie")).toContain("Secure");
+      },
+      { apiToken: "deploy-token", secureCookies: true }
+    );
+  });
+
+  it("ignores X-Forwarded-Proto for session cookie security unless trusted proxy mode is enabled", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const untrustedForwardedProto = await fetch(`${baseUrl}/api/auth/session`, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer deploy-token",
+            "content-type": "application/json",
+            "x-forwarded-proto": "https"
+          },
+          body: JSON.stringify({
+            subject: "untrusted-proxy@example.com",
+            scopes: ["read"],
+            ttlSeconds: 600
+          })
+        });
+        expect(untrustedForwardedProto.status).toBe(201);
+        expect(untrustedForwardedProto.headers.get("set-cookie")).not.toContain("Secure");
+      },
+      { apiToken: "deploy-token", trustProxy: false }
+    );
+
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/auth/session`, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer deploy-token",
+            "content-type": "application/json",
+            "x-forwarded-proto": "https"
+          },
+          body: JSON.stringify({
+            subject: "trusted-proxy@example.com",
+            scopes: ["read"],
+            ttlSeconds: 600
+          })
+        });
+
+        expect(response.status).toBe(201);
+        expect(response.headers.get("set-cookie")).toContain("Secure");
+      },
+      { apiToken: "deploy-token", trustProxy: "loopback" }
+    );
+  });
+
+  it("limits operator session permissions to configured project ids", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const created = await fetch(`${baseUrl}/api/auth/session`, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer deploy-token",
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            subject: "scoped@example.com",
+            scopes: ["read", "write"],
+            projectIds: ["project-acme-dashboard", "project-acme-dashboard"],
+            ttlSeconds: 900
+          })
+        });
+        const createdBody = await created.json() as {
+          status: "created";
+          session: OperatorSession;
+          message: string;
+          secret?: unknown;
+        };
+        const cookie = (created.headers.get("set-cookie") ?? "").split(";")[0];
+
+        expect(created.status).toBe(201);
+        expect(createdBody.secret).toBeUndefined();
+        expect(createdBody.session).toMatchObject({
+          subject: "scoped@example.com",
+          scopes: ["read", "write"],
+          projectIds: ["project-acme-dashboard"]
+        });
+
+        const allowedProject = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/settings`, {
+          headers: { cookie }
+        });
+        const deniedGlobalProjects = await fetch(`${baseUrl}/api/projects`, {
+          headers: { cookie }
+        });
+        const deniedProject = await fetch(`${baseUrl}/api/projects/project-other/settings`, {
+          headers: { cookie }
+        });
+        const deniedGlobalBody = await deniedGlobalProjects.json();
+        const deniedBody = await deniedProject.json();
+
+        expect(allowedProject.status).toBe(200);
+        expect(deniedGlobalProjects.status).toBe(403);
+        expect(deniedGlobalBody).toEqual({ message: "SiteFlow operator session does not include read permission." });
+        expect(deniedProject.status).toBe(403);
+        expect(deniedBody).toEqual({ message: "SiteFlow operator session does not include read permission." });
+      },
+      { apiToken: "deploy-token" }
+    );
+  });
+
+  it("treats operator sessions without project ids as global sessions for project routes", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const created = await fetch(`${baseUrl}/api/auth/session`, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer deploy-token",
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            subject: "global@example.com",
+            scopes: ["read"],
+            ttlSeconds: 900
+          })
+        });
+        const createdBody = await created.json() as {
+          status: "created";
+          session: OperatorSession;
+          message: string;
+          secret?: unknown;
+        };
+        const cookie = (created.headers.get("set-cookie") ?? "").split(";")[0];
+        const settings = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/settings`, {
+          headers: { cookie }
+        });
+        const settingsBody = await settings.json();
+
+        expect(created.status).toBe(201);
+        expect(createdBody.secret).toBeUndefined();
+        expect(createdBody.session.projectIds).toBeUndefined();
+        expect(settings.status).toBe(200);
+        expect(settingsBody.currentPermissions).toEqual(["read"]);
+        expect(settingsBody.currentPermissions).not.toContain("write");
+        expect(settingsBody.currentPermissions).not.toContain("admin");
+      },
+      { apiToken: "deploy-token" }
+    );
+  });
+
+  it("requires same-origin CSRF headers for cookie-authenticated writes", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const created = await fetch(`${baseUrl}/api/auth/session`, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer deploy-token",
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            subject: "ops@example.com",
+            scopes: ["read", "write", "admin"],
+            ttlSeconds: 900
+          })
+        });
+        const cookie = (created.headers.get("set-cookie") ?? "").split(";")[0];
+
+        const rejectedWrite = await fetch(`${baseUrl}/api/projects`, {
+          method: "POST",
+          headers: {
+            cookie,
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            name: "Docs",
+            slug: "docs"
+          })
+        });
+        const rejectedBody = await rejectedWrite.json();
+
+        expect(rejectedWrite.status).toBe(403);
+        expect(rejectedBody).toEqual({ message: "SiteFlow operator session writes require a same-origin CSRF header." });
+
+        const acceptedWrite = await fetch(`${baseUrl}/api/projects`, {
+          method: "POST",
+          headers: {
+            cookie,
+            "content-type": "application/json",
+            "x-siteflow-csrf": "same-origin"
+          },
+          body: JSON.stringify({
+            name: "Docs",
+            slug: "docs"
+          })
+        });
+
+        expect(acceptedWrite.status).toBe(201);
+      },
+      { apiToken: "deploy-token" }
+    );
+  });
+
+  it("uses operator session actor for cookie-authenticated writes instead of body actor", async () => {
+    let receivedCommand: PromoteDeploymentCommand | undefined;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      promoteDeployment: async (command: PromoteDeploymentCommand): Promise<CommandResultReadModel> => {
+        receivedCommand = command;
+        return fixtureRepository().promoteDeployment(command);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/release/production/promote`, {
+          method: "POST",
+          headers: {
+            cookie: "siteflow_session=session-admin-token",
+            "content-type": "application/json",
+            "x-siteflow-csrf": "same-origin"
+          },
+          body: JSON.stringify({
+            targetDeploymentId: "dep-healthy",
+            actor: { id: "client-spoof", name: "Spoofed Client", role: "operator" },
+            reason: "ship",
+            idempotencyKey: "idem-session-actor",
+            releaseEvidence: releaseEvidenceRequest()
+          })
+        });
+
+        expect(response.status).toBe(202);
+      },
+      { apiToken: "deploy-token", releaseEvidenceEvaluator: passingReleaseEvidenceEvaluator() }
+    );
+
+    expect(receivedCommand?.actor).toEqual({
+      id: "session-operator",
+      name: "Session Operator",
+      role: "operator"
+    });
+    expect(receivedCommand?.actor.id).not.toBe("client-spoof");
+  });
+
+  it("revokes operator session cookies and rejects expired sessions", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const created = await fetch(`${baseUrl}/api/auth/session`, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer deploy-token",
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            subject: "ops@example.com",
+            scopes: ["read", "write", "admin"],
+            ttlSeconds: 900
+          })
+        });
+        const cookie = (created.headers.get("set-cookie") ?? "").split(";")[0];
+        const revoked = await fetch(`${baseUrl}/api/auth/session`, {
+          method: "DELETE",
+          headers: {
+            cookie,
+            "x-siteflow-csrf": "same-origin"
+          }
+        });
+        const revokedBody = await revoked.json() as OperatorSessionRevokeReadModel;
+        const clearedCookie = revoked.headers.get("set-cookie") ?? "";
+
+        expect(revoked.status).toBe(200);
+        expect(revokedBody.status).toBe("revoked");
+        expect(clearedCookie).toContain("siteflow_session=");
+        expect(clearedCookie).toContain("Max-Age=0");
+
+        const afterRevoke = await fetch(`${baseUrl}/api/projects`, {
+          headers: { cookie }
+        });
+        const expired = await fetch(`${baseUrl}/api/projects`, {
+          headers: { cookie: "siteflow_session=expired-session-token" }
+        });
+
+        expect(afterRevoke.status).toBe(401);
+        expect(await afterRevoke.json()).toEqual({ message: "SiteFlow operator session is invalid or expired." });
+        expect(expired.status).toBe(401);
+        const expiredBody = await expired.json();
+        expect(expiredBody).toEqual({ message: "SiteFlow operator session is invalid or expired." });
+        expect(JSON.stringify(expiredBody)).not.toContain("expired-session-token");
+      },
+      { apiToken: "deploy-token" }
+    );
+  });
+
+  it("rejects idle-expired operator sessions during auth verification", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/auth/verify`, {
+          headers: {
+            cookie: "siteflow_session=expired-session-token"
+          }
+        });
+        const body = await response.json();
+
+        expect(response.status).toBe(401);
+        expect(body).toEqual({ message: "SiteFlow operator session is invalid or expired." });
+        expect(JSON.stringify(body)).not.toContain("expired-session-token");
+      },
+      { apiToken: "deploy-token" }
+    );
+  });
+
+  it("keeps bearer token authorization ahead of operator session cookies", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/routing-rules`, {
+          method: "PUT",
+          headers: {
+            authorization: "Bearer read-token",
+            cookie: "siteflow_session=session-admin-token",
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            name: "Legacy docs",
+            kind: "redirect",
+            source: "/legacy-docs",
+            destination: "/docs",
+            statusCode: 308
+          })
+        });
+        const body = await response.json();
+
+        expect(response.status).toBe(403);
+        expect(body).toEqual({ message: "SiteFlow API token does not include admin permission." });
+      },
+      { apiToken: "deploy-token" }
+    );
+  });
+
+  it("rejects cookie-only operator session revoke-all requests", async () => {
+    let revokeAllCalls = 0;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      revokeAllOperatorSessions: async (command: RevokeAllOperatorSessionsCommand): Promise<OperatorSessionRevokeAllReadModel> => {
+        revokeAllCalls += 1;
+        return fixtureRepository().revokeAllOperatorSessions(command);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/auth/sessions/revoke-all`, {
+          method: "POST",
+          headers: {
+            cookie: "siteflow_session=session-admin-token",
+            "content-type": "application/json",
+            "x-siteflow-csrf": "same-origin"
+          },
+          body: JSON.stringify({ reason: "stolen browser cookie" })
+        });
+        const body = await response.json();
+
+        expect(response.status).toBe(401);
+        expect(body).toEqual({ message: "SiteFlow API token is required." });
+      },
+      { apiToken: "deploy-token" }
+    );
+
+    expect(revokeAllCalls).toBe(0);
+  });
+
+  it("does not fall back to admin cookies when a revoke-all bearer token lacks admin scope", async () => {
+    let revokeAllCalls = 0;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      revokeAllOperatorSessions: async (command: RevokeAllOperatorSessionsCommand): Promise<OperatorSessionRevokeAllReadModel> => {
+        revokeAllCalls += 1;
+        return fixtureRepository().revokeAllOperatorSessions(command);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/auth/sessions/revoke-all`, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer read-token",
+            cookie: "siteflow_session=session-admin-token",
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({ reason: "bad bearer must win" })
+        });
+        const body = await response.json();
+
+        expect(response.status).toBe(403);
+        expect(body).toEqual({ message: "SiteFlow API token does not include admin permission." });
+      },
+      { apiToken: "deploy-token" }
+    );
+
+    expect(revokeAllCalls).toBe(0);
+  });
+
+  it("revokes all operator sessions from a global admin bearer token", async () => {
+    let receivedCommand: RevokeAllOperatorSessionsCommand | undefined;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      revokeAllOperatorSessions: async (command: RevokeAllOperatorSessionsCommand): Promise<OperatorSessionRevokeAllReadModel> => {
+        receivedCommand = command;
+        return fixtureRepository().revokeAllOperatorSessions(command);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/auth/sessions/revoke-all`, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer admin-token",
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            actor: { id: "client-spoof", name: "Spoofed Client", role: "operator" },
+            requestedBy: { id: "client-requested-by", name: "Client Requested By", role: "operator" },
+            reason: "operator laptop lost"
+          })
+        });
+        const body = await response.json() as OperatorSessionRevokeAllReadModel;
+
+        expect(response.status).toBe(200);
+        expect(body).toMatchObject({
+          status: "revoked",
+          scope: "global",
+          revokedAt: "2026-06-07T00:40:00.000Z",
+          message: "All existing operator sessions were revoked."
+        });
+        expect(body.cutoffId).toMatch(/^sessioncutoff_fixture_/);
+      },
+      { apiToken: "deploy-token" }
+    );
+
+    expect(receivedCommand).toEqual({
+      actor: {
+        id: "api-token:token-admin-token",
+        name: "admin-token fixture",
+        role: "system"
+      },
+      reason: "operator laptop lost"
+    });
+  });
+
+  it("revokes project operator sessions from a project admin bearer token", async () => {
+    let receivedCommand: RevokeAllOperatorSessionsCommand | undefined;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      revokeAllOperatorSessions: async (command: RevokeAllOperatorSessionsCommand): Promise<OperatorSessionRevokeAllReadModel> => {
+        receivedCommand = command;
+        return fixtureRepository().revokeAllOperatorSessions(command);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/auth/sessions/revoke-all`, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer project-admin-token",
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({ reason: "project incident" })
+        });
+        const body = await response.json() as OperatorSessionRevokeAllReadModel;
+
+        expect(response.status).toBe(200);
+        expect(body).toMatchObject({
+          status: "revoked",
+          scope: "project",
+          projectId: "project-acme-dashboard",
+          revokedAt: "2026-06-07T00:40:00.000Z",
+          message: "Project operator sessions were revoked."
+        });
+        expect(body.cutoffId).toMatch(/^sessioncutoff_fixture_/);
+      },
+      { apiToken: "deploy-token" }
+    );
+
+    expect(receivedCommand).toEqual({
+      projectId: "project-acme-dashboard",
+      actor: {
+        id: "token-project-admin",
+        name: "Project admin token",
+        role: "operator"
+      },
+      reason: "project incident"
+    });
+  });
+
+  it("rejects project-scoped admin bearer tokens for global revoke-all", async () => {
+    let revokeAllCalls = 0;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      revokeAllOperatorSessions: async (command: RevokeAllOperatorSessionsCommand): Promise<OperatorSessionRevokeAllReadModel> => {
+        revokeAllCalls += 1;
+        return fixtureRepository().revokeAllOperatorSessions(command);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/auth/sessions/revoke-all`, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer project-admin-token",
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({ reason: "global needs global admin" })
+        });
+        const body = await response.json();
+
+        expect(response.status).toBe(403);
+        expect(body).toEqual({ message: "SiteFlow API token does not include admin permission." });
+      },
+      { apiToken: "deploy-token" }
+    );
+
+    expect(revokeAllCalls).toBe(0);
+  });
+
+  it("fails closed for mutating endpoints when the API token is not configured", async () => {
+    let deployCalls = 0;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      deployPrebuilt: async (command: PrebuiltDeployCommand): Promise<PrebuiltDeployResult> => {
+        deployCalls += 1;
+        return fixtureRepository().deployPrebuilt(command);
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/deployments/prebuilt`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectSlug: "docs",
+          baseDomain: "w33d.xyz",
+          files: []
+        })
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(503);
+      expect(body).toEqual({ message: "SiteFlow API token is not configured." });
+    });
+
+    expect(deployCalls).toBe(0);
+  });
+
+  it("rejects unauthenticated sensitive read endpoints", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const paths = [
+          "/api/projects",
+          "/api/projects/project-acme-dashboard",
+          "/api/projects/project-acme-dashboard/release/production",
+          "/api/projects/project-acme-dashboard/rollback/production",
+          "/api/deployments?projectId=project-acme-dashboard",
+          "/api/deployments/dep-healthy",
+          "/api/deployments/dep-healthy/logs",
+          "/api/operations/op-healthy-promote"
+        ];
+
+        for (const path of paths) {
+          const response = await fetch(`${baseUrl}${path}`);
+          const body = await response.json();
+
+          expect(response.status).toBe(401);
+          expect(body).toEqual({ message: "SiteFlow API token is required." });
+        }
+      },
+      { apiToken: "deploy-token" }
+    );
+  });
+
+  it("allows read-scoped tokens to access sensitive read endpoints", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const headers = { authorization: "Bearer read-token" };
+        const paths = [
+          "/api/projects",
+          "/api/projects/project-acme-dashboard",
+          "/api/projects/project-acme-dashboard/environments",
+          "/api/projects/project-acme-dashboard/logs?source=build",
+          "/api/projects/project-acme-dashboard/release/production",
+          "/api/projects/project-acme-dashboard/rollback/production",
+          "/api/deployments?projectId=project-acme-dashboard",
+          "/api/deployments/dep-healthy",
+          "/api/deployments/dep-healthy/logs",
+          "/api/operations/op-healthy-promote"
+        ];
+
+        for (const path of paths) {
+          const response = await fetch(`${baseUrl}${path}`, { headers });
+
+          expect(response.status).toBe(200);
+        }
+      },
+      { apiToken: "deploy-token" }
+    );
+  });
+
+  it("uses a production stdout request logger that emits NDJSON fields", () => {
+    const loggedLines: string[] = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation((line?: unknown) => {
+      loggedLines.push(String(line));
+    });
+
+    try {
+      expect(createDefaultRequestLogger("2.3.4", { NODE_ENV: "production" })).toEqual(expect.any(Function));
+      expect(createDefaultRequestLogger("2.3.4", { NODE_ENV: "test" })).toBeUndefined();
+
+      const logger = createStdoutRequestLogger("2.3.4");
+
+      logger({
+        requestId: "req_observability",
+        method: "GET",
+        path: "/api/projects",
+        status: 200,
+        durationMs: 7
+      });
+
+      logger({
+        requestId: "req_observability_error",
+        method: "POST",
+        path: "/api/deploy-hooks/[token]/trigger",
+        status: 503,
+        durationMs: 11,
+        errorClass: "ExpectedHttpError",
+        query: `token=${SITEFLOW_SECRET_CANARY}`,
+        headers: { authorization: "Bearer deploy-token" },
+        body: { token: SITEFLOW_SECRET_CANARY }
+      } as SiteFlowRequestLogEntry & Record<string, unknown>);
+    } finally {
+      logSpy.mockRestore();
+    }
+
+    expect(loggedLines).toHaveLength(2);
+
+    const successLog = JSON.parse(loggedLines[0]) as Record<string, unknown>;
+    const errorLog = JSON.parse(loggedLines[1]) as Record<string, unknown>;
+
+    expect(successLog).toEqual({
+      event: "siteflow.request",
+      service: "siteflow-control-plane",
+      version: "2.3.4",
+      requestId: "req_observability",
+      method: "GET",
+      path: "/api/projects",
+      status: 200,
+      durationMs: 7,
+      errorClass: null
+    });
+    expect(errorLog).toMatchObject({
+      event: "siteflow.request",
+      service: "siteflow-control-plane",
+      version: "2.3.4",
+      requestId: "req_observability_error",
+      method: "POST",
+      path: "/api/deploy-hooks/[token]/trigger",
+      status: 503,
+      durationMs: 11,
+      errorClass: "ExpectedHttpError"
+    });
+    expect(Object.keys(errorLog).sort()).toEqual([
+      "durationMs",
+      "errorClass",
+      "event",
+      "method",
+      "path",
+      "requestId",
+      "service",
+      "status",
+      "version"
+    ]);
+    expect(loggedLines.every((line) => JSON.parse(line))).toBe(true);
+    expect(loggedLines.join("\n")).not.toContain(SITEFLOW_SECRET_CANARY);
+    expect(loggedLines.join("\n")).not.toContain("authorization");
+    expect(loggedLines.join("\n")).not.toContain("deploy-token");
+  });
+
+  it("defaults secure operator session cookies only for production runtimes", () => {
+    expect(defaultSecureCookies({ NODE_ENV: "production" })).toBe(true);
+    expect(defaultSecureCookies({ SITEFLOW_ENV: "production" })).toBe(true);
+    expect(defaultSecureCookies({ NODE_ENV: "test", SITEFLOW_ENV: "staging" })).toBe(false);
+    expect(defaultSecureCookies({})).toBe(false);
+  });
+
+  it("enables same-process function runtime only with an explicit production exception", () => {
+    expect(defaultAllowSameProcessFunctionRuntime({})).toBe(false);
+    expect(defaultAllowSameProcessFunctionRuntime({ SITEFLOW_ALLOW_SAME_PROCESS_FUNCTION_RUNTIME: "0" })).toBe(false);
+    expect(defaultAllowSameProcessFunctionRuntime({ SITEFLOW_ALLOW_SAME_PROCESS_FUNCTION_RUNTIME: "false" })).toBe(false);
+    expect(defaultAllowSameProcessFunctionRuntime({ SITEFLOW_ALLOW_SAME_PROCESS_FUNCTION_RUNTIME: "1" })).toBe(true);
+    expect(defaultAllowSameProcessFunctionRuntime({ SITEFLOW_ALLOW_SAME_PROCESS_FUNCTION_RUNTIME: "true" })).toBe(true);
+    expect(defaultAllowSameProcessFunctionRuntime({ SITEFLOW_ALLOW_SAME_PROCESS_FUNCTION_RUNTIME: "yes" })).toBe(true);
+  });
+
+  it("trusts forwarded proxy headers only when explicitly configured", () => {
+    expect(defaultTrustProxy({})).toBeUndefined();
+    expect(defaultTrustProxy({ NODE_ENV: "production" })).toBeUndefined();
+    expect(defaultTrustProxy({ SITEFLOW_TRUST_PROXY: "1" })).toBe("loopback");
+    expect(defaultTrustProxy({ SITEFLOW_TRUST_PROXY: "true" })).toBe("loopback");
+    expect(defaultTrustProxy({ SITEFLOW_TRUST_PROXY: "loopback" })).toBe("loopback");
+    expect(defaultTrustProxy({ SITEFLOW_TRUST_PROXY: "private" })).toBe("private");
+    expect(defaultTrustProxy({ SITEFLOW_TRUST_PROXY: "192.168.1.10" })).toEqual(["192.168.1.10"]);
+    expect(defaultTrustProxy({ SITEFLOW_TRUST_PROXY: "10.0.0.0/8,192.168.1.10" })).toEqual(["10.0.0.0/8", "192.168.1.10"]);
+    expect(defaultTrustProxy({ SITEFLOW_TRUST_PROXY: "0" })).toBeUndefined();
+    expect(() => defaultTrustProxy({ SITEFLOW_TRUST_PROXY: "not-a-cidr" })).toThrow("SITEFLOW_TRUST_PROXY");
+    expect(() => defaultTrustProxy({ SITEFLOW_TRUST_PROXY: "10.0.0.0/64" })).toThrow("SITEFLOW_TRUST_PROXY");
+    expect(() => defaultTrustProxy({ SITEFLOW_TRUST_PROXY: "0.0.0.0/0" })).toThrow("SITEFLOW_TRUST_PROXY");
+    expect(() => defaultTrustProxy({ SITEFLOW_TRUST_PROXY: "::/0" })).toThrow("SITEFLOW_TRUST_PROXY");
+  });
+
+  it("parses configured git webhook provider secrets from environment", () => {
+    expect(gitWebhookSecretsFromEnv({
+      SITEFLOW_GITHUB_WEBHOOK_SECRET: " github-secret ",
+      SITEFLOW_GITLAB_WEBHOOK_SECRET: "gitlab-secret",
+      SITEFLOW_GITEA_WEBHOOK_SECRET: "gitea-secret",
+      SITEFLOW_GENERIC_WEBHOOK_SECRET: "generic-secret"
+    })).toEqual({
+      github: "github-secret",
+      gitlab: "gitlab-secret",
+      gitea: "gitea-secret",
+      generic: "generic-secret"
+    });
+    expect(gitWebhookSecretsFromEnv({})).toEqual({
+      github: undefined,
+      gitlab: undefined,
+      gitea: undefined,
+      generic: undefined
+    });
+  });
+
+  it("reads server startup bearer and webhook secrets from *_FILE fallbacks", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "siteflow-server-secret-file-"));
+
+    try {
+      const apiTokenPath = path.join(tempDir, "api-token");
+      const metricsTokenPath = path.join(tempDir, "metrics-token");
+      const githubSecretPath = path.join(tempDir, "github-webhook-secret");
+      const gitlabSecretPath = path.join(tempDir, "gitlab-webhook-secret");
+      const giteaSecretPath = path.join(tempDir, "gitea-webhook-secret");
+      const genericSecretPath = path.join(tempDir, "generic-webhook-secret");
+      await writeFile(apiTokenPath, "0123456789abcdef0123456789abcdef\n", "utf8");
+      await writeFile(metricsTokenPath, "abcdef0123456789abcdef0123456789\n", "utf8");
+      await writeFile(githubSecretPath, "github-file-secret\n", "utf8");
+      await writeFile(gitlabSecretPath, "gitlab-file-secret\n", "utf8");
+      await writeFile(giteaSecretPath, "gitea-file-secret\n", "utf8");
+      await writeFile(genericSecretPath, "generic-file-secret\n", "utf8");
+
+      expect(() =>
+        requireProductionApiToken({
+          SITEFLOW_ENV: "production",
+          SITEFLOW_API_TOKEN_FILE: apiTokenPath
+        })
+      ).not.toThrow();
+      expect(() =>
+        requireProductionMetricsToken({
+          SITEFLOW_ENV: "production",
+          SITEFLOW_METRICS_TOKEN_FILE: metricsTokenPath
+        })
+      ).not.toThrow();
+      expect(gitWebhookSecretsFromEnv({
+        SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE: githubSecretPath,
+        SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE: gitlabSecretPath,
+        SITEFLOW_GITEA_WEBHOOK_SECRET_FILE: giteaSecretPath,
+        SITEFLOW_GENERIC_WEBHOOK_SECRET_FILE: genericSecretPath
+      })).toEqual({
+        github: "github-file-secret",
+        gitlab: "gitlab-file-secret",
+        gitea: "gitea-file-secret",
+        generic: "generic-file-secret"
+      });
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("injects SITEFLOW_POSTGRES_PASSWORD_FILE into passwordless server database URLs", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "siteflow-server-postgres-password-"));
+
+    try {
+      const passwordPath = path.join(tempDir, "postgres-password");
+      await writeFile(passwordPath, "postgres-secret\n", "utf8");
+
+      expect(resolveDatabaseUrl({
+        DATABASE_URL: "postgres://siteflow@localhost:5432/siteflow",
+        SITEFLOW_POSTGRES_PASSWORD_FILE: passwordPath
+      })).toBe("postgres://siteflow:postgres-secret@localhost:5432/siteflow");
+      expect(resolveDatabaseUrl({
+        DATABASE_URL: "postgres://siteflow:url-secret@localhost:5432/siteflow",
+        SITEFLOW_POSTGRES_PASSWORD_FILE: passwordPath
+      })).toBe("postgres://siteflow:url-secret@localhost:5432/siteflow");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("defaults and validates operator session idle timeout settings", () => {
+    expect(defaultOperatorSessionIdleTimeoutSeconds({})).toBe(1800);
+    expect(defaultOperatorSessionIdleTimeoutSeconds({
+      SITEFLOW_OPERATOR_SESSION_IDLE_TIMEOUT_SECONDS: "900"
+    })).toBe(900);
+
+    expect(() =>
+      defaultOperatorSessionIdleTimeoutSeconds({
+        SITEFLOW_OPERATOR_SESSION_IDLE_TIMEOUT_SECONDS: "59"
+      })
+    ).toThrow("SITEFLOW_OPERATOR_SESSION_IDLE_TIMEOUT_SECONDS");
+
+    expect(() =>
+      defaultOperatorSessionIdleTimeoutSeconds({
+        SITEFLOW_OPERATOR_SESSION_IDLE_TIMEOUT_SECONDS: "900.5"
+      })
+    ).toThrow("SITEFLOW_OPERATOR_SESSION_IDLE_TIMEOUT_SECONDS");
+  });
+
+  it("requires metrics scrape protection in production unless explicitly bypassed", () => {
+    expect(() =>
+      requireProductionMetricsToken({
+        SITEFLOW_ENV: "production"
+      })
+    ).toThrow("SITEFLOW_METRICS_TOKEN");
+
+    expect(() =>
+      requireProductionMetricsToken({
+        SITEFLOW_ENV: "production",
+        SITEFLOW_METRICS_TOKEN: "metrics-token"
+      })
+    ).toThrow(/at least 32 characters/i);
+
+    expect(() =>
+      requireProductionMetricsToken({
+        SITEFLOW_ENV: "production",
+        SITEFLOW_METRICS_TOKEN: "0123456789abcdef0123456789abcdef"
+      })
+    ).not.toThrow();
+
+    expect(() =>
+      requireProductionMetricsToken({
+        NODE_ENV: "production",
+        SITEFLOW_ALLOW_UNAUTHENTICATED_METRICS: "1"
+      })
+    ).not.toThrow();
+
+    expect(() =>
+      requireProductionMetricsToken({
+        NODE_ENV: "test"
+      })
+    ).not.toThrow();
+  });
+
+  it("requires a strong API bearer token in production", () => {
+    expect(() =>
+      requireProductionApiToken({
+        SITEFLOW_ENV: "production"
+      })
+    ).toThrow("SITEFLOW_API_TOKEN");
+
+    expect(() =>
+      requireProductionApiToken({
+        SITEFLOW_ENV: "production",
+        SITEFLOW_API_TOKEN: "token"
+      })
+    ).toThrow(/at least 32 characters/i);
+
+    expect(() =>
+      requireProductionApiToken({
+        SITEFLOW_ENV: "production",
+        SITEFLOW_API_TOKEN: "0123456789abcdef0123456789abcdef"
+      })
+    ).not.toThrow();
+
+    expect(() =>
+      requireProductionApiToken({
+        NODE_ENV: "test",
+        SITEFLOW_API_TOKEN: "token"
+      })
+    ).not.toThrow();
+  });
+
+  it("emits structured request logs without query strings or credentials", async () => {
+    const requestLogs: SiteFlowRequestLogEntry[] = [];
+
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const ok = await fetch(`${baseUrl}/api/projects?token=${SITEFLOW_SECRET_CANARY}`, {
+          headers: {
+            authorization: "Bearer deploy-token",
+            "user-agent": "SiteFlowTest/1.0"
+          }
+        });
+        const unauthorized = await fetch(`${baseUrl}/api/projects?token=${SITEFLOW_SECRET_CANARY}`, {
+          headers: {
+            "user-agent": "SiteFlowTest/1.0"
+          }
+        });
+        const missingWebhookSecret = await fetch(`${baseUrl}/api/webhooks/git/github`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({ token: SITEFLOW_SECRET_CANARY })
+        });
+
+        expect(ok.status).toBe(200);
+        expect(unauthorized.status).toBe(401);
+        expect(missingWebhookSecret.status).toBe(503);
+      },
+      {
+        apiToken: "deploy-token",
+        requestLogger: (entry) => {
+          requestLogs.push(entry);
+        }
+      }
+    );
+
+    expect(requestLogs).toHaveLength(3);
+    expect(requestLogs[0]).toMatchObject({
+      method: "GET",
+      path: "/api/projects",
+      status: 200
+    });
+    expect(requestLogs[1]).toMatchObject({
+      method: "GET",
+      path: "/api/projects",
+      status: 401,
+      errorClass: "ExpectedHttpError"
+    });
+    expect(requestLogs[2]).toMatchObject({
+      method: "POST",
+      path: "/api/webhooks/git/github",
+      status: 503,
+      errorClass: "ExpectedHttpError"
+    });
+    expect(requestLogs[0].requestId).toMatch(/^req_/);
+    expect(requestLogs[0].durationMs).toBeGreaterThanOrEqual(0);
+    expect(JSON.stringify(requestLogs)).not.toContain(SITEFLOW_SECRET_CANARY);
+    expect(JSON.stringify(requestLogs)).not.toContain("deploy-token");
+    expect(JSON.stringify(requestLogs)).not.toContain("authorization");
+  });
+
+  it("serves aggregate HTTP metrics without path tokens or request payload data", async () => {
+    let now = 2_000_000;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      listProjects: async (): Promise<ProjectListReadModel> => {
+        throw new Error(`database password ${SITEFLOW_SECRET_CANARY}`);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const deployHookToken = "sfh_metrics_secret_token";
+        const health = await fetch(`${baseUrl}/healthz?token=${SITEFLOW_SECRET_CANARY}`);
+        const hook = await fetch(`${baseUrl}/api/deploy-hooks/${deployHookToken}/trigger?token=${SITEFLOW_SECRET_CANARY}`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-forwarded-for": "198.51.100.10"
+          },
+          body: JSON.stringify({
+            branch: "main",
+            canary: SITEFLOW_SECRET_CANARY
+          })
+        });
+        const verify = await fetch(`${baseUrl}/api/auth/verify`, {
+          headers: {
+            authorization: "Bearer deploy-token",
+            "x-forwarded-for": "198.51.100.20"
+          }
+        });
+        const limited = await fetch(`${baseUrl}/api/auth/verify`, {
+          headers: {
+            authorization: "Bearer deploy-token",
+            "x-forwarded-for": "198.51.100.20"
+          }
+        });
+        const failed = await fetch(`${baseUrl}/api/projects`, {
+          headers: {
+            authorization: "Bearer deploy-token",
+            "x-forwarded-for": "198.51.100.30"
+          }
+        });
+        const metrics = await fetch(`${baseUrl}/metrics?token=${SITEFLOW_SECRET_CANARY}`);
+        const metricsText = await metrics.text();
+
+        expect(health.status).toBe(200);
+        expect(hook.status).toBe(202);
+        expect(verify.status).toBe(200);
+        expect(limited.status).toBe(429);
+        expect(failed.status).toBe(500);
+        expect(metrics.status).toBe(200);
+        expect(metrics.headers.get("content-type")).toContain("text/plain");
+        expect(metricsText).toContain("siteflow_http_requests_total 5");
+        expect(metricsText).toContain("siteflow_http_5xx_total 1");
+        expect(metricsText).toContain("siteflow_http_429_total 1");
+        expect(metricsText).toContain("siteflow_http_request_duration_ms_count 5");
+        expect(metricsText).toMatch(/siteflow_http_request_duration_ms_sum \d+/);
+        expect(metricsText).toContain("siteflow_runtime_metrics_collection_error 1");
+        expect(metricsText).toContain("siteflow_backup_automation_last_success_age_seconds -1");
+        expect(metricsText).toContain("siteflow_backup_metrics_collection_error 1");
+        expect(metricsText).not.toContain(deployHookToken);
+        expect(metricsText).not.toContain(SITEFLOW_SECRET_CANARY);
+        expect(metricsText).not.toContain("database password");
+        expect(metricsText).not.toContain("authorization");
+      },
+      {
+        apiToken: "deploy-token",
+        rateLimit: {
+          maxRequests: 1,
+          windowMs: 1000,
+          now: () => now++
+        }
+      }
+    );
+  });
+
+  it("serves runtime queue metrics from the configured collector", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const metrics = await fetch(`${baseUrl}/metrics`);
+        const metricsText = await metrics.text();
+
+        expect(metrics.status).toBe(200);
+        expect(metricsText).toContain("siteflow_build_jobs_queued 4");
+        expect(metricsText).toContain("siteflow_build_jobs_running 2");
+        expect(metricsText).toContain("siteflow_build_jobs_stale 1");
+        expect(metricsText).toContain("siteflow_build_job_oldest_queued_age_seconds 360");
+        expect(metricsText).toContain("siteflow_build_job_oldest_running_heartbeat_age_seconds 45");
+        expect(metricsText).toContain("siteflow_runtime_metrics_collection_error 0");
+        expect(metricsText).toContain("siteflow_backup_automation_last_success_age_seconds -1");
+        expect(metricsText).toContain("siteflow_backup_restore_drill_last_success_age_seconds -1");
+        expect(metricsText).toContain("siteflow_backup_offload_last_run_failed 0");
+        expect(metricsText).toContain("siteflow_backup_metrics_collection_error 1");
+      },
+      {
+        runtimeMetricsCollector: async () => ({
+          queuedBuildJobs: 4,
+          runningBuildJobs: 2,
+          staleBuildJobs: 1,
+          oldestQueuedBuildAgeSeconds: 360,
+          oldestRunningBuildHeartbeatAgeSeconds: 45
+        })
+      }
+    );
+  });
+
+  it("keeps metrics scrape available when runtime metrics collection fails", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const metrics = await fetch(`${baseUrl}/metrics`);
+        const metricsText = await metrics.text();
+
+        expect(metrics.status).toBe(200);
+        expect(metricsText).toContain("siteflow_http_requests_total");
+        expect(metricsText).toContain("siteflow_runtime_metrics_collection_error 1");
+        expect(metricsText).not.toContain("database password");
+        expect(metricsText).not.toContain(SITEFLOW_SECRET_CANARY);
+      },
+      {
+        runtimeMetricsCollector: async () => {
+          throw new Error(`database password ${SITEFLOW_SECRET_CANARY}`);
+        }
+      }
+    );
+  });
+
+  it("protects HTTP metrics when a metrics token is configured", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const unauthorized = await fetch(`${baseUrl}/metrics`);
+        const forbidden = await fetch(`${baseUrl}/metrics`, {
+          headers: {
+            authorization: "Bearer wrong-token"
+          }
+        });
+        const authorized = await fetch(`${baseUrl}/metrics?token=${SITEFLOW_SECRET_CANARY}`, {
+          headers: {
+            authorization: "Bearer metrics-token"
+          }
+        });
+        const headAuthorized = await rawHttpGet(
+          baseUrl,
+          `/metrics?token=${SITEFLOW_SECRET_CANARY}`,
+          { authorization: "Bearer metrics-token" },
+          "HEAD"
+        );
+        const metricsText = await authorized.text();
+
+        expect(unauthorized.status).toBe(401);
+        expect(forbidden.status).toBe(403);
+        expect(authorized.status).toBe(200);
+        expect(headAuthorized.status).toBe(200);
+        expect(headAuthorized.body.byteLength).toBe(0);
+        expect(metricsText).toContain("siteflow_http_requests_total");
+        expect(metricsText).not.toContain(SITEFLOW_SECRET_CANARY);
+        expect(metricsText).not.toContain("metrics-token");
+      },
+      {
+        apiToken: "deploy-token",
+        metricsToken: "metrics-token"
+      }
+    );
+  });
+
+  it("maps Postgres queue metrics rows into runtime metrics", async () => {
+    const queries: string[] = [];
+    const collector = createProductionMetricsCollector({
+      query: async (sql: string) => {
+        queries.push(sql);
+
+        return {
+          rows: [
+            {
+              queued_build_jobs: "5",
+              running_build_jobs: 3,
+              stale_build_jobs: "1",
+              oldest_queued_age_seconds: "720",
+              oldest_running_heartbeat_age_seconds: 90
+            }
+          ]
+        };
+      }
+    });
+
+    await expect(collector()).resolves.toMatchObject({
+      queuedBuildJobs: 5,
+      runningBuildJobs: 3,
+      staleBuildJobs: 1,
+      oldestQueuedBuildAgeSeconds: 720,
+      oldestRunningBuildHeartbeatAgeSeconds: 90,
+      backupAutomationLastSuccessAgeSeconds: -1,
+      backupMetricsCollectionError: 1
+    });
+    expect(queries[0]).toContain("FROM siteflow_build_jobs");
+    expect(queries[0]).toContain("locked_until");
+    expect(queries[0]).toContain("heartbeat_at");
+  });
+
+  it("maps backup automation run records into runtime backup metrics", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-backup-runtime-metrics-"));
+
+    try {
+      const restoreDrillPath = path.join(root, "restore-drill.json");
+      const offloadPath = path.join(root, "backup-offload.json");
+      const prunePath = path.join(root, "backup-prune.json");
+      const runRecordPath = path.join(root, "backup-automation-run.json");
+
+      await writeFile(restoreDrillPath, `${JSON.stringify({
+        status: "restore_drilled",
+        completedAt: "2026-06-07T11:50:00.000Z"
+      })}\n`, "utf8");
+      await writeFile(offloadPath, `${JSON.stringify({
+        status: "offloaded",
+        offloadedAt: "2026-06-07T11:52:00.000Z"
+      })}\n`, "utf8");
+      await writeFile(prunePath, `${JSON.stringify({
+        status: "pruned",
+        checkedAt: "2026-06-07T11:55:00.000Z",
+        dryRun: false
+      })}\n`, "utf8");
+      await writeFile(runRecordPath, `${JSON.stringify({
+        name: "siteflow-backup-automation-run",
+        status: "completed",
+        completedAt: "2026-06-07T11:58:00.000Z",
+        exitCode: 0,
+        evidenceFiles: {
+          restoreDrill: restoreDrillPath,
+          backupOffload: offloadPath,
+          backupPrune: prunePath
+        },
+        steps: [
+          { id: "backup", status: "completed" },
+          { id: "backup_verify", status: "completed" },
+          { id: "restore_drill", status: "completed" },
+          { id: "backup_offload", status: "completed" },
+          { id: "backup_prune", status: "completed" }
+        ]
+      })}\n`, "utf8");
+
+      const collector = createProductionMetricsCollector(
+        {
+          query: async () => ({
+            rows: [
+              {
+                queued_build_jobs: 0,
+                running_build_jobs: 0,
+                stale_build_jobs: 0,
+                oldest_queued_age_seconds: 0,
+                oldest_running_heartbeat_age_seconds: 0
+              }
+            ]
+          })
+        },
+        {
+          backupAutomationRunRecordPath: runRecordPath,
+          now: () => new Date("2026-06-07T12:00:00.000Z")
+        }
+      );
+
+      await expect(collector()).resolves.toMatchObject({
+        backupAutomationLastSuccessAgeSeconds: 120,
+        backupRestoreDrillLastSuccessAgeSeconds: 600,
+        backupOffloadLastSuccessAgeSeconds: 480,
+        backupPruneLastSuccessAgeSeconds: 300,
+        backupOffloadLastRunFailed: 0,
+        backupPruneLastRunFailed: 0,
+        backupMetricsCollectionError: 0
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves relative backup automation evidence paths from the run record directory", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-backup-runtime-relative-metrics-"));
+
+    try {
+      const runRecordPath = path.join(root, "backup-automation-run.json");
+
+      await writeFile(path.join(root, "restore-drill.json"), `${JSON.stringify({
+        status: "restore_drilled",
+        completedAt: "2026-06-07T11:50:00.000Z"
+      })}\n`, "utf8");
+      await writeFile(path.join(root, "backup-offload.json"), `${JSON.stringify({
+        status: "offloaded",
+        offloadedAt: "2026-06-07T11:52:00.000Z"
+      })}\n`, "utf8");
+      await writeFile(path.join(root, "backup-prune.json"), `${JSON.stringify({
+        status: "pruned",
+        checkedAt: "2026-06-07T11:55:00.000Z",
+        dryRun: false
+      })}\n`, "utf8");
+      await writeFile(runRecordPath, `${JSON.stringify({
+        name: "siteflow-backup-automation-run",
+        status: "completed",
+        completedAt: "2026-06-07T11:58:00.000Z",
+        exitCode: 0,
+        evidenceFiles: {
+          restoreDrill: "restore-drill.json",
+          backupOffload: "backup-offload.json",
+          backupPrune: "backup-prune.json"
+        },
+        steps: [
+          { id: "backup", status: "completed" },
+          { id: "backup_verify", status: "completed" },
+          { id: "restore_drill", status: "completed" },
+          { id: "backup_offload", status: "completed" },
+          { id: "backup_prune", status: "completed" }
+        ]
+      })}\n`, "utf8");
+
+      const collector = createProductionMetricsCollector(
+        {
+          query: async () => ({
+            rows: [
+              {
+                queued_build_jobs: 0,
+                running_build_jobs: 0,
+                stale_build_jobs: 0,
+                oldest_queued_age_seconds: 0,
+                oldest_running_heartbeat_age_seconds: 0
+              }
+            ]
+          })
+        },
+        {
+          backupAutomationRunRecordPath: runRecordPath,
+          now: () => new Date("2026-06-07T12:00:00.000Z")
+        }
+      );
+
+      await expect(collector()).resolves.toMatchObject({
+        backupAutomationLastSuccessAgeSeconds: 120,
+        backupRestoreDrillLastSuccessAgeSeconds: 600,
+        backupOffloadLastSuccessAgeSeconds: 480,
+        backupPruneLastSuccessAgeSeconds: 300,
+        backupMetricsCollectionError: 0
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("maps failed backup automation steps into targeted failure gauges", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-backup-runtime-failures-"));
+    const query = async () => ({
+      rows: [
+        {
+          queued_build_jobs: 0,
+          running_build_jobs: 0,
+          stale_build_jobs: 0,
+          oldest_queued_age_seconds: 0,
+          oldest_running_heartbeat_age_seconds: 0
+        }
+      ]
+    });
+
+    try {
+      const offloadFailurePath = path.join(root, "offload-failed.json");
+      const prunePlanFailurePath = path.join(root, "prune-plan-failed.json");
+      const pruneFailurePath = path.join(root, "prune-failed.json");
+
+      await writeFile(offloadFailurePath, `${JSON.stringify({
+        name: "siteflow-backup-automation-run",
+        status: "failed",
+        exitCode: 1,
+        steps: [
+          { id: "backup", status: "completed" },
+          { id: "backup_verify", status: "completed" },
+          { id: "restore_drill", status: "completed" },
+          { id: "backup_offload", status: "failed" }
+        ]
+      })}\n`, "utf8");
+      await writeFile(prunePlanFailurePath, `${JSON.stringify({
+        name: "siteflow-backup-automation-run",
+        status: "failed",
+        exitCode: 1,
+        steps: [
+          { id: "backup", status: "completed" },
+          { id: "backup_verify", status: "completed" },
+          { id: "restore_drill", status: "completed" },
+          { id: "backup_offload", status: "completed" },
+          { id: "backup_prune_plan", status: "failed" }
+        ]
+      })}\n`, "utf8");
+      await writeFile(pruneFailurePath, `${JSON.stringify({
+        name: "siteflow-backup-automation-run",
+        status: "failed",
+        exitCode: 1,
+        steps: [
+          { id: "backup", status: "completed" },
+          { id: "backup_verify", status: "completed" },
+          { id: "restore_drill", status: "completed" },
+          { id: "backup_offload", status: "completed" },
+          { id: "backup_prune_plan", status: "completed" },
+          { id: "backup_prune", status: "failed" }
+        ]
+      })}\n`, "utf8");
+
+      await expect(createProductionMetricsCollector({ query }, { backupAutomationRunRecordPath: offloadFailurePath })()).resolves.toMatchObject({
+        backupOffloadLastRunFailed: 1,
+        backupPruneLastRunFailed: 0,
+        backupMetricsCollectionError: 1
+      });
+      await expect(createProductionMetricsCollector({ query }, { backupAutomationRunRecordPath: prunePlanFailurePath })()).resolves.toMatchObject({
+        backupOffloadLastRunFailed: 0,
+        backupPruneLastRunFailed: 0,
+        backupMetricsCollectionError: 1
+      });
+      await expect(createProductionMetricsCollector({ query }, { backupAutomationRunRecordPath: pruneFailurePath })()).resolves.toMatchObject({
+        backupOffloadLastRunFailed: 0,
+        backupPruneLastRunFailed: 1,
+        backupMetricsCollectionError: 1
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let request logger failures affect responses", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/projects`, {
+          headers: {
+            authorization: "Bearer deploy-token"
+          }
+        });
+        const body = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(body.projects).toEqual(expect.any(Array));
+      },
+      {
+        apiToken: "deploy-token",
+        requestLogger: () => {
+          throw new Error("logger sink unavailable");
+        }
+      }
+    );
+  });
+
+  it("does not expose internal error messages for unexpected 500 responses", async () => {
+    const requestLogs: SiteFlowRequestLogEntry[] = [];
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      listProjects: async (): Promise<ProjectListReadModel> => {
+        throw new Error("database password leaked in stack");
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/projects`, {
+          headers: {
+            authorization: "Bearer deploy-token"
+          }
+        });
+        const body = await response.json();
+
+        expect(response.status).toBe(500);
+        expect(body).toEqual({ message: "Unexpected SiteFlow API error." });
+        expect(JSON.stringify(body)).not.toContain("database password");
+      },
+      {
+        apiToken: "deploy-token",
+        requestLogger: (entry) => {
+          requestLogs.push(entry);
+        }
+      }
+    );
+
+    expect(requestLogs).toHaveLength(1);
+    expect(requestLogs[0]).toMatchObject({
+      method: "GET",
+      path: "/api/projects",
+      status: 500,
+      errorClass: "Error"
+    });
+    expect(JSON.stringify(requestLogs)).not.toContain("database password");
+  });
+
+  it("rejects oversized JSON request bodies without invoking the handler", async () => {
+    let createCalls = 0;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      createProject: async (command: CreateProjectCommand): Promise<ProjectMutationReadModel> => {
+        createCalls += 1;
+        return fixtureRepository().createProject(command);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/projects`, {
+          method: "POST",
+          headers: {
+            authorization: "Bearer admin-token",
+            "content-type": "application/json"
+          },
+          body: JSON.stringify({
+            slug: "docs",
+            name: "Documentation portal with a payload that exceeds the test body limit"
+          })
+        });
+        const body = await response.json();
+
+        expect(response.status).toBe(413);
+        expect(body).toEqual({ message: "Request body is too large." });
+      },
+      { apiToken: "deploy-token", maxBodyBytes: 32 }
+    );
+
+    expect(createCalls).toBe(0);
+  });
+
+  it("rate limits control-plane API buckets without trusting client bucket headers", async () => {
+    const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "siteflow-rate-limit-static-"));
+    let now = 1_000_000;
+
+    try {
+      await writeFile(path.join(artifactRoot, "index.html"), "<h1>Static shell</h1>");
+      const repository: SiteFlowReadRepository = {
+        ...fixtureRepository(),
+        resolveArtifactRoute: async (host: string): Promise<ArtifactRoute | undefined> =>
+          host === "static.w33d.xyz"
+            ? {
+                host,
+                deploymentId: "dep_rate_limit_static",
+                artifactRoot,
+                entrypoint: "index.html"
+              }
+            : undefined
+      };
+
+      await withServer(
+        repository,
+        async (baseUrl) => {
+          const bucketHeaders = {
+            authorization: "Bearer read-token",
+            "x-siteflow-bucket-key": "control-plane-rate-limit-test"
+          };
+          const first = await fetch(`${baseUrl}/api/projects`, { headers: bucketHeaders });
+          const limited = await fetch(`${baseUrl}/api/projects`, {
+            headers: {
+              ...bucketHeaders,
+              "x-siteflow-bucket-key": "client-rotated-rate-limit-key"
+            }
+          });
+          const limitedBody = await limited.json();
+          const firstHealth = await fetch(`${baseUrl}/healthz`, {
+            headers: { "x-siteflow-bucket-key": "control-plane-rate-limit-test" }
+          });
+          const secondHealth = await fetch(`${baseUrl}/healthz`, {
+            headers: { "x-siteflow-bucket-key": "control-plane-rate-limit-test" }
+          });
+          const firstStatic = await fetch(`${baseUrl}/`, {
+            headers: {
+              "x-forwarded-host": "static.w33d.xyz",
+              "x-siteflow-bucket-key": "control-plane-rate-limit-test"
+            }
+          });
+          const secondStatic = await fetch(`${baseUrl}/`, {
+            headers: {
+              "x-forwarded-host": "static.w33d.xyz",
+              "x-siteflow-bucket-key": "control-plane-rate-limit-test"
+            }
+          });
+
+          now += 1000;
+          const afterWindow = await fetch(`${baseUrl}/api/projects`, { headers: bucketHeaders });
+
+          expect(first.status).toBe(200);
+          expect(limited.status).toBe(429);
+          expect(limited.headers.get("retry-after")).toBe("1");
+          expect(limitedBody).toEqual({ message: "SiteFlow API rate limit exceeded." });
+          expect(firstHealth.status).toBe(200);
+          expect(secondHealth.status).toBe(200);
+          expect(firstStatic.status).toBe(200);
+          expect(secondStatic.status).toBe(200);
+          expect(await firstStatic.text()).toContain("Static shell");
+          expect(await secondStatic.text()).toContain("Static shell");
+          expect(afterWindow.status).toBe(200);
+        },
+        {
+          apiToken: "deploy-token",
+          rateLimit: {
+            maxRequests: 1,
+            windowMs: 1000,
+            now: () => now
+          }
+        }
+      );
+    } finally {
+      await rm(artifactRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores spoofed X-Forwarded-For when trusted proxy mode is disabled", async () => {
+    let now = 1_100_000;
+
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const first = await fetch(`${baseUrl}/api/auth/verify`, {
+          headers: {
+            authorization: "Bearer deploy-token",
+            "x-forwarded-for": "198.51.100.10",
+            "user-agent": "siteflow-rate-limit-test"
+          }
+        });
+        const spoofed = await fetch(`${baseUrl}/api/auth/verify`, {
+          headers: {
+            authorization: "Bearer deploy-token",
+            "x-forwarded-for": "198.51.100.20",
+            "user-agent": "siteflow-rate-limit-test"
+          }
+        });
+        const spoofedBody = await spoofed.json();
+
+        expect(first.status).toBe(200);
+        expect(spoofed.status).toBe(429);
+        expect(spoofedBody).toEqual({ message: "SiteFlow API rate limit exceeded." });
+      },
+      {
+        apiToken: "deploy-token",
+        trustProxy: false,
+        rateLimit: {
+          maxRequests: 1,
+          windowMs: 1000,
+          now: () => now++
+        }
+      }
+    );
+  });
+
+  it("uses X-Forwarded-For for rate buckets when loopback proxy trust matches the connection", async () => {
+    let now = 1_200_000;
+
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const first = await fetch(`${baseUrl}/api/auth/verify`, {
+          headers: {
+            authorization: "Bearer deploy-token",
+            "x-forwarded-for": "198.51.100.10",
+            "user-agent": "siteflow-rate-limit-test"
+          }
+        });
+        const secondClient = await fetch(`${baseUrl}/api/auth/verify`, {
+          headers: {
+            authorization: "Bearer deploy-token",
+            "x-forwarded-for": "198.51.100.20",
+            "user-agent": "siteflow-rate-limit-test"
+          }
+        });
+        const limitedFirstClient = await fetch(`${baseUrl}/api/auth/verify`, {
+          headers: {
+            authorization: "Bearer deploy-token",
+            "x-forwarded-for": "198.51.100.10",
+            "user-agent": "siteflow-rate-limit-test"
+          }
+        });
+
+        expect(first.status).toBe(200);
+        expect(secondClient.status).toBe(200);
+        expect(limitedFirstClient.status).toBe(429);
+      },
+      {
+        apiToken: "deploy-token",
+        trustProxy: "loopback",
+        rateLimit: {
+          maxRequests: 1,
+          windowMs: 1000,
+          now: () => now++
+        }
+      }
+    );
+  });
+
+  it("ignores X-Forwarded-For when proxy trust policy does not match the connection", async () => {
+    let now = 1_300_000;
+
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const first = await fetch(`${baseUrl}/api/auth/verify`, {
+          headers: {
+            authorization: "Bearer deploy-token",
+            "x-forwarded-for": "198.51.100.10",
+            "user-agent": "siteflow-rate-limit-test"
+          }
+        });
+        const spoofed = await fetch(`${baseUrl}/api/auth/verify`, {
+          headers: {
+            authorization: "Bearer deploy-token",
+            "x-forwarded-for": "198.51.100.20",
+            "user-agent": "siteflow-rate-limit-test"
+          }
+        });
+
+        expect(first.status).toBe(200);
+        expect(spoofed.status).toBe(429);
+      },
+      {
+        apiToken: "deploy-token",
+        trustProxy: ["203.0.113.0/24"],
+        rateLimit: {
+          maxRequests: 1,
+          windowMs: 1000,
+          now: () => now++
+        }
+      }
+    );
+  });
+
+  it("uses X-Forwarded-For when explicit proxy CIDR matches the connection", async () => {
+    let now = 1_400_000;
+
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const first = await fetch(`${baseUrl}/api/auth/verify`, {
+          headers: {
+            authorization: "Bearer deploy-token",
+            "x-forwarded-for": "198.51.100.10",
+            "user-agent": "siteflow-rate-limit-test"
+          }
+        });
+        const secondClient = await fetch(`${baseUrl}/api/auth/verify`, {
+          headers: {
+            authorization: "Bearer deploy-token",
+            "x-forwarded-for": "198.51.100.20",
+            "user-agent": "siteflow-rate-limit-test"
+          }
+        });
+        const limitedFirstClient = await fetch(`${baseUrl}/api/auth/verify`, {
+          headers: {
+            authorization: "Bearer deploy-token",
+            "x-forwarded-for": "198.51.100.10",
+            "user-agent": "siteflow-rate-limit-test"
+          }
+        });
+
+        expect(first.status).toBe(200);
+        expect(secondClient.status).toBe(200);
+        expect(limitedFirstClient.status).toBe(429);
+      },
+      {
+        apiToken: "deploy-token",
+        trustProxy: ["127.0.0.0/8"],
+        rateLimit: {
+          maxRequests: 1,
+          windowMs: 1000,
+          now: () => now++
+        }
+      }
+    );
+  });
+
+  it("enforces scoped API token permissions for read, write, and admin routes", async () => {
+    let receivedPromote: PromoteDeploymentCommand | undefined;
+    let receivedCreateToken: CreateApiTokenCommand | undefined;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      promoteDeployment: async (command: PromoteDeploymentCommand): Promise<CommandResultReadModel> => {
+        receivedPromote = command;
+        return fixtureRepository().promoteDeployment(command);
+      },
+      createApiToken: async (command: CreateApiTokenCommand): Promise<ApiTokenCreateReadModel> => {
+        receivedCreateToken = command;
+        return fixtureRepository().createApiToken(command);
+      }
+    };
+
+    await withServer(
+      repository,
       async (baseUrl) => {
         const readSettings = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/settings`, {
           headers: {
@@ -3540,9 +7237,10 @@ describe("SiteFlow control-plane HTTP server", () => {
           },
           body: JSON.stringify({
             targetDeploymentId: "dep-healthy",
-            actor: { id: "actor-1", name: "Ops", role: "operator" },
+            actor: { id: "client-spoof", name: "Spoofed Client", role: "operator" },
             reason: "ship",
-            idempotencyKey: "operator-token-promote"
+            idempotencyKey: "operator-token-promote",
+            releaseEvidence: releaseEvidenceRequest()
           })
         });
 
@@ -3556,7 +7254,8 @@ describe("SiteFlow control-plane HTTP server", () => {
           },
           body: JSON.stringify({
             name: "Read token",
-            scopes: ["read"]
+            scopes: ["read"],
+            actor: { id: "client-spoof", name: "Spoofed Client", role: "operator" }
           })
         });
 
@@ -3578,8 +7277,21 @@ describe("SiteFlow control-plane HTTP server", () => {
         expect(acceptedAdmin.status).toBe(201);
         expect(adminBody.secret).toBe("sft_created_secret");
       },
-      { apiToken: "deploy-token" }
+      { apiToken: "deploy-token", releaseEvidenceEvaluator: passingReleaseEvidenceEvaluator() }
     );
+
+    expect(receivedPromote?.actor).toEqual({
+      id: "token-operator",
+      name: "Operator token",
+      role: "operator"
+    });
+    expect(receivedPromote?.actor.id).not.toBe("client-spoof");
+    expect(receivedCreateToken?.actor).toEqual({
+      id: "api-token:token-admin-token",
+      name: "admin-token fixture",
+      role: "system"
+    });
+    expect(receivedCreateToken?.actor?.id).not.toBe("client-spoof");
   });
 
   it("serves a deployed artifact by preview host", async () => {
@@ -4818,6 +8530,60 @@ describe("SiteFlow control-plane HTTP server", () => {
     });
   });
 
+  it("does not trust spoofed X-Forwarded-For for firewall evaluation when proxy trust is disabled", async () => {
+    const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "siteflow-firewall-untrusted-proxy-"));
+    const evaluations: Array<{ path: string; ip?: string }> = [];
+
+    try {
+      await writeFile(path.join(artifactRoot, "index.html"), "<h1>SiteFlow Preview</h1>");
+      const repository: SiteFlowReadRepository = {
+        ...fixtureRepository(),
+        resolveArtifactRoute: async (host: string): Promise<ArtifactRoute | undefined> =>
+          host === "abc123.w33d.xyz"
+            ? {
+                host,
+                projectId: "project-acme-dashboard",
+                deploymentId: "dep_prebuilt",
+                artifactRoot,
+                entrypoint: "index.html"
+              }
+            : undefined,
+        evaluateFirewall: async (command): Promise<FirewallEvaluationReadModel> => {
+          evaluations.push({
+            path: command.path,
+            ip: command.ip
+          });
+
+          return {
+            projectId: command.projectId,
+            decision: "allow",
+            reason: "No firewall rule matched."
+          };
+        }
+      };
+
+      await withServer(
+        repository,
+        async (baseUrl) => {
+          const response = await rawHttpGet(baseUrl, "/", {
+            host: "abc123.w33d.xyz",
+            "x-forwarded-for": "203.0.113.10",
+            "user-agent": "curl/8.0"
+          });
+
+          expect(response.status).toBe(200);
+        },
+        { trustProxy: false }
+      );
+    } finally {
+      await rm(artifactRoot, { recursive: true, force: true });
+    }
+
+    expect(evaluations).toHaveLength(1);
+    expect(evaluations[0]).toMatchObject({ path: "/" });
+    expect(evaluations[0].ip).not.toBe("203.0.113.10");
+  });
+
   it("omits JSON bodies for HEAD firewall rejections", async () => {
     const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "siteflow-firewall-head-"));
     const blockRule: FirewallRule = {
@@ -5186,6 +8952,257 @@ describe("SiteFlow control-plane HTTP server", () => {
     expect(invocations).toHaveLength(0);
   });
 
+  it("disables same-process function runtime by default in production", async () => {
+    const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "siteflow-function-production-disabled-"));
+    const invocations: FunctionInvocation[] = [];
+
+    try {
+      await writeFile(path.join(artifactRoot, "index.html"), "<h1>Static shell</h1>");
+      const repository: SiteFlowReadRepository = {
+        ...fixtureRepository(),
+        resolveArtifactRoute: async (host: string): Promise<ArtifactRoute | undefined> =>
+          host === "abc123.w33d.xyz"
+            ? {
+                host,
+                projectId: "project_docs",
+                deploymentId: "dep_function_disabled",
+                artifactRoot,
+                entrypoint: "index.html",
+                functions: [
+                  {
+                    path: "/api/revalidate",
+                    sourcePath: ".siteflow/functions/api/revalidate.js",
+                    runtime: "nodejs20.x",
+                    handler: "default"
+                  }
+                ]
+              }
+            : undefined,
+        recordFunctionInvocation: async (invocation: FunctionInvocation): Promise<void> => {
+          invocations.push(invocation);
+        }
+      };
+
+      await withServer(
+        repository,
+        async (baseUrl) => {
+          const response = await fetch(`${baseUrl}/api/revalidate`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-forwarded-host": "abc123.w33d.xyz"
+            },
+            body: JSON.stringify({ name: "home" })
+          });
+          const body = await response.json();
+
+          expect(response.status).toBe(503);
+          expect(response.headers.get("x-siteflow-function-runtime")).toBe("disabled");
+          expect(body.message).toBe("Function runtime is disabled in production.");
+        },
+        {
+          productionRuntime: true,
+          functionModuleLoader: async () => {
+            throw new Error("Production function gate should prevent same-process module loading.");
+          }
+        }
+      );
+    } finally {
+      await rm(artifactRoot, { recursive: true, force: true });
+    }
+
+    expect(invocations).toHaveLength(1);
+    expect(invocations[0]).toMatchObject({
+      deploymentId: "dep_function_disabled",
+      projectId: "project_docs",
+      path: "/api/revalidate",
+      method: "POST",
+      status: "failed",
+      responseStatus: 503
+    });
+    expect(invocations[0].errorMessage).toContain("Same-process function runtime is disabled in production");
+  });
+
+  it("runs isolated-process function artifacts in production without inheriting parent environment", async () => {
+    const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "siteflow-function-production-isolated-"));
+    const invocations: FunctionInvocation[] = [];
+    const previousParentSecret = process.env.PARENT_ONLY_SECRET;
+
+    try {
+      process.env.PARENT_ONLY_SECRET = "parent-secret-20260608";
+      await writeFile(path.join(artifactRoot, "index.html"), "<h1>Static shell</h1>");
+      await mkdir(path.join(artifactRoot, ".siteflow", "functions", "api"), { recursive: true });
+      await writeFile(
+        path.join(artifactRoot, ".siteflow", "functions", "api", "revalidate.js"),
+        [
+          "export default async function handler(request, context) {",
+          "  console.log('runtime secret', process.env.RUNTIME_SECRET);",
+          "  return {",
+          "    status: 201,",
+          "    headers: { 'content-type': 'application/json; charset=utf-8' },",
+          "    body: {",
+          "      method: request.method,",
+          "      payload: await request.json(),",
+          "      envSecret: context.env.RUNTIME_SECRET,",
+          "      processSecret: process.env.RUNTIME_SECRET,",
+          "      parentSecret: process.env.PARENT_ONLY_SECRET ?? null,",
+          "      isolation: process.env.SITEFLOW_FUNCTION_RUNTIME_ISOLATION",
+          "    }",
+          "  };",
+          "}"
+        ].join("\n"),
+        "utf8"
+      );
+
+      const repository: SiteFlowReadRepository = {
+        ...fixtureRepository(),
+        resolveArtifactRoute: async (host: string): Promise<ArtifactRoute | undefined> =>
+          host === "abc123.w33d.xyz"
+            ? {
+                host,
+                projectId: "project_docs",
+                deploymentId: "dep_function_isolated",
+                artifactRoot,
+                entrypoint: "index.html",
+                runtimeEnvironment: {
+                  RUNTIME_SECRET: "runtime-secret-20260608"
+                },
+                functions: [
+                  {
+                    path: "/api/revalidate",
+                    sourcePath: ".siteflow/functions/api/revalidate.js",
+                    runtime: "nodejs20.x",
+                    runtimeIsolation: "isolated_process",
+                    handler: "default"
+                  }
+                ]
+              }
+            : undefined,
+        recordFunctionInvocation: async (invocation: FunctionInvocation): Promise<void> => {
+          invocations.push(invocation);
+        }
+      };
+
+      await withServer(
+        repository,
+        async (baseUrl) => {
+          const response = await fetch(`${baseUrl}/api/revalidate`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-forwarded-host": "abc123.w33d.xyz"
+            },
+            body: JSON.stringify({ name: "home" })
+          });
+          const body = await response.json();
+
+          expect(response.status).toBe(201);
+          expect(response.headers.get("x-siteflow-function-runtime")).toBe("isolated_process");
+          expect(body).toEqual({
+            method: "POST",
+            payload: { name: "home" },
+            envSecret: "runtime-secret-20260608",
+            processSecret: "runtime-secret-20260608",
+            parentSecret: null,
+            isolation: "isolated_process"
+          });
+        },
+        {
+          productionRuntime: true,
+          functionModuleLoader: async () => {
+            throw new Error("Isolated production functions should not use the same-process module loader.");
+          }
+        }
+      );
+    } finally {
+      if (previousParentSecret === undefined) {
+        delete process.env.PARENT_ONLY_SECRET;
+      } else {
+        process.env.PARENT_ONLY_SECRET = previousParentSecret;
+      }
+      await rm(artifactRoot, { recursive: true, force: true });
+    }
+
+    expect(invocations).toHaveLength(1);
+    expect(invocations[0]).toMatchObject({
+      deploymentId: "dep_function_isolated",
+      projectId: "project_docs",
+      path: "/api/revalidate",
+      method: "POST",
+      status: "succeeded",
+      responseStatus: 201
+    });
+    expect(invocations[0].logs.join("\n")).toContain("[REDACTED]");
+    expect(invocations[0].logs.join("\n")).not.toContain("runtime-secret-20260608");
+  });
+
+  it("allows same-process function runtime in production only when explicitly enabled", async () => {
+    const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "siteflow-function-production-enabled-"));
+    const invocations: FunctionInvocation[] = [];
+
+    try {
+      await writeFile(path.join(artifactRoot, "index.html"), "<h1>Static shell</h1>");
+      const repository: SiteFlowReadRepository = {
+        ...fixtureRepository(),
+        resolveArtifactRoute: async (host: string): Promise<ArtifactRoute | undefined> =>
+          host === "abc123.w33d.xyz"
+            ? {
+                host,
+                projectId: "project_docs",
+                deploymentId: "dep_function_enabled",
+                artifactRoot,
+                entrypoint: "index.html",
+                functions: [
+                  {
+                    path: "/api/revalidate",
+                    sourcePath: ".siteflow/functions/api/revalidate.js",
+                    runtime: "nodejs20.x",
+                    handler: "default"
+                  }
+                ]
+              }
+            : undefined,
+        recordFunctionInvocation: async (invocation: FunctionInvocation): Promise<void> => {
+          invocations.push(invocation);
+        }
+      };
+
+      await withServer(
+        repository,
+        async (baseUrl) => {
+          const response = await fetch(`${baseUrl}/api/revalidate`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-forwarded-host": "abc123.w33d.xyz"
+            },
+            body: JSON.stringify({ name: "home" })
+          });
+          const body = await response.json();
+
+          expect(response.status).toBe(200);
+          expect(body).toEqual({ ok: true });
+        },
+        {
+          productionRuntime: true,
+          allowSameProcessFunctionRuntime: true,
+          functionModuleLoader: async () => ({
+            default: async () => ({ body: { ok: true } })
+          })
+        }
+      );
+    } finally {
+      await rm(artifactRoot, { recursive: true, force: true });
+    }
+
+    expect(invocations).toHaveLength(1);
+    expect(invocations[0]).toMatchObject({
+      deploymentId: "dep_function_enabled",
+      status: "succeeded",
+      responseStatus: 200
+    });
+  });
+
   it("routes deployed API functions and records invocation logs", async () => {
     const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "siteflow-function-"));
     const invocations: FunctionInvocation[] = [];
@@ -5295,6 +9312,10 @@ describe("SiteFlow control-plane HTTP server", () => {
           expect(invocations[0]?.errorMessage).toBeUndefined();
           expect(invocations[0].logs.join("\n")).toContain("[REDACTED]");
           expect(invocations[0].logs.join("\n")).not.toContain("SITEFLOW_SECRET_CANARY_20260515");
+          expect(invocations[0].logs.join("\n")).toContain("\"safe\":\"visible\"");
+          expect(invocations[0].logs.join("\n")).not.toContain("\"token\":\"t\"");
+          expect(invocations[0].logs.join("\n")).not.toContain("\"password\":\"pw\"");
+          expect(invocations[0].logs.join("\n")).not.toContain("\"apiKey\":\"k\"");
         },
         {
           functionModuleLoader: async (functionPath) => {
@@ -5303,6 +9324,14 @@ describe("SiteFlow control-plane HTTP server", () => {
             return {
               default: async (request: Request, context: { deploymentId: string; requestId: string }) => {
                 console.log("runtime SITEFLOW_SECRET_CANARY_20260515");
+                console.log("runtime object", {
+                  token: "t",
+                  nested: {
+                    password: "pw"
+                  },
+                  apiKey: "k",
+                  safe: "visible"
+                });
                 const body = await request.json() as { name: string };
                 const requestUrl = new URL(request.url);
 
@@ -5322,6 +9351,80 @@ describe("SiteFlow control-plane HTTP server", () => {
             };
           },
           allowedOrigin: "https://console.example.test"
+        }
+      );
+    } finally {
+      await rm(artifactRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects deployed API function bodies over the configured limit before loading the module", async () => {
+    const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "siteflow-function-body-limit-"));
+    const invocations: FunctionInvocation[] = [];
+    let loadCalls = 0;
+
+    try {
+      await writeFile(path.join(artifactRoot, "index.html"), "<h1>Static shell</h1>");
+      const repository = {
+        ...fixtureRepository(),
+        resolveArtifactRoute: async (host: string): Promise<ArtifactRoute | undefined> =>
+          host === "abc123.w33d.xyz"
+            ? {
+                host,
+                projectId: "project_docs",
+                deploymentId: "dep_function_body_limit",
+                artifactRoot,
+                entrypoint: "index.html",
+                functions: [
+                  {
+                    path: "/api/revalidate",
+                    sourcePath: ".siteflow/functions/api/revalidate.js",
+                    runtime: "nodejs20.x",
+                    handler: "default"
+                  }
+                ]
+              }
+            : undefined,
+        recordFunctionInvocation: async (invocation: FunctionInvocation): Promise<void> => {
+          invocations.push(invocation);
+        }
+      };
+
+      await withServer(
+        repository,
+        async (baseUrl) => {
+          const response = await fetch(`${baseUrl}/api/revalidate`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-forwarded-host": "abc123.w33d.xyz"
+            },
+            body: JSON.stringify({
+              name: "payload larger than the configured API function body limit"
+            })
+          });
+          const body = await response.json() as { message: string; requestId: string };
+
+          expect(response.status).toBe(413);
+          expect(body.message).toBe("Request body is too large.");
+          expect(body.requestId).toMatch(/^req_/);
+          expect(loadCalls).toBe(0);
+          expect(invocations).toHaveLength(1);
+          expect(invocations[0]).toMatchObject({
+            deploymentId: "dep_function_body_limit",
+            path: "/api/revalidate",
+            method: "POST",
+            responseStatus: 413,
+            requestId: body.requestId,
+            errorMessage: "Request body is too large."
+          });
+        },
+        {
+          maxBodyBytes: 32,
+          functionModuleLoader: async () => {
+            loadCalls += 1;
+            throw new Error("Oversized function body should prevent function loading.");
+          }
         }
       );
     } finally {

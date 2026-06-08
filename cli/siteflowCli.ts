@@ -4,9 +4,35 @@ import { applyInstallPlan, type InstallApplyOptions } from "./installApply.js";
 import { createSingleHostInstallPlan, formatInstallPlan } from "./installPlan.js";
 import { parseInstallState } from "./installState.js";
 import { formatDoctorReport, runDoctor, type DoctorOptions } from "./doctor.js";
-import { deployPrebuilt, formatPrebuiltDeployResult, type DeployPrebuiltOptions } from "./deploy.js";
+import { deployPrebuilt, formatPrebuiltDeployResult, prebuiltUploadBudgetFromEnv, type DeployPrebuiltOptions } from "./deploy.js";
 import { readCliConfig, resolveServerConfig, saveLoginConfig } from "./config.js";
 import { readProjectLink, writeProjectLink } from "./projectLink.js";
+import {
+  createSiteFlowBackup,
+  fetchSiteFlowBackup,
+  formatBackupFetchResult,
+  formatBackupOffloadResult,
+  formatBackupPruneResult,
+  formatBackupResult,
+  formatBackupVerifyResult,
+  formatRestoreResult,
+  formatRestoreDrillResult,
+  offloadSiteFlowBackup,
+  pruneSiteFlowBackups,
+  restoreDrillSiteFlowBackup,
+  restoreSiteFlowBackup,
+  verifySiteFlowBackup,
+  type BackupRuntimeDependencies
+} from "./backup.js";
+import {
+  formatReleaseGateReport,
+  runReleaseGate,
+  type ReleaseGateRuntimeDependencies
+} from "./releaseGate.js";
+import {
+  evaluateReleaseEvidenceBundle,
+  type ReleaseEvidenceBundleResult
+} from "../scripts/releaseEvidenceBundleCheck.js";
 
 export interface CliIo {
   stdout(message: string): void;
@@ -16,9 +42,18 @@ export interface CliIo {
 export interface CliDependencies {
   doctor?: DoctorOptions;
   install?: InstallApplyOptions;
+  backup?: BackupRuntimeDependencies;
+  releaseGate?: ReleaseGateRuntimeDependencies;
+  releaseEvidence?: ReleaseEvidenceGateDependencies;
   version?: string;
   fetch?: DeployPrebuiltOptions["fetch"];
   env?: NodeJS.ProcessEnv;
+}
+
+export interface ReleaseEvidenceGateDependencies {
+  evaluate?: typeof evaluateReleaseEvidenceBundle;
+  readFile?: typeof readFile;
+  now?: () => Date;
 }
 
 interface ParsedArgs {
@@ -74,6 +109,7 @@ interface DeploymentInspectResponse {
     routeRevision?: {
       id: string;
       status: string;
+      releaseEvidence?: ReleaseEvidenceMetadata;
     };
   };
 }
@@ -132,6 +168,31 @@ interface CommandResultResponse {
     status: string;
     summary: string;
   }>;
+}
+
+interface ReleaseEvidenceGateResult {
+  evidencePath: string;
+  check: ReleaseEvidenceBundleResult;
+  rawEvidence: Record<string, unknown>;
+}
+
+interface ReleaseEvidenceMetadata {
+  evidencePath: string;
+  checkedAt: string;
+  status: "passed";
+  commitRef: string;
+  repository: string;
+  branch: string;
+  targetEnvironment: string;
+  releaseTicket?: string;
+  operatorName?: string;
+}
+
+interface ReleaseEvidenceException {
+  type: "production_rolling_abort_stop_rollout";
+  targetEnvironment: "production";
+  acceptedWithoutReleaseEvidence: true;
+  reason: string;
 }
 
 interface DeployHookItem {
@@ -558,7 +619,11 @@ interface RollingCommandResponse {
   }>;
 }
 
-const lifecycleCommands = new Set(["backup", "restore", "upgrade", "uninstall"]);
+const reservedLifecycleCommands = new Set(["upgrade", "uninstall"]);
+
+class CliBlockedError extends Error {
+  readonly exitCode = 2;
+}
 
 function parseArgs(argv: string[]): ParsedArgs {
   const [command, ...rest] = argv;
@@ -606,6 +671,103 @@ function writeJson(io: CliIo, value: unknown) {
   io.stdout(`${JSON.stringify(value, null, 2)}\n`);
 }
 
+function isObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function stringValue(value: unknown) {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function nestedObject(value: Record<string, unknown>, key: string) {
+  return isObject(value[key]) ? value[key] : undefined;
+}
+
+function productionChannel(channel: string) {
+  return channel.toLowerCase() === "production";
+}
+
+async function releaseEvidenceGate(
+  parsed: ParsedArgs,
+  channel: string,
+  dependencies: ReleaseEvidenceGateDependencies | undefined
+): Promise<ReleaseEvidenceGateResult | undefined> {
+  if (!productionChannel(channel)) {
+    return undefined;
+  }
+
+  const evidencePath = flagString(parsed.flags, "release-evidence") ?? flagString(parsed.flags, "evidence");
+
+  if (!evidencePath) {
+    throw new CliBlockedError("Production release commands require --release-evidence <release-evidence.json> from a passing release:evidence check.");
+  }
+
+  const raw = JSON.parse(await (dependencies?.readFile ?? readFile)(evidencePath, "utf8")) as unknown;
+
+  if (!isObject(raw)) {
+    throw new CliBlockedError(`${evidencePath} must contain a release evidence JSON object.`);
+  }
+
+  const check = (dependencies?.evaluate ?? evaluateReleaseEvidenceBundle)(raw, {
+    evidencePath,
+    targetEnvironment: "production",
+    now: dependencies?.now
+  });
+
+  if (check.status !== "passed") {
+    const failed = check.checks
+      .filter((entry) => entry.status !== "pass")
+      .map((entry) => entry.name)
+      .slice(0, 5)
+      .join(", ");
+    throw new CliBlockedError(`Production release evidence did not pass${failed ? `: ${failed}` : "."}`);
+  }
+
+  return {
+    evidencePath,
+    check,
+    rawEvidence: raw
+  };
+}
+
+function releaseEvidenceMetadata(gate: ReleaseEvidenceGateResult | undefined): ReleaseEvidenceMetadata | undefined {
+  if (!gate) {
+    return undefined;
+  }
+
+  const release = nestedObject(gate.rawEvidence, "release") ?? {};
+  const commitRef = stringValue(gate.check.selectedEvidence.releaseCommitRef);
+  const repository = stringValue(gate.check.selectedEvidence.repository);
+  const branch = stringValue(gate.check.selectedEvidence.branch);
+
+  if (!commitRef || !repository || !branch) {
+    throw new CliBlockedError("Production release evidence must include repository, branch, and commitRef.");
+  }
+
+  return {
+    evidencePath: gate.evidencePath,
+    checkedAt: gate.check.checkedAt,
+    status: "passed",
+    commitRef,
+    repository,
+    branch,
+    targetEnvironment: stringValue(gate.rawEvidence.targetEnvironment) ?? stringValue(release.targetEnvironment) ?? "production",
+    ...(stringValue(release.releaseTicket) ? { releaseTicket: stringValue(release.releaseTicket) } : {}),
+    ...(stringValue(release.operatorName) ? { operatorName: stringValue(release.operatorName) } : {})
+  };
+}
+
+function releaseEvidenceRequest(gate: ReleaseEvidenceGateResult | undefined) {
+  if (!gate) {
+    return undefined;
+  }
+
+  return {
+    evidencePath: gate.evidencePath,
+    bundle: gate.rawEvidence
+  };
+}
+
 function formatShortSha(value: string) {
   return value.length > 8 ? value.slice(0, 8) : value;
 }
@@ -625,10 +787,22 @@ function formatDeploymentsList(list: DeploymentListResponse) {
   ].join("  ")).join("\n");
 }
 
-function formatDeploymentInspect(detail: DeploymentInspectResponse) {
-  const route = detail.lineage.routeRevision;
+function formatInspectReleaseEvidence(evidence: ReleaseEvidenceMetadata | undefined) {
+  if (!evidence) {
+    return undefined;
+  }
 
   return [
+    evidence.status,
+    `${evidence.repository}@${evidence.branch}@${formatShortSha(evidence.commitRef)}`,
+    evidence.evidencePath
+  ].join(" / ");
+}
+
+function formatDeploymentInspect(detail: DeploymentInspectResponse) {
+  const route = detail.lineage.routeRevision;
+  const releaseEvidence = formatInspectReleaseEvidence(route?.releaseEvidence);
+  const lines = [
     `Deployment ${detail.deployment.id}`,
     `Project:    ${detail.project.name}`,
     `Status:     ${detail.deployment.status}`,
@@ -638,7 +812,13 @@ function formatDeploymentInspect(detail: DeploymentInspectResponse) {
     `Build:      ${detail.lineage.buildJob.status}`,
     `Artifact:   ${detail.lineage.artifact.verificationStatus} / ${detail.lineage.artifact.manifest.fileCount} files / ${detail.lineage.artifact.manifest.totalBytes} bytes`,
     `Route:      ${route ? `${route.id} / ${route.status}` : "not applied"}`
-  ].join("\n");
+  ];
+
+  if (releaseEvidence) {
+    lines.push(`Evidence:   ${releaseEvidence}`);
+  }
+
+  return lines.join("\n");
 }
 
 function formatCommandResult(result: CommandResultResponse) {
@@ -1173,6 +1353,25 @@ function rollingReason(parsed: ParsedArgs, action: string, channel: string, env:
     ?? `${action} rolling release${target} on ${channel} via SiteFlow CLI.`;
 }
 
+function productionRollingAbortReason(parsed: ParsedArgs, env: NodeJS.ProcessEnv) {
+  const reason = flagString(parsed.flags, "reason") ?? env.SITEFLOW_RELEASE_REASON;
+
+  if (!reason) {
+    throw new CliBlockedError("Production rolling abort requires --reason <audit reason> or SITEFLOW_RELEASE_REASON because it records a stop-rollout release evidence exception.");
+  }
+
+  return reason;
+}
+
+function productionRollingAbortReleaseEvidenceException(reason: string): ReleaseEvidenceException {
+  return {
+    type: "production_rolling_abort_stop_rollout",
+    targetEnvironment: "production",
+    acceptedWithoutReleaseEvidence: true,
+    reason
+  };
+}
+
 function requiredPercentage(parsed: ParsedArgs) {
   const raw = flagString(parsed.flags, "percentage");
   const value = raw ? Number(raw) : Number.NaN;
@@ -1192,15 +1391,24 @@ function helpText() {
     "  siteflow login --server https://siteflow.example.com --token <token> [--base-domain w33d.xyz]",
     "  siteflow link --project project-acme-dashboard [--server https://siteflow.example.com] [--root .] [--json]",
     "  siteflow env pull [--project project-acme-dashboard] [--environment preview] [--output .env.local] [--json]",
-    "  siteflow install --topology single --domain siteflow.w33d.xyz --base-domain w33d.xyz --yes [--image ghcr.io/siteflow/siteflow:<version>] [--json]",
-    "  siteflow deploy --prebuilt ./dist --project my-app [--prod] [--server https://siteflow.example.com] [--base-domain w33d.xyz] [--json]",
+    "  siteflow install --topology single --domain siteflow.w33d.xyz --base-domain w33d.xyz --image ghcr.io/siteflow/siteflow@sha256:<digest> --postgres-image postgres@sha256:<digest> --build-image node:20-bookworm-slim@sha256:<digest> --yes [--json]",
+    "  siteflow backup --output <dir> --database-url <postgres-url> --artifact-root <path> [--json]",
+    "  siteflow backup verify --backup <dir> [--json]",
+    "  siteflow backup offload --backup <dir> --target file://<offhost-dir>|s3://<bucket/prefix> [--kms-key-ref <ref> --provider-retention-mode <mode> --provider-retention-days <days> --provider-retention-contract <id> --provider-proof] [--json]",
+    "  siteflow backup fetch --source s3://<bucket/prefix/backup-name> --output <dir> --expected-tree-sha256 <sha256> --expected-object-count <count> --expected-total-bytes <bytes> [--json]",
+    "  siteflow backup prune --backup-root <dir> --retention-days <days> --minimum-backups <count> [--dry-run|--yes] [--json]",
+    "  siteflow backup restore-drill --backup <dir> --database-url <disposable-postgres-url> --artifact-root <temp-root> --yes [--source-database-url <current-postgres-url>] [--current-artifact-root <path>] [--json]",
+    "  siteflow restore --backup <dir> --database-url <postgres-url> --artifact-root <path> --yes [--json]",
+    "  siteflow release-gate --allow-dirty --allow-manual-branch-protection [--json]",
+    "  siteflow release-gate --promotion --env-file .env.production --repo owner/repo --commit-ref <sha> --require-commit-status [--json]",
+    "  siteflow deploy --prebuilt ./dist --project my-app [--prod --release-evidence release-evidence.json] [--server https://siteflow.example.com] [--base-domain w33d.xyz] [--json]",
     "  siteflow deployments [--project project-acme-dashboard] [--server https://siteflow.example.com] [--json]",
     "  siteflow inspect <deploymentId> [--server https://siteflow.example.com] [--json]",
-    "  siteflow promote <deploymentId> [--project project-acme-dashboard] [--channel production] [--reason text] [--json]",
+    "  siteflow promote <deploymentId> [--project project-acme-dashboard] [--channel production] [--release-evidence release-evidence.json] [--reason text] [--json]",
     "  siteflow rollback <deploymentId> [--project project-acme-dashboard] [--channel production] [--reason text] [--json]",
-    "  siteflow rolling start <deploymentId> --percentage 10 [--project project-acme-dashboard] [--channel production] [--json]",
-    "  siteflow rolling advance --percentage 50 [--project project-acme-dashboard] [--channel production] [--json]",
-    "  siteflow rolling complete [--project project-acme-dashboard] [--channel production] [--json]",
+    "  siteflow rolling start <deploymentId> --percentage 10 [--project project-acme-dashboard] [--channel production] [--release-evidence release-evidence.json] [--json]",
+    "  siteflow rolling advance --percentage 50 [--project project-acme-dashboard] [--channel production] [--release-evidence release-evidence.json] [--json]",
+    "  siteflow rolling complete [--project project-acme-dashboard] [--channel production] [--release-evidence release-evidence.json] [--json]",
     "  siteflow rolling abort [--project project-acme-dashboard] [--channel production] [--reason text] [--json]",
     "  siteflow cron create <name> --path /api/revalidate --schedule \"0 * * * *\" [--project project-acme-dashboard] [--json]",
     "  siteflow cron list [--project project-acme-dashboard] [--json]",
@@ -1243,12 +1451,15 @@ function helpText() {
     "  link        Bind the current directory to a SiteFlow project.",
     "  env pull    Write metadata-safe environment variable placeholders for a linked project.",
     "  install     Plan or apply a SiteFlow server installation.",
+    "  backup      Create, statically verify, or drill-restore a Postgres dump plus local artifact backup manifest.",
+    "  restore     Restore a backup manifest into Postgres and local artifact storage.",
+    "  release-gate Check local release readiness and branch protection evidence; --promotion always requires a clean worktree.",
     "  deploy      Upload a prebuilt static artifact and create a preview URL.",
     "  deployments List recent deployments with build, artifact, and route state.",
     "  inspect     Show one deployment's source, build, artifact, and route evidence.",
     "  promote     Promote a deployment to a release channel.",
     "  rollback    Roll a release channel back to a known-good deployment.",
-    "  rolling     Start, advance, complete, or abort staged traffic rollout.",
+    "  rolling     Start, advance, complete, or abort staged traffic rollout. Production abort requires --reason or SITEFLOW_RELEASE_REASON.",
     "  cron        Create, list, disable, and manually run scheduled production GET jobs.",
     "  deploy-hook Create, list, and revoke external deploy triggers.",
     "  logs        Query project build, function, and cron logs.",
@@ -1263,8 +1474,6 @@ function helpText() {
     "  routing-rules Manage project redirects, rewrites, and response headers.",
     "  doctor      Validate host and SiteFlow runtime readiness.",
     "  status      Read the install-state manifest and print installed version/topology.",
-    "  backup      Reserved lifecycle command.",
-    "  restore     Reserved lifecycle command.",
     "  upgrade     Reserved lifecycle command.",
     "  uninstall   Reserved lifecycle command."
   ].join("\n");
@@ -1479,7 +1688,8 @@ async function runReleaseCommand(
   parsed: ParsedArgs,
   io: CliIo,
   env: NodeJS.ProcessEnv,
-  fetchImpl: DeployPrebuiltOptions["fetch"]
+  fetchImpl: DeployPrebuiltOptions["fetch"],
+  releaseEvidence: ReleaseEvidenceGateDependencies | undefined
 ) {
   const json = flagBoolean(parsed.flags, "json");
   const deploymentId = parsed.positionals[0];
@@ -1510,6 +1720,8 @@ async function runReleaseCommand(
       env
     );
     const reason = commandReason(parsed, action, deploymentId, channel, env);
+    const evidenceGate = await releaseEvidenceGate(parsed, channel, releaseEvidence);
+    const evidenceRequest = releaseEvidenceRequest(evidenceGate);
     const body: Record<string, unknown> = {
       projectId: linked.projectId,
       channel,
@@ -1517,7 +1729,8 @@ async function runReleaseCommand(
       actor: actorFromEnv(env),
       reason,
       idempotencyKey: flagString(parsed.flags, "idempotency-key") ?? idempotencyKey(action, deploymentId, channel),
-      dryRun: flagBoolean(parsed.flags, "dry-run")
+      dryRun: flagBoolean(parsed.flags, "dry-run"),
+      ...(evidenceRequest ? { releaseEvidence: evidenceRequest } : {})
     };
 
     if (action === "rollback") {
@@ -1550,12 +1763,12 @@ async function runReleaseCommand(
     const message = error instanceof Error ? error.message : `Unable to ${action} deployment.`;
 
     if (json) {
-      writeJson(io, { status: "failed", message });
+      writeJson(io, { status: error instanceof CliBlockedError ? "blocked" : "failed", message });
     } else {
       io.stderr(`${message}\n`);
     }
 
-    return 1;
+    return error instanceof CliBlockedError ? error.exitCode : 1;
   }
 }
 
@@ -2997,7 +3210,13 @@ async function runRoutingRulesCommand(parsed: ParsedArgs, io: CliIo, env: NodeJS
   }
 }
 
-async function runRollingRelease(parsed: ParsedArgs, io: CliIo, env: NodeJS.ProcessEnv, fetchImpl: DeployPrebuiltOptions["fetch"]) {
+async function runRollingRelease(
+  parsed: ParsedArgs,
+  io: CliIo,
+  env: NodeJS.ProcessEnv,
+  fetchImpl: DeployPrebuiltOptions["fetch"],
+  releaseEvidence: ReleaseEvidenceGateDependencies | undefined
+) {
   const json = flagBoolean(parsed.flags, "json");
   const action = parsed.positionals[0];
 
@@ -3032,13 +3251,24 @@ async function runRollingRelease(parsed: ParsedArgs, io: CliIo, env: NodeJS.Proc
       throw new Error("Rolling release start requires a deployment id.");
     }
 
+    const productionAbort = action === "abort" && productionChannel(channel);
+    const reason = productionAbort
+      ? productionRollingAbortReason(parsed, env)
+      : rollingReason(parsed, action, channel, env, candidateDeploymentId);
+    const evidenceGate = action === "abort" ? undefined : await releaseEvidenceGate(parsed, channel, releaseEvidence);
+    const evidenceRequest = releaseEvidenceRequest(evidenceGate);
+    const releaseEvidenceException = productionAbort
+      ? productionRollingAbortReleaseEvidenceException(reason)
+      : undefined;
     const body: Record<string, unknown> = {
       projectId: linked.projectId,
       channel,
       actor: actorFromEnv(env),
-      reason: rollingReason(parsed, action, channel, env, candidateDeploymentId),
+      reason,
       idempotencyKey: flagString(parsed.flags, "idempotency-key")
-        ?? idempotencyKey(`rolling:${action}`, candidateDeploymentId ?? "active", channel)
+        ?? idempotencyKey(`rolling:${action}`, candidateDeploymentId ?? "active", channel),
+      ...(releaseEvidenceException ? { releaseEvidenceException } : {}),
+      ...(evidenceRequest ? { releaseEvidence: evidenceRequest } : {})
     };
 
     if (action === "start") {
@@ -3072,12 +3302,12 @@ async function runRollingRelease(parsed: ParsedArgs, io: CliIo, env: NodeJS.Proc
     const message = error instanceof Error ? error.message : "Unable to manage rolling release.";
 
     if (json) {
-      writeJson(io, { status: "failed", message });
+      writeJson(io, { status: error instanceof CliBlockedError ? "blocked" : "failed", message });
     } else {
       io.stderr(`${message}\n`);
     }
 
-    return 1;
+    return error instanceof CliBlockedError ? error.exitCode : 1;
   }
 }
 
@@ -3088,7 +3318,8 @@ async function promoteDeployResult(
   serverUrl: string,
   apiToken: string | undefined,
   deploymentId: string,
-  projectId: string
+  projectId: string,
+  evidenceGate?: ReleaseEvidenceGateResult
 ) {
   const channel = flagString(parsed.flags, "channel") ?? "production";
   const reason = commandReason(parsed, "promote", deploymentId, channel, env);
@@ -3107,7 +3338,8 @@ async function promoteDeployResult(
         actor: actorFromEnv(env),
         reason,
         idempotencyKey: flagString(parsed.flags, "idempotency-key") ?? idempotencyKey("promote", deploymentId, channel),
-        dryRun: flagBoolean(parsed.flags, "dry-run")
+        dryRun: flagBoolean(parsed.flags, "dry-run"),
+        ...(releaseEvidenceRequest(evidenceGate) ? { releaseEvidence: releaseEvidenceRequest(evidenceGate) } : {})
       })
     }
   );
@@ -3254,6 +3486,400 @@ async function runStatus(parsed: ParsedArgs, io: CliIo) {
   }
 }
 
+async function runBackupCommand(
+  parsed: ParsedArgs,
+  io: CliIo,
+  env: NodeJS.ProcessEnv,
+  version: string,
+  dependencies?: BackupRuntimeDependencies
+) {
+  const json = flagBoolean(parsed.flags, "json");
+  const action = parsed.positionals[0];
+
+  if (action === "verify") {
+    return runBackupVerifyCommand(parsed, io);
+  }
+
+  if (action === "offload") {
+    return runBackupOffloadCommand(parsed, io, dependencies);
+  }
+
+  if (action === "fetch") {
+    return runBackupFetchCommand(parsed, io, dependencies);
+  }
+
+  if (action === "prune") {
+    return runBackupPruneCommand(parsed, io, dependencies);
+  }
+
+  if (action === "restore-drill") {
+    return runBackupRestoreDrillCommand(parsed, io, env, dependencies);
+  }
+
+  if (action) {
+    const message = "Backup command supports only the verify, offload, fetch, prune, and restore-drill subcommands.";
+
+    if (json) {
+      writeJson(io, { status: "failed", message });
+    } else {
+      io.stderr(`${message}\n`);
+    }
+
+    return 1;
+  }
+
+  try {
+    const result = await createSiteFlowBackup(
+      {
+        output: flagString(parsed.flags, "output") ?? "",
+        databaseUrl: flagString(parsed.flags, "database-url") ?? env.DATABASE_URL ?? "",
+        artifactRoot: flagString(parsed.flags, "artifact-root") ?? env.SITEFLOW_ARTIFACT_ROOT ?? "",
+        version
+      },
+      dependencies
+    );
+
+    if (json) {
+      writeJson(io, result);
+    } else {
+      io.stdout(`${formatBackupResult(result)}\n`);
+    }
+
+    return 0;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Backup failed.";
+
+    if (json) {
+      writeJson(io, { status: "failed", message });
+    } else {
+      io.stderr(`${message}\n`);
+    }
+
+    return 1;
+  }
+}
+
+async function runBackupOffloadCommand(
+  parsed: ParsedArgs,
+  io: CliIo,
+  dependencies?: BackupRuntimeDependencies
+) {
+  const json = flagBoolean(parsed.flags, "json");
+
+  try {
+    const result = await offloadSiteFlowBackup(
+      {
+        backup: flagString(parsed.flags, "backup") ?? "",
+        target: flagString(parsed.flags, "target") ?? flagString(parsed.flags, "destination") ?? "",
+        kmsKeyRef: flagString(parsed.flags, "kms-key-ref"),
+        providerRetentionMode: flagString(parsed.flags, "provider-retention-mode"),
+        providerRetentionDays: optionalIntegerFlag(parsed, "provider-retention-days"),
+        providerRetentionContract: flagString(parsed.flags, "provider-retention-contract") ?? flagString(parsed.flags, "retention-contract"),
+        verifyProviderConfig: flagBoolean(parsed.flags, "provider-proof") || flagBoolean(parsed.flags, "verify-provider-config")
+      },
+      dependencies
+    );
+
+    if (json) {
+      writeJson(io, result);
+    } else {
+      io.stdout(`${formatBackupOffloadResult(result)}\n`);
+    }
+
+    return 0;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Backup offload failed.";
+
+    if (json) {
+      writeJson(io, { status: "failed", message });
+    } else {
+      io.stderr(`${message}\n`);
+    }
+
+    return 1;
+  }
+}
+
+async function runBackupFetchCommand(
+  parsed: ParsedArgs,
+  io: CliIo,
+  dependencies?: BackupRuntimeDependencies
+) {
+  const json = flagBoolean(parsed.flags, "json");
+
+  try {
+    const result = await fetchSiteFlowBackup(
+      {
+        source: flagString(parsed.flags, "source") ?? "",
+        output: flagString(parsed.flags, "output") ?? "",
+        expectedTreeSha256: flagString(parsed.flags, "expected-tree-sha256") ?? "",
+        expectedObjectCount: requiredIntegerFlag(parsed, "expected-object-count"),
+        expectedTotalBytes: requiredIntegerFlag(parsed, "expected-total-bytes")
+      },
+      dependencies
+    );
+
+    if (json) {
+      writeJson(io, result);
+    } else {
+      io.stdout(`${formatBackupFetchResult(result)}\n`);
+    }
+
+    return 0;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Backup fetch failed.";
+
+    if (json) {
+      writeJson(io, { status: "failed", message });
+    } else {
+      io.stderr(`${message}\n`);
+    }
+
+    return 1;
+  }
+}
+
+function requiredIntegerFlag(parsed: ParsedArgs, name: string) {
+  const value = optionalIntegerFlag(parsed, name);
+
+  if (value === undefined) {
+    throw new Error(`--${name} is required.`);
+  }
+
+  return value;
+}
+
+async function runBackupPruneCommand(
+  parsed: ParsedArgs,
+  io: CliIo,
+  dependencies?: BackupRuntimeDependencies
+) {
+  const json = flagBoolean(parsed.flags, "json");
+  const dryRun = flagBoolean(parsed.flags, "dry-run");
+  const yes = flagBoolean(parsed.flags, "yes");
+
+  if (!dryRun && !yes) {
+    const message = "Backup prune deletes old backups and requires --yes unless --dry-run is set.";
+
+    if (json) {
+      writeJson(io, { status: "blocked", message });
+    } else {
+      io.stderr(`${message}\n`);
+    }
+
+    return 2;
+  }
+
+  try {
+    const result = await pruneSiteFlowBackups(
+      {
+        backupRoot: flagString(parsed.flags, "backup-root") ?? "",
+        retentionDays: requiredIntegerFlag(parsed, "retention-days"),
+        minimumBackups: requiredIntegerFlag(parsed, "minimum-backups"),
+        dryRun,
+        yes
+      },
+      dependencies
+    );
+
+    if (json) {
+      writeJson(io, result);
+    } else {
+      io.stdout(`${formatBackupPruneResult(result)}\n`);
+    }
+
+    return 0;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Backup prune failed.";
+
+    if (json) {
+      writeJson(io, { status: "failed", message });
+    } else {
+      io.stderr(`${message}\n`);
+    }
+
+    return 1;
+  }
+}
+
+async function runBackupVerifyCommand(parsed: ParsedArgs, io: CliIo) {
+  const json = flagBoolean(parsed.flags, "json");
+
+  try {
+    const result = await verifySiteFlowBackup({
+      backup: flagString(parsed.flags, "backup") ?? ""
+    });
+
+    if (json) {
+      writeJson(io, result);
+    } else {
+      io.stdout(`${formatBackupVerifyResult(result)}\n`);
+    }
+
+    return 0;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Backup verification failed.";
+
+    if (json) {
+      writeJson(io, { status: "failed", message });
+    } else {
+      io.stderr(`${message}\n`);
+    }
+
+    return 1;
+  }
+}
+
+async function runBackupRestoreDrillCommand(
+  parsed: ParsedArgs,
+  io: CliIo,
+  env: NodeJS.ProcessEnv,
+  dependencies?: BackupRuntimeDependencies
+) {
+  const json = flagBoolean(parsed.flags, "json");
+
+  if (!flagBoolean(parsed.flags, "yes")) {
+    const message = "Restore drill requires --yes and must target a disposable database URL plus temporary artifact root. Do not use production targets.";
+
+    if (json) {
+      writeJson(io, { status: "blocked", restoreDrill: true, message });
+    } else {
+      io.stderr(`${message}\n`);
+    }
+
+    return 2;
+  }
+
+  try {
+    const result = await restoreDrillSiteFlowBackup(
+      {
+        backup: flagString(parsed.flags, "backup") ?? "",
+        databaseUrl: flagString(parsed.flags, "database-url") ?? "",
+        artifactRoot: flagString(parsed.flags, "artifact-root") ?? "",
+        sourceDatabaseUrl: flagString(parsed.flags, "source-database-url") ?? env.DATABASE_URL,
+        currentArtifactRoot: flagString(parsed.flags, "current-artifact-root") ?? env.SITEFLOW_ARTIFACT_ROOT
+      },
+      dependencies
+    );
+
+    if (json) {
+      writeJson(io, result);
+    } else {
+      io.stdout(`${formatRestoreDrillResult(result)}\n`);
+    }
+
+    return 0;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Restore drill failed.";
+
+    if (json) {
+      writeJson(io, { status: "failed", restoreDrill: true, message });
+    } else {
+      io.stderr(`${message}\n`);
+    }
+
+    return 1;
+  }
+}
+
+async function runRestoreCommand(
+  parsed: ParsedArgs,
+  io: CliIo,
+  env: NodeJS.ProcessEnv,
+  dependencies?: BackupRuntimeDependencies
+) {
+  const json = flagBoolean(parsed.flags, "json");
+
+  if (!flagBoolean(parsed.flags, "yes")) {
+    const message = "Restore is destructive and requires --yes.";
+
+    if (json) {
+      writeJson(io, { status: "blocked", message });
+    } else {
+      io.stderr(`${message}\n`);
+    }
+
+    return 2;
+  }
+
+  try {
+    const result = await restoreSiteFlowBackup(
+      {
+        backup: flagString(parsed.flags, "backup") ?? "",
+        databaseUrl: flagString(parsed.flags, "database-url") ?? env.DATABASE_URL ?? "",
+        artifactRoot: flagString(parsed.flags, "artifact-root") ?? env.SITEFLOW_ARTIFACT_ROOT ?? ""
+      },
+      dependencies
+    );
+
+    if (json) {
+      writeJson(io, result);
+    } else {
+      io.stdout(`${formatRestoreResult(result)}\n`);
+    }
+
+    return 0;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Restore failed.";
+
+    if (json) {
+      writeJson(io, { status: "failed", message });
+    } else {
+      io.stderr(`${message}\n`);
+    }
+
+    return 1;
+  }
+}
+
+async function runReleaseGateCommand(
+  parsed: ParsedArgs,
+  io: CliIo,
+  env: NodeJS.ProcessEnv,
+  dependencies: ReleaseGateRuntimeDependencies | undefined,
+  fetchImpl: DeployPrebuiltOptions["fetch"]
+) {
+  const json = flagBoolean(parsed.flags, "json");
+
+  try {
+    const report = await runReleaseGate({
+      root: flagString(parsed.flags, "root") ?? env.SITEFLOW_PROJECT_ROOT ?? process.cwd(),
+      env,
+      envFile: flagString(parsed.flags, "env-file"),
+      requireRuntimeEnv: flagBoolean(parsed.flags, "require-env"),
+      allowDirty: flagBoolean(parsed.flags, "allow-dirty"),
+      allowManualBranchProtection: flagBoolean(parsed.flags, "allow-manual-branch-protection"),
+      promotion: flagBoolean(parsed.flags, "promotion"),
+      requireCommitStatus: flagBoolean(parsed.flags, "require-commit-status"),
+      requiredStatusCheck: flagString(parsed.flags, "required-status-check"),
+      commitSha: flagString(parsed.flags, "commit-ref") ?? flagString(parsed.flags, "commit-sha"),
+      repo: flagString(parsed.flags, "repo"),
+      branch: flagString(parsed.flags, "branch") ?? "main",
+      runner: dependencies?.runner,
+      fetch: dependencies?.fetch ?? fetchImpl,
+      now: dependencies?.now
+    });
+
+    if (json) {
+      writeJson(io, report);
+    } else {
+      io.stdout(`${formatReleaseGateReport(report)}\n`);
+    }
+
+    return report.status === "pass" ? 0 : 1;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Release gate failed.";
+
+    if (json) {
+      writeJson(io, { status: "failed", message });
+    } else {
+      io.stderr(`${message}\n`);
+    }
+
+    return 1;
+  }
+}
+
 export async function runSiteFlowCli(argv: string[], io: CliIo, dependencies: CliDependencies = {}) {
   const parsed = parseArgs(argv);
   const json = flagBoolean(parsed.flags, "json");
@@ -3285,6 +3911,12 @@ export async function runSiteFlowCli(argv: string[], io: CliIo, dependencies: Cl
     const baseDomain = flagString(parsed.flags, "base-domain") ?? env.SITEFLOW_BASE_DOMAIN;
     const apiPortValue = flagString(parsed.flags, "api-port") ?? env.SITEFLOW_API_PORT;
     const image = flagString(parsed.flags, "image") ?? env.SITEFLOW_IMAGE;
+    const postgresImage = flagString(parsed.flags, "postgres-image") ?? env.SITEFLOW_POSTGRES_IMAGE;
+    const buildImage = flagString(parsed.flags, "build-image") ?? env.SITEFLOW_BUILD_IMAGE;
+    const buildImageAllowlistValue = flagString(parsed.flags, "build-image-allowlist") ?? env.SITEFLOW_BUILD_IMAGE_ALLOWLIST;
+    const buildImageAllowlist = buildImageAllowlistValue
+      ? buildImageAllowlistValue.split(",").map((entry) => entry.trim()).filter(Boolean)
+      : undefined;
 
     if (!dryRun && !yes) {
       const message = "Install apply requires --yes. Run with --dry-run to inspect the production install plan first.";
@@ -3305,6 +3937,9 @@ export async function runSiteFlowCli(argv: string[], io: CliIo, dependencies: Cl
         baseDomain,
         apiPort: apiPortValue ? Number(apiPortValue) : undefined,
         image,
+        postgresImage,
+        buildImage,
+        buildImageAllowlist,
         dryRun,
         version
       });
@@ -3438,6 +4073,12 @@ export async function runSiteFlowCli(argv: string[], io: CliIo, dependencies: Cl
     }
 
     try {
+      const promotionChannel = flagString(parsed.flags, "channel") ?? "production";
+      const evidenceGate = flagBoolean(parsed.flags, "prod")
+        ? await releaseEvidenceGate(parsed, promotionChannel, dependencies.releaseEvidence)
+        : undefined;
+      const evidenceMetadata = releaseEvidenceMetadata(evidenceGate);
+      const prebuiltUploadBudget = prebuiltUploadBudgetFromEnv(env);
       const result = await deployPrebuilt({
         directory: prebuilt,
         serverUrl,
@@ -3446,10 +4087,21 @@ export async function runSiteFlowCli(argv: string[], io: CliIo, dependencies: Cl
         entrypoint,
         requestedHostPrefix,
         apiToken,
-        fetch: dependencies.fetch
+        fetch: dependencies.fetch,
+        ...prebuiltUploadBudget,
+        ...(evidenceMetadata
+          ? {
+              source: {
+                repository: evidenceMetadata.repository,
+                branch: evidenceMetadata.branch,
+                commitSha: evidenceMetadata.commitRef
+              },
+              releaseEvidence: releaseEvidenceRequest(evidenceGate)
+            }
+          : {})
       });
       const promotion = flagBoolean(parsed.flags, "prod")
-        ? await promoteDeployResult(parsed, env, dependencies.fetch, serverUrl, apiToken, result.deploymentId, result.projectId)
+        ? await promoteDeployResult(parsed, env, dependencies.fetch, serverUrl, apiToken, result.deploymentId, result.projectId, evidenceGate)
         : undefined;
 
       if (json) {
@@ -3463,12 +4115,12 @@ export async function runSiteFlowCli(argv: string[], io: CliIo, dependencies: Cl
       const message = error instanceof Error ? error.message : "Prebuilt deploy failed.";
 
       if (json) {
-        writeJson(io, { status: "failed", message });
+        writeJson(io, { status: error instanceof CliBlockedError ? "blocked" : "failed", message });
       } else {
         io.stderr(`${message}\n`);
       }
 
-      return 1;
+      return error instanceof CliBlockedError ? error.exitCode : 1;
     }
   }
 
@@ -3481,11 +4133,11 @@ export async function runSiteFlowCli(argv: string[], io: CliIo, dependencies: Cl
   }
 
   if (parsed.command === "promote") {
-    return runReleaseCommand("promote", parsed, io, env, dependencies.fetch);
+    return runReleaseCommand("promote", parsed, io, env, dependencies.fetch, dependencies.releaseEvidence);
   }
 
   if (parsed.command === "rollback") {
-    return runReleaseCommand("rollback", parsed, io, env, dependencies.fetch);
+    return runReleaseCommand("rollback", parsed, io, env, dependencies.fetch, dependencies.releaseEvidence);
   }
 
   if (parsed.command === "deploy-hook") {
@@ -3533,18 +4185,30 @@ export async function runSiteFlowCli(argv: string[], io: CliIo, dependencies: Cl
   }
 
   if (parsed.command === "rolling") {
-    return runRollingRelease(parsed, io, env, dependencies.fetch);
+    return runRollingRelease(parsed, io, env, dependencies.fetch, dependencies.releaseEvidence);
   }
 
   if (parsed.command === "cron") {
     return runCronCommand(parsed, io, env, dependencies.fetch);
   }
 
+  if (parsed.command === "backup") {
+    return runBackupCommand(parsed, io, env, version, dependencies.backup);
+  }
+
+  if (parsed.command === "restore") {
+    return runRestoreCommand(parsed, io, env, dependencies.backup);
+  }
+
+  if (parsed.command === "release-gate") {
+    return runReleaseGateCommand(parsed, io, env, dependencies.releaseGate, dependencies.fetch);
+  }
+
   if (parsed.command === "status") {
     return runStatus(parsed, io);
   }
 
-  if (lifecycleCommands.has(parsed.command)) {
+  if (reservedLifecycleCommands.has(parsed.command)) {
     const message = `${parsed.command} is reserved for the lifecycle implementation phase.`;
 
     if (json) {

@@ -1,12 +1,26 @@
 import { resolveRuntimeConfig, type RuntimeConfig, type SiteFlowClientMode } from "@lib/config/runtimeConfig";
-import { createFixtureSiteFlowClient } from "./fixtureClient";
+import { createFixtureSiteFlowClient } from "@lib/api/fixtureClient";
 import { HttpSiteFlowClient } from "./httpClient";
 import type { SiteFlowClient } from "./siteflowClient";
-import { isSiteFlowScenarioName, type SiteFlowScenarioName } from "@lib/fixtures/scenarios";
+import { isSiteFlowScenarioName, type SiteFlowScenarioName } from "./scenarioContracts";
 
 export interface SiteFlowClientFactoryOptions {
   config?: RuntimeConfig;
   fixtureScenario?: string;
+}
+
+const browserTokenStorageKey = "siteflow.apiToken";
+
+function browserOperatorToken() {
+  if (typeof window === "undefined") {
+    return undefined;
+  }
+
+  try {
+    return window.sessionStorage.getItem(browserTokenStorageKey) ?? undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function resolveFixtureScenario(value: string): SiteFlowScenarioName {
@@ -30,7 +44,11 @@ export function createSiteFlowClient(options: SiteFlowClientFactoryOptions = {})
     throw new Error("SiteFlow API base URL is required for HTTP client mode.");
   }
 
-  return new HttpSiteFlowClient({ baseUrl: config.apiBaseUrl });
+  return new HttpSiteFlowClient({
+    baseUrl: config.apiBaseUrl,
+    authToken: config.apiToken,
+    getAuthToken: config.browserTokenFallbackEnabled ? browserOperatorToken : undefined
+  });
 }
 
 export function getDefaultSiteFlowClientMode(config: RuntimeConfig = resolveRuntimeConfig()): SiteFlowClientMode {

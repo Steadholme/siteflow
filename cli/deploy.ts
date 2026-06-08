@@ -2,7 +2,19 @@ import { createHash } from "node:crypto";
 import { brotliCompressSync, gzipSync } from "node:zlib";
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import type { PrebuiltCronJob, PrebuiltDeployCommand, PrebuiltDeployFile, PrebuiltDeployResult, PrebuiltImageConfig, PrebuiltRoutingConfig, PrebuiltRoutingRule } from "../src/lib/api/deployContracts.js";
+import {
+  assertPrebuiltUploadBudget,
+  defaultPrebuiltMaxUploadBytes,
+  defaultPrebuiltMaxUploadFiles,
+  type PrebuiltCronJob,
+  type PrebuiltDeployCommand,
+  type PrebuiltDeployFile,
+  type PrebuiltDeployResult,
+  type PrebuiltImageConfig,
+  type PrebuiltRoutingConfig,
+  type PrebuiltRoutingRule,
+  type PrebuiltUploadBudget
+} from "../src/lib/api/deployContracts.js";
 
 type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
 
@@ -19,6 +31,10 @@ export interface DeployPrebuiltOptions extends PackagePrebuiltOptions {
   requestedHostPrefix?: string;
   apiToken?: string;
   fetch?: FetchLike;
+  source?: PrebuiltDeployCommand["source"];
+  releaseEvidence?: PrebuiltDeployCommand["releaseEvidence"];
+  maxUploadBytes?: number;
+  maxFiles?: number;
 }
 
 function toPosixPath(value: string) {
@@ -56,6 +72,35 @@ function shouldPrecompressPath(filePath: string) {
   }
 
   return compressibleExtensions.has(path.posix.extname(filePath).toLowerCase());
+}
+
+function parsePositiveIntegerEnv(value: string | undefined, fallback: number, name: string) {
+  if (value === undefined || !value.trim()) {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+
+  return parsed;
+}
+
+export function prebuiltUploadBudgetFromEnv(env: NodeJS.ProcessEnv = process.env): Required<PrebuiltUploadBudget> {
+  return {
+    maxUploadBytes: parsePositiveIntegerEnv(
+      env.SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES,
+      defaultPrebuiltMaxUploadBytes,
+      "SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES"
+    ),
+    maxFiles: parsePositiveIntegerEnv(
+      env.SITEFLOW_PREBUILT_MAX_FILES,
+      defaultPrebuiltMaxUploadFiles,
+      "SITEFLOW_PREBUILT_MAX_FILES"
+    )
+  };
 }
 
 function addPrecompressedFiles(files: PrebuiltDeployFile[]) {
@@ -284,6 +329,10 @@ export async function packagePrebuiltDirectory(options: PackagePrebuiltOptions):
 
 export async function deployPrebuilt(options: DeployPrebuiltOptions): Promise<PrebuiltDeployResult> {
   const files = await packagePrebuiltDirectory(options);
+  assertPrebuiltUploadBudget(files, {
+    maxUploadBytes: options.maxUploadBytes,
+    maxFiles: options.maxFiles
+  });
   const config = await readVercelConfig(options);
   const command: PrebuiltDeployCommand = {
     projectSlug: options.projectSlug,
@@ -294,7 +343,9 @@ export async function deployPrebuilt(options: DeployPrebuiltOptions): Promise<Pr
     fluid: config.fluid,
     images: config.images,
     routing: config.routing,
-    crons: config.crons
+    crons: config.crons,
+    ...(options.source ? { source: options.source } : {}),
+    ...(options.releaseEvidence ? { releaseEvidence: options.releaseEvidence } : {})
   };
 
   if (options.baseDomain) {

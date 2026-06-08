@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { lstat, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import type {
   Actor,
   AnalyticsEvent,
@@ -32,12 +32,15 @@ import type {
   ObservabilityLogSource,
   ApiToken,
   AuditEvent,
+  OperatorSession,
   PermissionScope,
   Project,
   ProjectBuildSettings,
   ProjectEnvironment,
   ProjectPolicy,
+  ReleaseChannel,
   ReleaseChannelName,
+  ReleaseEvidenceMetadata,
   RepositoryBinding,
   RedirectStatusCode,
   RoutingHeader,
@@ -81,6 +84,7 @@ import type {
   DeploymentSummaryReadModel,
   EdgeConfigMutationReadModel,
   EdgeConfigReadModel,
+  EventFeedReadModel,
   EvidenceItemReadModel,
   FirewallEvaluationReadModel,
   FirewallRuleListReadModel,
@@ -97,15 +101,21 @@ import type {
   OperationSnapshotReadModel,
   ApiTokenCreateReadModel,
   ApiTokenRevokeReadModel,
+  OperatorSessionCreateReadModel,
+  OperatorSessionRotateReadModel,
+  OperatorSessionRevokeAllReadModel,
+  OperatorSessionRevokeReadModel,
   ProjectDetailReadModel,
   ProjectEnvironmentSettingsReadModel,
   ProjectEnvironmentVariableUpsertReadModel,
   ProjectListReadModel,
   ProjectMutationReadModel,
   ProjectSettingsReadModel,
+  ReleaseChannelReadModel,
   ReleaseConsoleReadModel,
   RollingReleaseCommandReadModel,
   RollingReleaseReadModel,
+  RollbackTargetReadModel,
   RouteRevisionEvidenceReadModel,
   RollbackConsoleReadModel,
   RoutingRuleListReadModel,
@@ -141,11 +151,13 @@ import type {
   LogQueryCommand,
   MatchRoutingRulesCommand,
   CreateApiTokenCommand,
+  CreateOperatorSessionCommand,
   PutBlobCommand,
   PurgeCacheCommand,
   PromoteDeploymentCommand,
   RemoveTeamMemberCommand,
   RevokeDeployHookCommand,
+  RevokeAllOperatorSessionsCommand,
   RevokeApiTokenCommand,
   RollbackDeploymentCommand,
   RunCronJobCommand,
@@ -158,7 +170,16 @@ import type {
   UpsertTeamMemberCommand,
   UpsertEnvironmentVariableCommand
 } from "../src/lib/api/siteflowClient.js";
-import type { PrebuiltDeployCommand, PrebuiltDeployFile, PrebuiltDeployResult, PrebuiltImageConfig } from "../src/lib/api/deployContracts.js";
+import {
+  assertPrebuiltUploadBudget,
+  defaultPrebuiltMaxUploadBytes,
+  defaultPrebuiltMaxUploadFiles,
+  type PrebuiltDeployCommand,
+  type PrebuiltDeployFile,
+  type PrebuiltDeployResult,
+  type PrebuiltImageConfig,
+  type PrebuiltUploadBudget
+} from "../src/lib/api/deployContracts.js";
 import { analyticsWebVitalRating, normalizeAnalyticsEventInput } from "../src/lib/analytics.js";
 import { redactLogLine, redactSecrets } from "../src/lib/redaction.js";
 import {
@@ -168,7 +189,10 @@ import {
   type ArtifactRoute,
   type FirewallEvaluationCommand,
   type LogDrainDeliveryPlan,
+  type OperatorSessionCreateResult,
+  type OperatorSessionRotateResult,
   type RecordLogDrainDeliveryCommand,
+  type SiteFlowAuthPrincipal,
   type SiteFlowReadRepository
 } from "./readRepository.js";
 
@@ -197,8 +221,30 @@ interface ReleaseCommandRow {
   reason: string;
   message: string;
   route_revision_id: string | null;
+  release_evidence: ReleaseEvidenceMetadata | null;
   created_at: Date;
   updated_at: Date;
+}
+
+interface ReleaseCommandInsertInput {
+  idempotencyKey: string;
+  operationId: string;
+  action: ReleaseAction;
+  projectId: SiteFlowId;
+  channel: ReleaseChannelName;
+  currentDeploymentId: SiteFlowId | null;
+  targetDeploymentId: SiteFlowId;
+  actor: Actor;
+  reason: string;
+  state: ReleaseCommandRow["state"];
+  message: string;
+  routeRevisionId?: SiteFlowId | null;
+  releaseEvidenceJson?: string | null;
+}
+
+interface ReleaseCommandInsertResult {
+  row: ReleaseCommandRow;
+  inserted: boolean;
 }
 
 interface ArtifactRouteRow {
@@ -228,6 +274,10 @@ interface DeploymentRouteRow {
   id: string;
   project_id: string;
   status: DeploymentStatus;
+  source_branch: string | null;
+  source_commit_sha: string | null;
+  source_repository: string | null;
+  project_repository: RepositoryBinding | Record<string, never>;
   artifact_root: string;
   entrypoint: string;
   preview_host: string;
@@ -281,6 +331,7 @@ interface RouteRevisionRow {
   status: RouteRevision["status"];
   generated_config: string;
   validation_summary: string;
+  release_evidence: ReleaseEvidenceMetadata | null;
   created_at: Date;
   applied_at: Date | null;
   failed_reason: string | null;
@@ -480,6 +531,24 @@ interface ApiTokenRow {
   last_used_at: Date | null;
 }
 
+interface OperatorSessionRow {
+  id: string;
+  subject: string;
+  actor: Actor | null;
+  token_prefix: string;
+  scopes: PermissionScope[];
+  project_ids: string[] | null;
+  status: OperatorSession["status"];
+  created_at: Date;
+  expires_at: Date;
+  revoked_at: Date | null;
+  last_used_at: Date | null;
+}
+
+interface OperatorSessionRotateRow extends OperatorSessionRow {
+  max_age_seconds: number;
+}
+
 interface AuditEventRow {
   id: string;
   project_id: string;
@@ -669,6 +738,7 @@ interface DeploymentInspectRow {
   route_status: RouteRevision["status"] | null;
   route_generated_config: string | null;
   route_validation_summary: string | null;
+  route_release_evidence: ReleaseEvidenceMetadata | null;
   route_created_at: Date | null;
   route_applied_at: Date | null;
   route_failed_reason: string | null;
@@ -678,10 +748,20 @@ export interface PostgresSiteFlowReadRepositoryOptions {
   artifactRoot: string;
   publicScheme?: "http" | "https";
   baseDomain?: string;
+  operatorSessionIdleTimeoutSeconds?: number;
+  prebuiltMaxUploadBytes?: number;
+  prebuiltMaxFiles?: number;
 }
 
 function operationIdFor(idempotencyKey: string) {
   return `op_${createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 20)}`;
+}
+
+const releaseCommandLockNamespace = "siteflow:release-command";
+const releaseChannelLockNamespace = "siteflow:release-channel";
+
+function positiveIntegerOption(value: number | undefined, fallback: number) {
+  return Number.isInteger(value) && value !== undefined && value > 0 ? value : fallback;
 }
 
 function permissionLevel(permission: PermissionScope) {
@@ -720,6 +800,62 @@ function apiTokenSecret() {
 
 function apiTokenHash(token: string) {
   return `sha256:${createHash("sha256").update(token).digest("hex")}`;
+}
+
+function operatorSessionSecret() {
+  return `sfs_${randomBytes(32).toString("base64url")}`;
+}
+
+function operatorSessionHash(token: string) {
+  return `sha256:${createHash("sha256").update(token).digest("hex")}`;
+}
+
+function normalizeOperatorSessionSubject(value: string | undefined) {
+  const subject = (value ?? "operator").trim();
+
+  if (!subject || subject.length > 120) {
+    throw new Error("Operator session subject is required and must be 120 characters or fewer.");
+  }
+
+  return subject;
+}
+
+function normalizeOperatorSessionTtlSeconds(value: number | undefined) {
+  const ttlSeconds = value ?? 3600;
+
+  if (!Number.isInteger(ttlSeconds) || ttlSeconds < 60 || ttlSeconds > 86_400) {
+    throw new Error("Operator session ttlSeconds must be an integer from 60 to 86400.");
+  }
+
+  return ttlSeconds;
+}
+
+function normalizeOperatorSessionIdleTimeoutSeconds(value: number | undefined) {
+  const idleTimeoutSeconds = value ?? 1800;
+
+  if (!Number.isInteger(idleTimeoutSeconds) || idleTimeoutSeconds < 60 || idleTimeoutSeconds > 86_400) {
+    throw new Error("Operator session idle timeout seconds must be an integer from 60 to 86400.");
+  }
+
+  return idleTimeoutSeconds;
+}
+
+function normalizeOperatorSessionProjectIds(value: SiteFlowId[] | undefined) {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error("Operator session projectIds must include at least one project id when provided.");
+  }
+
+  const projectIds = Array.from(new Set(value.map((entry) => entry.trim())));
+
+  if (projectIds.some((entry) => !entry || entry.length > 120)) {
+    throw new Error("Operator session projectIds must be non-empty project ids 120 characters or fewer.");
+  }
+
+  return projectIds;
 }
 
 function normalizeFirewallRuleName(value: string) {
@@ -1544,6 +1680,21 @@ function projectFromRow(row: ProjectRow): Project {
   };
 }
 
+function mergeRepositoryBinding(current: RepositoryBinding, incoming: RepositoryBinding): RepositoryBinding {
+  const currentPayload = isRecord(current.providerPayload) ? current.providerPayload : {};
+  const incomingPayload = isRecord(incoming.providerPayload) ? incoming.providerPayload : {};
+
+  return {
+    ...current,
+    installationId: incoming.installationId ?? current.installationId,
+    webhookSecretRef: incoming.webhookSecretRef ?? current.webhookSecretRef,
+    providerPayload: {
+      ...currentPayload,
+      ...incomingPayload
+    }
+  };
+}
+
 function environmentFromRow(row: EnvironmentRow): ProjectEnvironment {
   return {
     projectId: row.project_id,
@@ -1588,9 +1739,23 @@ function routeRevisionFromRow(row: RouteRevisionRow): RouteRevision {
     status: row.status,
     generatedConfig: row.generated_config,
     validationSummary: row.validation_summary,
+    releaseEvidence: row.release_evidence ?? undefined,
     createdAt: row.created_at.toISOString(),
     appliedAt: row.applied_at?.toISOString(),
     failedReason: row.failed_reason ?? undefined
+  };
+}
+
+function releaseChannelFromRow(row: ReleaseChannelRow): ReleaseChannel {
+  return {
+    id: `${row.project_id}:${row.name}`,
+    projectId: row.project_id,
+    name: row.name,
+    currentDeploymentId: row.current_deployment_id ?? undefined,
+    pendingDeploymentId: row.pending_deployment_id ?? undefined,
+    routeRevisionId: row.route_revision_id ?? undefined,
+    updatedAt: row.updated_at.toISOString(),
+    updatedBy: row.updated_by
   };
 }
 
@@ -1644,7 +1809,8 @@ function rollingGeneratedConfig(
   currentDeploymentId: SiteFlowId,
   candidateDeploymentId: SiteFlowId,
   percentage: number,
-  domains: DomainBinding[]
+  domains: DomainBinding[],
+  releaseEvidenceException?: AbortRollingReleaseCommand["releaseEvidenceException"]
 ) {
   return [
     `rolling_release=${rolloutId}`,
@@ -1653,6 +1819,13 @@ function rollingGeneratedConfig(
     `current_deployment=${currentDeploymentId}`,
     `candidate_deployment=${candidateDeploymentId}`,
     `candidate_percentage=${percentage}`,
+    ...(releaseEvidenceException
+      ? [
+          `release_evidence_exception=${releaseEvidenceException.type}`,
+          `release_evidence_exception_target_environment=${releaseEvidenceException.targetEnvironment}`,
+          `release_evidence_exception_reason=${releaseEvidenceException.reason.replace(/\s+/g, " ").trim()}`
+        ]
+      : []),
     ...domains.map((domain) => `host=${domain.hostname}`)
   ].join("\n");
 }
@@ -1695,6 +1868,27 @@ function safeArtifactPath(filePath: string) {
   }
 
   return normalized;
+}
+
+async function pathExists(filePath: string) {
+  try {
+    await lstat(filePath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
+    }
+
+    throw error;
+  }
+}
+
+async function removeDirectoryBestEffort(directory: string) {
+  try {
+    await rm(directory, { recursive: true, force: true });
+  } catch {
+    // Cleanup must not mask the original deploy failure.
+  }
 }
 
 function verifyFile(file: PrebuiltDeployFile) {
@@ -2083,6 +2277,38 @@ function apiTokenFromRow(row: ApiTokenRow): ApiToken {
   };
 }
 
+function operatorSessionFromRow(row: OperatorSessionRow): OperatorSession {
+  return {
+    id: row.id,
+    subject: row.subject,
+    actor: row.actor ?? undefined,
+    tokenPrefix: row.token_prefix,
+    scopes: row.scopes,
+    projectIds: row.project_ids ?? undefined,
+    status: row.status,
+    createdAt: row.created_at.toISOString(),
+    expiresAt: row.expires_at.toISOString(),
+    revokedAt: row.revoked_at?.toISOString(),
+    lastUsedAt: row.last_used_at?.toISOString()
+  };
+}
+
+function fallbackTokenActor(token: ApiToken): Actor {
+  return {
+    id: `api-token:${token.id}`,
+    name: token.name,
+    role: "system"
+  };
+}
+
+function fallbackSessionActor(session: OperatorSession): Actor {
+  return {
+    id: `operator-session:${session.id}`,
+    name: session.subject,
+    role: "operator"
+  };
+}
+
 function auditEventFromRow(row: AuditEventRow): AuditEvent {
   return {
     id: row.id,
@@ -2384,6 +2610,9 @@ function functionEntrypointsFromManifest(manifest: Record<string, unknown>): Fun
     const functionPath = typeof entry.path === "string" ? entry.path : undefined;
     const sourcePath = typeof entry.sourcePath === "string" ? entry.sourcePath : undefined;
     const runtime = entry.runtime === "nodejs20.x" ? entry.runtime : undefined;
+    const runtimeIsolation = entry.runtimeIsolation === "same_process" || entry.runtimeIsolation === "isolated_process"
+      ? entry.runtimeIsolation
+      : undefined;
     const handler = entry.handler === "handler" ? "handler" : entry.handler === "default" ? "default" : undefined;
     const methods = Array.isArray(entry.methods)
       ? entry.methods.filter((method): method is string => typeof method === "string")
@@ -2407,6 +2636,7 @@ function functionEntrypointsFromManifest(manifest: Record<string, unknown>): Fun
         path: functionPath,
         sourcePath,
         runtime,
+        runtimeIsolation,
         handler,
         methods: methods && methods.length > 0 ? methods : undefined,
         timeoutMs,
@@ -2754,6 +2984,7 @@ function routeRevisionFromInspectRow(row: DeploymentInspectRow): RouteRevision |
     status: row.route_status,
     generatedConfig: row.route_generated_config,
     validationSummary: row.route_validation_summary,
+    releaseEvidence: row.route_release_evidence ?? undefined,
     createdAt: row.route_created_at.toISOString(),
     appliedAt: row.route_applied_at?.toISOString(),
     failedReason: row.route_failed_reason ?? undefined
@@ -2833,6 +3064,34 @@ function routeEvidenceForDetail(routeRevision: RouteRevision | undefined, deploy
   };
 }
 
+function routeEvidenceForSummary(
+  routeRevision: RouteRevision,
+  deployment: DeploymentSummaryReadModel | undefined
+): RouteRevisionEvidenceReadModel {
+  return {
+    routeRevision,
+    checks: [
+      {
+        id: "check-route-target-deployment",
+        label: "Route target deployment",
+        status: deployment && routeRevision.deploymentId === deployment.id ? "pass" : "fail",
+        summary: deployment
+          ? routeRevision.deploymentId === deployment.id
+            ? `Route revision targets ${deployment.id}.`
+            : "Route revision target does not match this deployment."
+          : "Route revision target deployment could not be loaded."
+      },
+      {
+        id: "check-route-state",
+        label: "Route state",
+        status: routeRevision.status === "failed" ? "fail" : routeRevision.status === "applied" ? "pass" : "warning",
+        summary: routeRevision.validationSummary
+      }
+    ],
+    previousKnownGoodDeploymentId: routeRevision.previousDeploymentId
+  };
+}
+
 function emptyLogChunk(deploymentId: SiteFlowId, buildJobId: SiteFlowId, cursor?: string): LogChunkReadModel {
   return {
     deploymentId,
@@ -2854,6 +3113,84 @@ function releaseVerb(action: ReleaseAction) {
 
 function releaseEventStatus(routeRevision: RouteRevision): ChannelEvent["status"] {
   return routeRevision.status === "applied" ? "succeeded" : routeRevision.status === "failed" ? "failed" : "pending";
+}
+
+function repositoryBindingName(value: RepositoryBinding | Record<string, never> | null | undefined) {
+  if (!value || !isRecord(value)) {
+    return undefined;
+  }
+
+  const binding = value as Record<string, unknown>;
+  const owner = typeof binding.owner === "string" ? binding.owner.trim() : "";
+  const name = typeof binding.name === "string" ? binding.name.trim() : "";
+
+  return owner && name ? `${owner}/${name}` : undefined;
+}
+
+function deploymentRepositoryName(deployment: DeploymentRouteRow | undefined) {
+  return deployment?.source_repository?.trim() || repositoryBindingName(deployment?.project_repository);
+}
+
+function releaseEvidenceIdentityCheck(
+  deployment: DeploymentRouteRow | undefined,
+  evidence: ReleaseEvidenceMetadata | undefined,
+  channel: ReleaseChannelName
+): SafetyCheck[] {
+  if (channel !== "production") {
+    return [];
+  }
+
+  if (!evidence) {
+    return [
+      {
+        id: "check-release-evidence-target-identity",
+        label: "Release evidence target identity",
+        status: "fail",
+        summary: "Production release requires release evidence metadata bound to the target deployment."
+      }
+    ];
+  }
+
+  if (!deployment) {
+    return [];
+  }
+
+  const repository = deploymentRepositoryName(deployment);
+  const deploymentIdentity = [
+    repository ?? "unknown-repository",
+    deployment.source_branch ?? "unknown-branch",
+    deployment.source_commit_sha ?? "unknown-commit"
+  ].join("@");
+  const evidenceIdentity = `${evidence.repository}@${evidence.branch}@${evidence.commitRef}`;
+  const matches = repository === evidence.repository
+    && deployment.source_branch === evidence.branch
+    && deployment.source_commit_sha === evidence.commitRef;
+
+  return [
+    {
+      id: "check-release-evidence-target-identity",
+      label: "Release evidence target identity",
+      status: matches ? "pass" : "fail",
+      summary: matches
+        ? `Release evidence matches ${evidence.repository} ${evidence.branch}@${evidence.commitRef}.`
+        : `Release evidence targets ${evidenceIdentity}, but deployment source is ${deploymentIdentity}.`,
+      evidence: evidenceIdentity
+    }
+  ];
+}
+
+function releaseEvidenceMetadataForStorage(
+  evidence: PromoteDeploymentCommand["releaseEvidence"] | RollingCommand["releaseEvidence"] | PrebuiltDeployCommand["releaseEvidence"] | undefined
+): ReleaseEvidenceMetadata | undefined {
+  if (!evidence) {
+    return undefined;
+  }
+
+  if ("bundle" in evidence) {
+    throw new Error("Repository received unnormalized release evidence bundle request.");
+  }
+
+  return evidence;
 }
 
 function safetyChecksForRoute(
@@ -2931,6 +3268,8 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
   private readonly artifactRoot: string;
   private readonly publicScheme: "http" | "https";
   private readonly baseDomain?: string;
+  private readonly operatorSessionIdleTimeoutSeconds: number;
+  private readonly prebuiltUploadBudget: Required<PrebuiltUploadBudget>;
 
   constructor(
     private readonly pool: Pool,
@@ -2939,23 +3278,47 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
     this.artifactRoot = options.artifactRoot;
     this.publicScheme = options.publicScheme ?? "https";
     this.baseDomain = options.baseDomain;
+    this.operatorSessionIdleTimeoutSeconds = normalizeOperatorSessionIdleTimeoutSeconds(options.operatorSessionIdleTimeoutSeconds);
+    this.prebuiltUploadBudget = {
+      maxUploadBytes: positiveIntegerOption(options.prebuiltMaxUploadBytes, defaultPrebuiltMaxUploadBytes),
+      maxFiles: positiveIntegerOption(options.prebuiltMaxFiles, defaultPrebuiltMaxUploadFiles)
+    };
   }
 
-  async resolveTokenPermissions(token: string, projectId?: SiteFlowId): Promise<PermissionScope[] | undefined> {
+  async resolveTokenPrincipal(token: string, projectId?: SiteFlowId): Promise<SiteFlowAuthPrincipal | undefined> {
     const tokenHash = apiTokenHash(token.trim());
-    const result = await this.pool.query<{ id: string; scopes: PermissionScope[] }>(
+    const result = await this.pool.query<ApiTokenRow>(
       `
         UPDATE siteflow_api_tokens
         SET last_used_at = now()
         WHERE token_hash = $1
           AND status = 'active'
           AND (project_id IS NULL OR project_id = $2)
-        RETURNING id, scopes
+        RETURNING id, project_id, name, token_prefix, scopes, status, created_by,
+                  created_at, updated_at, revoked_at, last_used_at
       `,
       [tokenHash, projectId ?? null]
     );
+    const row = result.rows[0];
 
-    return result.rows[0]?.scopes;
+    if (!row) {
+      return undefined;
+    }
+
+    const resolvedToken = apiTokenFromRow(row);
+
+    return {
+      kind: "api_token",
+      scopes: resolvedToken.scopes,
+      token: resolvedToken,
+      actor: resolvedToken.createdBy ?? fallbackTokenActor(resolvedToken)
+    };
+  }
+
+  async resolveTokenPermissions(token: string, projectId?: SiteFlowId): Promise<PermissionScope[] | undefined> {
+    const principal = await this.resolveTokenPrincipal(token, projectId);
+
+    return principal?.scopes;
   }
 
   async authorizeToken(token: string, permission: PermissionScope, projectId?: SiteFlowId): Promise<boolean> {
@@ -2964,12 +3327,324 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
     return scopes ? hasPermission(scopes, permission) : false;
   }
 
-  listProjects(): Promise<ProjectListReadModel> {
-    return this.readModel("project-list", "default");
+  async resolveSessionPrincipal(token: string, projectId?: SiteFlowId): Promise<SiteFlowAuthPrincipal | undefined> {
+    const sessionHash = operatorSessionHash(token.trim());
+    const result = await this.pool.query<OperatorSessionRow>(
+      `
+        UPDATE siteflow_operator_sessions
+        SET last_used_at = now()
+        WHERE token_hash = $1
+          AND status = 'active'
+          AND expires_at > now()
+          AND COALESCE(last_used_at, created_at) > now() - ($2::integer * interval '1 second')
+          AND created_at > COALESCE((
+            SELECT max(created_at)
+            FROM siteflow_operator_session_cutoffs
+            WHERE project_id IS NULL
+          ), '-infinity'::timestamptz)
+          AND (
+            $3::text IS NULL
+            OR project_ids IS NULL
+            OR NOT (project_ids @> ARRAY[$3::text]::text[])
+            OR created_at > COALESCE((
+              SELECT max(created_at)
+              FROM siteflow_operator_session_cutoffs
+              WHERE project_id = $3::text
+            ), '-infinity'::timestamptz)
+          )
+        RETURNING id, subject, actor, token_prefix, scopes, project_ids, status,
+                  created_at, expires_at, revoked_at, last_used_at
+      `,
+      [sessionHash, this.operatorSessionIdleTimeoutSeconds, projectId ?? null]
+    );
+    const row = result.rows[0];
+
+    if (!row) {
+      return undefined;
+    }
+
+    const session = operatorSessionFromRow(row);
+    const inProjectScope = !session.projectIds || (projectId !== undefined && session.projectIds.includes(projectId));
+    const scopes = inProjectScope ? session.scopes : [];
+
+    return {
+      kind: "operator_session",
+      scopes,
+      session,
+      actor: session.actor ?? fallbackSessionActor(session)
+    };
   }
 
-  getProject(projectId: SiteFlowId): Promise<ProjectDetailReadModel> {
-    return this.readModel("project-detail", projectId);
+  async resolveSessionPermissions(token: string, projectId?: SiteFlowId): Promise<PermissionScope[] | undefined> {
+    const principal = await this.resolveSessionPrincipal(token, projectId);
+
+    return principal?.scopes;
+  }
+
+  async createOperatorSession(command: CreateOperatorSessionCommand): Promise<OperatorSessionCreateResult> {
+    const subject = normalizeOperatorSessionSubject(command.subject);
+    const scopes = normalizePermissionScopes(command.scopes);
+    const projectIds = normalizeOperatorSessionProjectIds(command.projectIds);
+    const ttlSeconds = normalizeOperatorSessionTtlSeconds(command.ttlSeconds);
+    const secret = operatorSessionSecret();
+    const sessionId = stableId("session", `${subject}:${randomUUID()}`);
+    const result = await this.pool.query<OperatorSessionRow>(
+      `
+        INSERT INTO siteflow_operator_sessions (
+          id,
+          subject,
+          actor,
+          token_hash,
+          token_prefix,
+          scopes,
+          project_ids,
+          expires_at
+        )
+        VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7::text[], now() + ($8::integer * interval '1 second'))
+        RETURNING id, subject, actor, token_prefix, scopes, project_ids, status,
+                  created_at, expires_at, revoked_at, last_used_at
+      `,
+      [
+        sessionId,
+        subject,
+        command.actor ? JSON.stringify(command.actor) : null,
+        operatorSessionHash(secret),
+        secret.slice(0, 12),
+        scopes,
+        projectIds ?? null,
+        ttlSeconds
+      ]
+    );
+    const session = operatorSessionFromRow(result.rows[0]);
+
+    return {
+      status: "created",
+      session,
+      secret,
+      message: "Operator session created."
+    };
+  }
+
+  async rotateOperatorSession(token: string): Promise<OperatorSessionRotateResult | undefined> {
+    const client = await this.pool.connect();
+    const oldSessionHash = operatorSessionHash(token.trim());
+    const secret = operatorSessionSecret();
+    const sessionId = stableId("session", `rotate:${randomUUID()}`);
+
+    try {
+      await client.query("BEGIN");
+      const currentResult = await client.query<OperatorSessionRow>(
+        `
+          SELECT id, subject, actor, token_prefix, scopes, project_ids, status,
+                 created_at, expires_at, revoked_at, last_used_at
+          FROM siteflow_operator_sessions s
+          WHERE token_hash = $1
+            AND status = 'active'
+            AND expires_at > now()
+            AND COALESCE(last_used_at, created_at) > now() - ($2::integer * interval '1 second')
+            AND created_at > COALESCE((
+              SELECT max(created_at)
+              FROM siteflow_operator_session_cutoffs
+              WHERE project_id IS NULL
+            ), '-infinity'::timestamptz)
+            AND (
+              project_ids IS NULL
+              OR NOT EXISTS (
+                SELECT 1
+                FROM siteflow_operator_session_cutoffs cutoff
+                WHERE cutoff.project_id IS NOT NULL
+                  AND project_ids @> ARRAY[cutoff.project_id]::text[]
+                  AND cutoff.created_at >= s.created_at
+              )
+            )
+          FOR UPDATE
+        `,
+        [oldSessionHash, this.operatorSessionIdleTimeoutSeconds]
+      );
+      const current = currentResult.rows[0];
+
+      if (!current) {
+        await client.query("ROLLBACK");
+        return undefined;
+      }
+
+      await client.query(
+        `
+          UPDATE siteflow_operator_sessions
+          SET status = 'revoked',
+              revoked_at = COALESCE(revoked_at, now())
+          WHERE id = $1
+        `,
+        [current.id]
+      );
+
+      const rotatedResult = await client.query<OperatorSessionRotateRow>(
+        `
+          INSERT INTO siteflow_operator_sessions (
+            id,
+            subject,
+            actor,
+            token_hash,
+            token_prefix,
+            scopes,
+            project_ids,
+            expires_at
+          )
+          VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7::text[], $8)
+          RETURNING id, subject, actor, token_prefix, scopes, project_ids, status,
+                    created_at, expires_at, revoked_at, last_used_at,
+                    GREATEST(1, CEIL(EXTRACT(EPOCH FROM (expires_at - now()))))::integer AS max_age_seconds
+        `,
+        [
+          sessionId,
+          current.subject,
+          current.actor ? JSON.stringify(current.actor) : null,
+          operatorSessionHash(secret),
+          secret.slice(0, 12),
+          current.scopes,
+          current.project_ids ?? null,
+          current.expires_at
+        ]
+      );
+      const rotated = rotatedResult.rows[0];
+
+      await client.query("COMMIT");
+
+      return {
+        status: "rotated",
+        session: operatorSessionFromRow(rotated),
+        secret,
+        maxAgeSeconds: rotated.max_age_seconds,
+        message: "Operator session rotated."
+      };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async revokeOperatorSession(token: string): Promise<OperatorSessionRevokeReadModel> {
+    const sessionHash = operatorSessionHash(token.trim());
+    const result = await this.pool.query<OperatorSessionRow>(
+      `
+        UPDATE siteflow_operator_sessions
+        SET status = 'revoked',
+            revoked_at = COALESCE(revoked_at, now())
+        WHERE token_hash = $1
+        RETURNING id, subject, actor, token_prefix, scopes, project_ids, status,
+                  created_at, expires_at, revoked_at, last_used_at
+      `,
+      [sessionHash]
+    );
+    const row = result.rows[0];
+
+    if (!row) {
+      return {
+        status: "not_found",
+        message: "Operator session was not found."
+      };
+    }
+
+    return {
+      status: "revoked",
+      session: operatorSessionFromRow(row),
+      message: "Operator session revoked."
+    };
+  }
+
+  async revokeAllOperatorSessions(command: RevokeAllOperatorSessionsCommand): Promise<OperatorSessionRevokeAllReadModel> {
+    const client = await this.pool.connect();
+    const projectId = command.projectId?.trim() || undefined;
+    const cutoffId = stableId("sessioncutoff", `${projectId ?? "global"}:${randomUUID()}`);
+    const reason = command.reason?.trim() || undefined;
+
+    try {
+      await client.query("BEGIN");
+      const revokeSql = projectId
+        ? `
+          UPDATE siteflow_operator_sessions
+          SET status = 'revoked',
+              revoked_at = COALESCE(revoked_at, now())
+          WHERE status = 'active'
+            AND created_at <= now()
+            AND project_ids @> ARRAY[$1]::text[]
+          RETURNING id
+        `
+        : `
+          UPDATE siteflow_operator_sessions
+          SET status = 'revoked',
+              revoked_at = COALESCE(revoked_at, now())
+          WHERE status = 'active'
+            AND created_at <= now()
+          RETURNING id
+        `;
+      const revokedResult = await client.query<{ id: string }>(
+        revokeSql,
+        projectId ? [projectId] : []
+      );
+      const cutoffResult = await client.query<{ created_at: Date }>(
+        `
+          INSERT INTO siteflow_operator_session_cutoffs (
+            id,
+            project_id,
+            actor,
+            reason,
+            revoked_count
+          )
+          VALUES ($1, $2, $3::jsonb, $4, $5)
+          RETURNING created_at
+        `,
+        [
+          cutoffId,
+          projectId ?? null,
+          JSON.stringify(command.actor),
+          reason ?? null,
+          revokedResult.rows.length
+        ]
+      );
+      const revokedAt = cutoffResult.rows[0]?.created_at ?? new Date();
+
+      await client.query("COMMIT");
+
+      return {
+        status: "revoked",
+        scope: projectId ? "project" : "global",
+        projectId,
+        cutoffId,
+        revokedAt: revokedAt.toISOString(),
+        revokedCount: revokedResult.rows.length,
+        message: projectId
+          ? "Project operator sessions were revoked."
+          : "All existing operator sessions were revoked."
+      };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async listProjects(): Promise<ProjectListReadModel> {
+    const cached = await this.tryReadModel<ProjectListReadModel>("project-list", "default");
+
+    if (cached) {
+      return cached;
+    }
+
+    return this.buildProjectList();
+  }
+
+  async getProject(projectId: SiteFlowId): Promise<ProjectDetailReadModel> {
+    const cached = await this.tryReadModel<ProjectDetailReadModel>("project-detail", projectId);
+
+    if (cached) {
+      return cached;
+    }
+
+    return this.buildProjectDetail(projectId);
   }
 
   async getProjectSettings(projectId: SiteFlowId): Promise<ProjectSettingsReadModel> {
@@ -5694,12 +6369,28 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
     return this.readDeploymentDetail(deploymentId);
   }
 
-  getReleaseConsole(projectId: SiteFlowId, channel: ReleaseChannelName): Promise<ReleaseConsoleReadModel> {
-    return this.readModel("release-console", releaseConsoleKey(projectId, channel));
+  async getReleaseConsole(projectId: SiteFlowId, channel: ReleaseChannelName): Promise<ReleaseConsoleReadModel> {
+    assertReleaseChannelName(channel);
+
+    const cached = await this.tryReadModel<ReleaseConsoleReadModel>("release-console", releaseConsoleKey(projectId, channel));
+
+    if (cached) {
+      return cached;
+    }
+
+    return this.buildReleaseConsole(projectId, channel);
   }
 
-  getRollbackConsole(projectId: SiteFlowId, channel: ReleaseChannelName): Promise<RollbackConsoleReadModel> {
-    return this.readModel("rollback-console", releaseConsoleKey(projectId, channel));
+  async getRollbackConsole(projectId: SiteFlowId, channel: ReleaseChannelName): Promise<RollbackConsoleReadModel> {
+    assertReleaseChannelName(channel);
+
+    const cached = await this.tryReadModel<RollbackConsoleReadModel>("rollback-console", releaseConsoleKey(projectId, channel));
+
+    if (cached) {
+      return cached;
+    }
+
+    return this.buildRollbackConsole(projectId, channel);
   }
 
   async promoteDeployment(command: PromoteDeploymentCommand): Promise<CommandResultReadModel> {
@@ -5770,6 +6461,7 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
       const current = currentDeploymentId ? await this.readDeploymentForRoute(client, currentDeploymentId) : undefined;
       const candidate = await this.readDeploymentForRoute(client, command.candidateDeploymentId);
       const domains = await this.listVerifiedDomainsForChannel(client, command.projectId, command.channel);
+      const releaseEvidence = releaseEvidenceMetadataForStorage(command.releaseEvidence);
       const safetyChecks = [
         {
           id: "check-current-deployment-ready",
@@ -5777,7 +6469,8 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
           status: current?.status === "ready" ? "pass" as const : "fail" as const,
           summary: current ? `Current deployment ${current.id} is ${current.status}.` : "Release channel has no current deployment."
         },
-        ...safetyChecksForRoute(command.projectId, candidate, domains, command.channel)
+        ...safetyChecksForRoute(command.projectId, candidate, domains, command.channel),
+        ...releaseEvidenceIdentityCheck(candidate, releaseEvidence, command.channel)
       ];
       const failedCheck = safetyChecks.find((check) => check.status === "fail");
 
@@ -5872,7 +6565,8 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
 
     const result = await this.pool.query<ReleaseCommandRow>(
       `
-        SELECT operation_id, action, project_id, channel, target_deployment_id, state, message, route_revision_id, updated_at
+        SELECT operation_id, action, project_id, channel, target_deployment_id, state, message, route_revision_id,
+               release_evidence, updated_at
         FROM siteflow_release_commands
         WHERE operation_id = $1
       `,
@@ -5892,6 +6586,7 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
       kind: operationKind(row.action),
       channel: row.channel,
       targetDeploymentId: row.target_deployment_id,
+      releaseEvidence: row.release_evidence ?? undefined,
       routeRevision: row.route_revision_id ? await this.readRouteRevision(this.pool, row.route_revision_id) : undefined,
       updatedAt: row.updated_at.toISOString(),
       message: row.message
@@ -5909,14 +6604,23 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
   }
 
   async deployPrebuilt(command: PrebuiltDeployCommand): Promise<PrebuiltDeployResult> {
+    if (!Array.isArray(command.files)) {
+      throw new Error("Prebuilt deploy requires a files array.");
+    }
+
+    assertPrebuiltUploadBudget(command.files, this.prebuiltUploadBudget, "Prebuilt deploy");
+
     const projectSlug = normalizeSlug(command.projectSlug);
     const baseDomain = resolveBaseDomain(command.baseDomain, this.baseDomain);
     const hostPrefix = normalizeHostPrefix(command.requestedHostPrefix);
     const previewHost = `${hostPrefix}.${baseDomain}`;
     const deploymentId = `dep_${randomUUID().replace(/-/g, "")}`;
     const projectId = `project_${projectSlug}`;
-    const artifactRoot = path.resolve(this.artifactRoot, deploymentId);
+    const artifactBaseRoot = path.resolve(this.artifactRoot);
+    const artifactRoot = path.join(artifactBaseRoot, deploymentId);
+    const artifactStagingRoot = path.join(artifactBaseRoot, `.publish-${deploymentId}-${randomUUID().replace(/-/g, "")}`);
     const entrypoint = safeArtifactPath(command.entrypoint ?? "index.html");
+    const releaseEvidence = releaseEvidenceMetadataForStorage(command.releaseEvidence);
     const artifactManifest: ArtifactManifest = {
       entrypoint,
       fileCount: command.files.length,
@@ -5927,6 +6631,8 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
         ...(command.public !== undefined ? { public: command.public } : {}),
         ...(command.fluid !== undefined ? { fluid: command.fluid } : {}),
         ...(command.images !== undefined ? { images: command.images } : {}),
+        ...(command.source !== undefined ? { source: command.source } : {}),
+        ...(releaseEvidence !== undefined ? { releaseEvidence } : {}),
         precompressed: precompressedStats(command.files),
         routing: {
           ...(command.routing?.cleanUrls !== undefined ? { cleanUrls: command.routing.cleanUrls } : {}),
@@ -5937,38 +6643,48 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
     };
     const checksum = createHash("sha256");
     let totalBytes = 0;
+    let stagingCreated = false;
+    let artifactPromoted = false;
+    let committed = false;
+    let client: PoolClient | undefined;
 
     if (command.files.length === 0) {
       throw new Error("Prebuilt deploy requires at least one file.");
     }
 
-    await mkdir(artifactRoot, { recursive: true });
+    try {
+      await mkdir(artifactBaseRoot, { recursive: true });
 
-    for (const file of command.files) {
-      const relativePath = safeArtifactPath(file.path);
-      const bytes = verifyFile(file);
-      const targetPath = path.resolve(artifactRoot, ...relativePath.split("/"));
-
-      if (!targetPath.startsWith(`${artifactRoot}${path.sep}`)) {
-        throw new Error(`Artifact file escapes deployment root: ${file.path}`);
+      if (await pathExists(artifactRoot)) {
+        throw new Error(`Prebuilt artifact target already exists: ${artifactRoot}.`);
       }
 
-      await mkdir(path.dirname(targetPath), { recursive: true });
-      await writeFile(targetPath, bytes);
+      await mkdir(artifactStagingRoot);
+      stagingCreated = true;
 
-      checksum.update(relativePath);
-      checksum.update("\0");
-      checksum.update(bytes);
-      totalBytes += bytes.byteLength;
-    }
+      for (const file of command.files) {
+        const relativePath = safeArtifactPath(file.path);
+        const bytes = verifyFile(file);
+        const targetPath = path.resolve(artifactStagingRoot, ...relativePath.split("/"));
 
-    const digest = checksum.digest("hex");
-    artifactManifest.totalBytes = totalBytes;
-    artifactManifest.checksum = `sha256:${digest}`;
+        if (!targetPath.startsWith(`${artifactStagingRoot}${path.sep}`)) {
+          throw new Error(`Artifact file escapes deployment root: ${file.path}`);
+        }
 
-    const client = await this.pool.connect();
+        await mkdir(path.dirname(targetPath), { recursive: true });
+        await writeFile(targetPath, bytes);
 
-    try {
+        checksum.update(relativePath);
+        checksum.update("\0");
+        checksum.update(bytes);
+        totalBytes += bytes.byteLength;
+      }
+
+      const digest = checksum.digest("hex");
+      artifactManifest.totalBytes = totalBytes;
+      artifactManifest.checksum = `sha256:${digest}`;
+
+      client = await this.pool.connect();
       await client.query("BEGIN");
       await client.query(
         `
@@ -6107,25 +6823,43 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
         );
       }
 
+      if (await pathExists(artifactRoot)) {
+        throw new Error(`Prebuilt artifact target already exists: ${artifactRoot}.`);
+      }
+
+      await rename(artifactStagingRoot, artifactRoot);
+      artifactPromoted = true;
       await client.query("COMMIT");
+      committed = true;
+
+      return {
+        deploymentId,
+        projectId,
+        projectSlug,
+        previewHost,
+        previewUrl: `${this.publicScheme}://${previewHost}`,
+        artifactRoot,
+        fileCount: command.files.length,
+        totalBytes,
+        checksum: digest
+      };
     } catch (error) {
-      await client.query("ROLLBACK");
+      if (client && !committed) {
+        try {
+          await client.query("ROLLBACK");
+        } catch {
+          // Preserve the original deploy failure.
+        }
+      }
+
+      if (!artifactPromoted && stagingCreated) {
+        await removeDirectoryBestEffort(artifactStagingRoot);
+      }
+
       throw error;
     } finally {
-      client.release();
+      client?.release();
     }
-
-    return {
-      deploymentId,
-      projectId,
-      projectSlug,
-      previewHost,
-      previewUrl: `${this.publicScheme}://${previewHost}`,
-      artifactRoot,
-      fileCount: command.files.length,
-      totalBytes,
-      checksum: digest
-    };
   }
 
   async resolveArtifactRoute(host: string, bucketKey?: string): Promise<ArtifactRoute | undefined> {
@@ -6326,6 +7060,377 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
     return result.rows[0]?.payload;
   }
 
+  private async buildProjectList(): Promise<ProjectListReadModel> {
+    const [projects, deploymentList, sourceEvents, auditEvents, activeOperations] = await Promise.all([
+      this.listProjectsFromTables(),
+      this.listDeployments(),
+      this.listRecentSourceEvents(undefined, 20),
+      this.listRecentAuditEvents(undefined, 20),
+      this.activeReleaseOperationCount()
+    ]);
+    const items: ProjectListReadModel["projects"] = [];
+
+    for (const project of projects) {
+      const productionChannel = await this.readReleaseChannel(this.pool, project.id, "production", false).catch(() => undefined);
+      const productionDeployment = await this.deploymentSummaryFromListOrRead(
+        deploymentList.deployments,
+        productionChannel?.current_deployment_id
+      );
+      const projectDeployments = deploymentList.deployments.filter((deployment) => deployment.projectId === project.id);
+
+      items.push({
+        project,
+        productionDeployment,
+        pendingDeploymentCount: projectDeployments.filter((deployment) =>
+          deployment.status === "queued" || deployment.status === "building"
+        ).length,
+        lastSourceEvent: sourceEvents.find((event) => event.projectId === project.id),
+        lastAuditEvent: auditEvents.find((event) => event.projectId === project.id)
+      });
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    const deploymentsToday = deploymentList.deployments.filter((deployment) => deployment.createdAt.slice(0, 10) === today).length;
+
+    return {
+      summary: {
+        totalProjects: projects.length,
+        activeProjects: projects.filter((project) => project.status === "active").length,
+        deploymentsToday,
+        activeOperations,
+        routeDriftCount: deploymentList.deployments.filter((deployment) => deployment.routeRevisionStatus === "drifted").length,
+        failedRouteCount: deploymentList.deployments.filter((deployment) => deployment.routeRevisionStatus === "failed").length,
+        failedBuildCount: deploymentList.deployments.filter((deployment) => deployment.status === "failed").length,
+        updatedAt: new Date().toISOString()
+      },
+      projects: items,
+      recentEvents: {
+        sourceEvents,
+        channelEvents: [],
+        auditEvents
+      },
+      emptyState: items.length === 0 ? "No SiteFlow projects have been created yet." : undefined
+    };
+  }
+
+  private async buildProjectDetail(projectId: SiteFlowId): Promise<ProjectDetailReadModel> {
+    const project = await this.readProject(projectId);
+    const [deploymentList, channels, sourceEvents, auditEvents] = await Promise.all([
+      this.listDeployments(project.id),
+      this.listReleaseChannels(project.id),
+      this.listRecentSourceEvents(project.id, 20),
+      this.listAuditEvents(project.id, 20)
+    ]);
+    const channelModels: ReleaseChannelReadModel[] = [];
+    const routeEvidence: RouteRevisionEvidenceReadModel[] = [];
+
+    for (const row of channels) {
+      const currentDeployment = await this.deploymentSummaryFromListOrRead(deploymentList.deployments, row.current_deployment_id);
+      const routeRevision = row.route_revision_id
+        ? await this.readRouteRevision(this.pool, row.route_revision_id)
+        : undefined;
+
+      channelModels.push({
+        channel: releaseChannelFromRow(row),
+        currentDeployment,
+        routeRevision
+      });
+
+      if (routeRevision) {
+        routeEvidence.push(routeEvidenceForSummary(routeRevision, currentDeployment));
+      }
+    }
+
+    const channelEvents = (await Promise.all(
+      channels.map((row) => this.listRecentReleaseChannelEvents(project.id, row.name, 5))
+    )).flat().sort((left, right) => right.createdAt.localeCompare(left.createdAt)).slice(0, 20);
+
+    return {
+      project,
+      channels: channelModels,
+      deployments: deploymentList.deployments,
+      recentEvents: {
+        sourceEvents,
+        channelEvents,
+        auditEvents
+      },
+      routeEvidence
+    };
+  }
+
+  private async listProjectsFromTables(): Promise<Project[]> {
+    const result = await this.pool.query<ProjectRow>(
+      `
+        SELECT id, slug, name, status, framework, default_branch, production_branch, repository, build_settings, created_at, updated_at
+        FROM siteflow_projects
+        ORDER BY updated_at DESC, name ASC
+      `
+    );
+    const projects: Project[] = [];
+
+    for (const row of result.rows) {
+      const project = projectFromRow(row);
+      project.domains = await this.listProjectDomains(project.id);
+      projects.push(project);
+    }
+
+    return projects;
+  }
+
+  private async listReleaseChannels(projectId: SiteFlowId): Promise<ReleaseChannelRow[]> {
+    const result = await this.pool.query<ReleaseChannelRow>(
+      `
+        SELECT project_id, name, current_deployment_id, pending_deployment_id, route_revision_id, updated_by, updated_at
+        FROM siteflow_release_channels
+        WHERE project_id = $1
+        ORDER BY
+          CASE name
+            WHEN 'production' THEN 1
+            WHEN 'staging' THEN 2
+            WHEN 'preview' THEN 3
+            ELSE 4
+          END
+      `,
+      [projectId]
+    );
+
+    return result.rows;
+  }
+
+  private async listRecentSourceEvents(projectId?: SiteFlowId, limit = 20): Promise<SourceEvent[]> {
+    const values = projectId ? [projectId, limit] : [limit];
+    const result = await this.pool.query<SourceEventRow>(
+      `
+        SELECT id, project_id, kind, status, disposition, provider_delivery_id, branch, commit_sha,
+               commit_message, commit_author, pull_request_number, received_at, actor
+        FROM siteflow_source_events
+        ${projectId ? "WHERE project_id = $1" : ""}
+        ORDER BY received_at DESC
+        LIMIT $${projectId ? 2 : 1}
+      `,
+      values
+    );
+
+    return result.rows.map(sourceEventFromRow);
+  }
+
+  private async listRecentAuditEvents(projectId?: SiteFlowId, limit = 20): Promise<AuditEvent[]> {
+    const values = projectId ? [projectId, limit] : [limit];
+    const result = await this.pool.query<AuditEventRow>(
+      `
+        SELECT id, project_id, action, actor, target_type, target_id, summary, reason, metadata, created_at
+        FROM siteflow_audit_events
+        ${projectId ? "WHERE project_id = $1" : ""}
+        ORDER BY created_at DESC
+        LIMIT $${projectId ? 2 : 1}
+      `,
+      values
+    );
+
+    return result.rows.map(auditEventFromRow);
+  }
+
+  private async activeReleaseOperationCount(): Promise<number> {
+    const result = await this.pool.query<{ count: string | number }>(
+      `
+        SELECT count(*) AS count
+        FROM siteflow_release_commands
+        WHERE state IN ('pending', 'running')
+      `
+    );
+
+    return pgNumber(result.rows[0]?.count ?? 0);
+  }
+
+  private async buildReleaseConsole(projectId: SiteFlowId, channel: ReleaseChannelName): Promise<ReleaseConsoleReadModel> {
+    const project = await this.readProject(projectId);
+    const [releaseChannel, deployments, domains, recentChannelEvents, auditEvents] = await Promise.all([
+      this.readReleaseChannel(this.pool, projectId, channel, false),
+      this.listDeployments(projectId),
+      this.listVerifiedDomainsForChannel(this.pool, projectId, channel),
+      this.listRecentReleaseChannelEvents(projectId, channel),
+      this.listAuditEvents(projectId)
+    ]);
+    const currentDeployment = await this.deploymentSummaryFromListOrRead(
+      deployments.deployments,
+      releaseChannel?.current_deployment_id
+    );
+    const candidateDeployment = releaseChannel?.pending_deployment_id
+      ? await this.deploymentSummaryFromListOrRead(deployments.deployments, releaseChannel.pending_deployment_id)
+      : deployments.deployments.find((deployment) =>
+          deployment.status === "ready" && deployment.id !== currentDeployment?.id
+        );
+    const candidateRoute = candidateDeployment
+      ? await this.readDeploymentForRoute(this.pool, candidateDeployment.id).catch(() => undefined)
+      : undefined;
+    const safetyChecks = safetyChecksForRoute(projectId, candidateRoute, domains, channel);
+    const routePreview = candidateRoute
+      ? this.routePreviewFor(candidateRoute, channel, domains, currentDeployment?.id, "Promotion")
+      : undefined;
+
+    return {
+      project,
+      channel,
+      currentDeployment,
+      candidateDeployment,
+      routePreview,
+      safetyChecks,
+      recentChannelEvents,
+      auditEvents
+    };
+  }
+
+  private async buildRollbackConsole(projectId: SiteFlowId, channel: ReleaseChannelName): Promise<RollbackConsoleReadModel> {
+    const project = await this.readProject(projectId);
+    const [releaseChannel, deployments, domains, recentChannelEvents, auditEvents] = await Promise.all([
+      this.readReleaseChannel(this.pool, projectId, channel, false),
+      this.listDeployments(projectId),
+      this.listVerifiedDomainsForChannel(this.pool, projectId, channel),
+      this.listRecentReleaseChannelEvents(projectId, channel),
+      this.listAuditEvents(projectId)
+    ]);
+    const currentDeployment = await this.deploymentSummaryFromListOrRead(
+      deployments.deployments,
+      releaseChannel?.current_deployment_id
+    );
+    const targetEntries: Array<{ target: RollbackTargetReadModel; route?: DeploymentRouteRow }> = [];
+
+    for (const deployment of deployments.deployments.filter((item) => item.id !== currentDeployment?.id).slice(0, 10)) {
+      const route = await this.readDeploymentForRoute(this.pool, deployment.id).catch(() => undefined);
+      const safetyChecks = [
+        ...safetyChecksForRoute(projectId, route, domains, channel),
+        {
+          id: "check-rollback-target-distinct",
+          label: "Rollback target is not current",
+          status: deployment.id !== currentDeployment?.id ? "pass" : "fail",
+          summary: deployment.id !== currentDeployment?.id
+            ? `Rollback target ${deployment.id} is distinct from the current channel target.`
+            : "Rollback target is already the current channel target."
+        } satisfies SafetyCheck
+      ];
+      const failedCheck = safetyChecks.find((check) => check.status !== "pass");
+
+      targetEntries.push({
+        route,
+        target: {
+          deployment,
+          eligible: !failedCheck,
+          disabledReason: failedCheck?.summary,
+          safetyChecks
+        }
+      });
+    }
+
+    const selectedEntry = targetEntries.find((entry) => entry.target.eligible) ?? targetEntries[0];
+    const routePreview = selectedEntry?.route && currentDeployment
+      ? this.routePreviewFor(selectedEntry.route, channel, domains, currentDeployment.id, "Rollback")
+      : undefined;
+
+    return {
+      project,
+      channel,
+      currentDeployment,
+      targets: targetEntries.map((entry) => entry.target),
+      selectedTargetId: selectedEntry?.target.deployment.id,
+      routePreview,
+      recentChannelEvents,
+      auditEvents
+    };
+  }
+
+  private async deploymentSummaryFromListOrRead(
+    deployments: DeploymentSummaryReadModel[],
+    deploymentId: SiteFlowId | null | undefined
+  ): Promise<DeploymentSummaryReadModel | undefined> {
+    if (!deploymentId) {
+      return undefined;
+    }
+
+    return deployments.find((deployment) => deployment.id === deploymentId)
+      ?? this.readDeploymentSummary(deploymentId).catch(() => undefined);
+  }
+
+  private routePreviewFor(
+    deployment: DeploymentRouteRow,
+    channel: ReleaseChannelName,
+    domains: DomainBinding[],
+    previousDeploymentId: SiteFlowId | undefined,
+    action: "Promotion" | "Rollback"
+  ): RouteRevisionEvidenceReadModel {
+    const routeRevision: RouteRevision = {
+      id: stableId("route", `preview:${action}:${deployment.project_id}:${channel}:${deployment.id}:${previousDeploymentId ?? "none"}`),
+      projectId: deployment.project_id,
+      channel,
+      deploymentId: deployment.id,
+      previousDeploymentId,
+      status: "planned",
+      generatedConfig: routeGeneratedConfig(deployment.project_id, channel, deployment, domains),
+      validationSummary: `${action} route preview for ${domains.length} verified domain${domains.length === 1 ? "" : "s"}.`,
+      createdAt: new Date().toISOString()
+    };
+
+    return {
+      routeRevision,
+      checks: safetyChecksForRoute(deployment.project_id, deployment, domains, channel),
+      previousKnownGoodDeploymentId: previousDeploymentId
+    };
+  }
+
+  private async listRecentReleaseChannelEvents(
+    projectId: SiteFlowId,
+    channel: ReleaseChannelName,
+    limit = 10
+  ): Promise<ChannelEvent[]> {
+    const result = await this.pool.query<ReleaseCommandRow>(
+      `
+        SELECT idempotency_key, operation_id, action, project_id, channel, current_deployment_id,
+               target_deployment_id, state, actor, reason, message, route_revision_id, release_evidence,
+               created_at, updated_at
+        FROM siteflow_release_commands
+        WHERE project_id = $1
+          AND channel = $2
+          AND route_revision_id IS NOT NULL
+        ORDER BY created_at DESC
+        LIMIT $3
+      `,
+      [projectId, channel, limit]
+    );
+    const events: ChannelEvent[] = [];
+
+    for (const row of result.rows) {
+      const routeRevision = row.route_revision_id
+        ? await this.readRouteRevision(this.pool, row.route_revision_id)
+        : undefined;
+
+      if (!routeRevision) {
+        continue;
+      }
+
+      const command = row.action === "rollback"
+        ? {
+            projectId: row.project_id,
+            channel: row.channel,
+            currentDeploymentId: row.current_deployment_id ?? undefined,
+            targetDeploymentId: row.target_deployment_id,
+            actor: row.actor,
+            reason: row.reason,
+            idempotencyKey: row.idempotency_key
+          }
+        : {
+            projectId: row.project_id,
+            channel: row.channel,
+            targetDeploymentId: row.target_deployment_id,
+            actor: row.actor,
+            reason: row.reason,
+            idempotencyKey: row.idempotency_key
+          };
+
+      events.push(channelEventForRoute(row.action, command, routeRevision, []));
+    }
+
+    return events;
+  }
+
   private async readDeploymentDetail(deploymentId: SiteFlowId): Promise<DeploymentDetailReadModel> {
     const result = await this.pool.query<DeploymentInspectRow>(
       `
@@ -6378,6 +7483,7 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
           route.status AS route_status,
           route.generated_config AS route_generated_config,
           route.validation_summary AS route_validation_summary,
+          route.release_evidence AS route_release_evidence,
           route.created_at AS route_created_at,
           route.applied_at AS route_applied_at,
           route.failed_reason AS route_failed_reason
@@ -6386,7 +7492,7 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
         LEFT JOIN siteflow_source_events source ON source.id = deployment.source_event_id
         LEFT JOIN siteflow_build_jobs build ON build.id = deployment.build_job_id
         LEFT JOIN LATERAL (
-          SELECT id, channel, previous_deployment_id, status, generated_config, validation_summary,
+          SELECT id, channel, previous_deployment_id, status, generated_config, validation_summary, release_evidence,
                  created_at, applied_at, failed_reason
           FROM siteflow_route_revisions
           WHERE deployment_id = deployment.id
@@ -6603,7 +7709,20 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
     );
 
     if (result.rows[0]) {
-      return projectFromRow(result.rows[0]);
+      const project = projectFromRow(result.rows[0]);
+      const mergedRepository = mergeRepositoryBinding(project.repository, repository);
+      const updated = await this.pool.query<ProjectRow>(
+        `
+          UPDATE siteflow_projects
+          SET repository = $2::jsonb,
+              updated_at = now()
+          WHERE id = $1
+          RETURNING id, slug, name, status, framework, default_branch, production_branch, repository, build_settings, created_at, updated_at
+        `,
+        [project.id, JSON.stringify(mergedRepository)]
+      );
+
+      return projectFromRow(updated.rows[0] ?? result.rows[0]);
     }
 
     return (await this.createProject({
@@ -6893,7 +8012,8 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
     const result = await client.query<ReleaseCommandRow>(
       `
         SELECT idempotency_key, operation_id, action, project_id, channel, current_deployment_id,
-               target_deployment_id, state, actor, reason, message, route_revision_id, created_at, updated_at
+               target_deployment_id, state, actor, reason, message, route_revision_id, release_evidence,
+               created_at, updated_at
         FROM siteflow_release_commands
         WHERE idempotency_key = $1
         FOR UPDATE
@@ -6904,11 +8024,83 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
     return result.rows[0];
   }
 
+  private async insertReleaseCommand(
+    client: Queryable,
+    input: ReleaseCommandInsertInput
+  ): Promise<ReleaseCommandInsertResult> {
+    const result = await client.query<ReleaseCommandRow>(
+      `
+        INSERT INTO siteflow_release_commands (
+          idempotency_key,
+          operation_id,
+          action,
+          project_id,
+          channel,
+          current_deployment_id,
+          target_deployment_id,
+          actor,
+          reason,
+          state,
+          message,
+          route_revision_id,
+          release_evidence
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13::jsonb)
+        ON CONFLICT (idempotency_key) DO NOTHING
+        RETURNING idempotency_key, operation_id, action, project_id, channel, current_deployment_id,
+                  target_deployment_id, state, actor, reason, message, route_revision_id, release_evidence,
+                  created_at, updated_at
+      `,
+      [
+        input.idempotencyKey,
+        input.operationId,
+        input.action,
+        input.projectId,
+        input.channel,
+        input.currentDeploymentId,
+        input.targetDeploymentId,
+        JSON.stringify(input.actor),
+        input.reason,
+        input.state,
+        input.message,
+        input.routeRevisionId ?? null,
+        input.releaseEvidenceJson ?? null
+      ]
+    );
+    const inserted = result.rows[0];
+
+    if (inserted) {
+      return { row: inserted, inserted: true };
+    }
+
+    const existing = await this.readReleaseCommandByIdempotencyKey(client, input.idempotencyKey);
+
+    if (!existing) {
+      throw new Error(`Release command idempotency key ${input.idempotencyKey} conflicted but no command row could be read.`);
+    }
+
+    return { row: existing, inserted: false };
+  }
+
+  private async lockReleaseCommandIdempotencyKey(client: Queryable, idempotencyKey: string) {
+    await client.query(
+      "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+      [releaseCommandLockNamespace, idempotencyKey]
+    );
+  }
+
+  private async lockReleaseChannelScope(client: Queryable, projectId: SiteFlowId, channel: ReleaseChannelName) {
+    await client.query(
+      "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+      [releaseChannelLockNamespace, `${projectId}:${channel}`]
+    );
+  }
+
   private async readRouteRevision(client: Queryable, routeRevisionId: SiteFlowId): Promise<RouteRevision | undefined> {
     const result = await client.query<RouteRevisionRow>(
       `
         SELECT id, project_id, channel, deployment_id, previous_deployment_id, status, generated_config,
-               validation_summary, created_at, applied_at, failed_reason
+               validation_summary, release_evidence, created_at, applied_at, failed_reason
         FROM siteflow_route_revisions
         WHERE id = $1
       `,
@@ -6923,7 +8115,7 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
     const result = await client.query<RouteRevisionRow>(
       `
         SELECT id, project_id, channel, deployment_id, previous_deployment_id, status, generated_config,
-               validation_summary, created_at, applied_at, failed_reason
+               validation_summary, release_evidence, created_at, applied_at, failed_reason
         FROM siteflow_route_revisions
         WHERE idempotency_key = $1
       `,
@@ -7010,6 +8202,10 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
   ): Promise<RouteRevision> {
     const routeRevisionId = stableId("route", `${command.idempotencyKey}:rolling:${rolloutId}:${percentage}`);
     const idempotencyKey = `${command.idempotencyKey}:rolling:${rolloutId}:${percentage}`;
+    const releaseEvidence = releaseEvidenceMetadataForStorage(command.releaseEvidence);
+    const releaseEvidenceException = "releaseEvidenceException" in command
+      ? command.releaseEvidenceException
+      : undefined;
     const result = await client.query<RouteRevisionRow>(
       `
         INSERT INTO siteflow_route_revisions (
@@ -7023,14 +8219,15 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
           validation_summary,
           actor,
           reason,
+          release_evidence,
           idempotency_key,
           applied_at
         )
-        VALUES ($1, $2, $3, $4, $5, 'applied', $6, $7, $8::jsonb, $9, $10, now())
+        VALUES ($1, $2, $3, $4, $5, 'applied', $6, $7, $8::jsonb, $9, $10::jsonb, $11, now())
         ON CONFLICT (idempotency_key) DO UPDATE
         SET idempotency_key = EXCLUDED.idempotency_key
         RETURNING id, project_id, channel, deployment_id, previous_deployment_id, status, generated_config,
-                  validation_summary, created_at, applied_at, failed_reason
+                  validation_summary, release_evidence, created_at, applied_at, failed_reason
       `,
       [
         routeRevisionId,
@@ -7045,11 +8242,13 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
           currentDeploymentId,
           candidateDeploymentId,
           percentage,
-          domains
+          domains,
+          releaseEvidenceException
         ),
         summary,
         JSON.stringify(command.actor),
         command.reason.trim(),
+        releaseEvidence ? JSON.stringify(releaseEvidence) : null,
         idempotencyKey
       ]
     );
@@ -7064,10 +8263,16 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
           deployment.id,
           deployment.project_id,
           deployment.status,
+          deployment.source_branch,
+          deployment.source_commit_sha,
+          deployment.artifact_manifest->'metadata'->'source'->>'repository' AS source_repository,
+          project.repository AS project_repository,
           deployment.artifact_root,
           COALESCE(route.entrypoint, deployment.artifact_manifest->>'entrypoint', 'index.html') AS entrypoint,
           deployment.preview_host
         FROM siteflow_deployments deployment
+        JOIN siteflow_projects project
+          ON project.id = deployment.project_id
         LEFT JOIN siteflow_artifact_routes route
           ON route.deployment_id = deployment.id
          AND route.host = deployment.preview_host
@@ -7080,13 +8285,13 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
     return result.rows[0];
   }
 
-  private async readReleaseChannel(client: Queryable, projectId: SiteFlowId, channel: ReleaseChannelName) {
+  private async readReleaseChannel(client: Queryable, projectId: SiteFlowId, channel: ReleaseChannelName, lock = true) {
     const result = await client.query<ReleaseChannelRow>(
       `
         SELECT project_id, name, current_deployment_id, pending_deployment_id, route_revision_id, updated_by, updated_at
         FROM siteflow_release_channels
         WHERE project_id = $1 AND name = $2
-        FOR UPDATE
+        ${lock ? "FOR UPDATE" : ""}
       `,
       [projectId, channel]
     );
@@ -7167,6 +8372,10 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
       const current = await this.readDeploymentForRoute(client, rollout.current_deployment_id);
       const candidate = await this.readDeploymentForRoute(client, rollout.candidate_deployment_id);
       const domains = await this.listVerifiedDomainsForChannel(client, command.projectId, command.channel);
+      const releaseEvidence = releaseEvidenceMetadataForStorage(command.releaseEvidence);
+      const releaseEvidenceException = "releaseEvidenceException" in command
+        ? command.releaseEvidenceException
+        : undefined;
       const safetyChecks: SafetyCheck[] = [
         {
           id: "check-active-rollout",
@@ -7180,7 +8389,8 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
           status: current?.status === "ready" ? "pass" : "fail",
           summary: current ? `Current deployment ${current.id} is ${current.status}.` : "Current deployment does not exist."
         },
-        ...safetyChecksForRoute(command.projectId, candidate, domains, command.channel)
+        ...safetyChecksForRoute(command.projectId, candidate, domains, command.channel),
+        ...(action === "abort" ? [] : releaseEvidenceIdentityCheck(candidate, releaseEvidence, command.channel))
       ];
       const failedCheck = safetyChecks.find((check) => check.status === "fail");
 
@@ -7272,6 +8482,25 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
         ]
       );
 
+      if (action === "abort") {
+        await insertAuditEvent(client, {
+          projectId: command.projectId,
+          action: "rolling_release.aborted",
+          actor: command.actor,
+          targetType: "route_revision",
+          targetId: routeRevision.id,
+          summary: "Rolling release aborted; current route preserved.",
+          reason: command.reason,
+          metadata: {
+            channel: command.channel,
+            rolloutId: rollout.id,
+            currentDeploymentId: current.id,
+            candidateDeploymentId: candidate.id,
+            ...(releaseEvidenceException ? { releaseEvidenceException } : {})
+          }
+        });
+      }
+
       await client.query("COMMIT");
 
       return {
@@ -7331,6 +8560,7 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
 
     try {
       await client.query("BEGIN");
+      await this.lockReleaseCommandIdempotencyKey(client, command.idempotencyKey);
 
       const existing = await this.readReleaseCommandByIdempotencyKey(client, command.idempotencyKey);
 
@@ -7341,12 +8571,18 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
       }
 
       await this.ensureProjectExists(client, command.projectId);
+      await this.lockReleaseChannelScope(client, command.projectId, command.channel);
 
       const deployment = await this.readDeploymentForRoute(client, command.targetDeploymentId);
       const channel = await this.readReleaseChannel(client, command.projectId, command.channel);
       const domains = await this.listVerifiedDomainsForChannel(client, command.projectId, command.channel);
-      const safetyChecks = safetyChecksForRoute(command.projectId, deployment, domains, command.channel);
+      const releaseEvidence = releaseEvidenceMetadataForStorage(command.releaseEvidence);
+      const safetyChecks = [
+        ...safetyChecksForRoute(command.projectId, deployment, domains, command.channel),
+        ...releaseEvidenceIdentityCheck(deployment, releaseEvidence, command.channel)
+      ];
       const previousDeploymentId = channel?.current_deployment_id ?? null;
+      const releaseEvidenceJson = releaseEvidence ? JSON.stringify(releaseEvidence) : null;
 
       if (currentDeploymentId && channel?.current_deployment_id && currentDeploymentId !== channel.current_deployment_id) {
         safetyChecks.push({
@@ -7362,36 +8598,26 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
       if (failedCheck || !deployment) {
         const message = `${releaseVerb(action)} rejected: ${failedCheck?.summary ?? "target deployment could not be routed"}`;
 
-        await client.query(
-          `
-            INSERT INTO siteflow_release_commands (
-              idempotency_key,
-              operation_id,
-              action,
-              project_id,
-              channel,
-              current_deployment_id,
-              target_deployment_id,
-              actor,
-              reason,
-              state,
-              message
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, 'failed', $10)
-          `,
-          [
-            command.idempotencyKey,
-            operationId,
-            action,
-            command.projectId,
-            command.channel,
-            currentDeploymentId,
-            command.targetDeploymentId,
-            JSON.stringify(command.actor),
-            command.reason.trim(),
-            message
-          ]
-        );
+        const insertedCommand = await this.insertReleaseCommand(client, {
+          idempotencyKey: command.idempotencyKey,
+          operationId,
+          action,
+          projectId: command.projectId,
+          channel: command.channel,
+          currentDeploymentId,
+          targetDeploymentId: command.targetDeploymentId,
+          actor: command.actor,
+          reason: command.reason.trim(),
+          state: "failed",
+          message,
+          releaseEvidenceJson
+        });
+
+        if (!insertedCommand.inserted) {
+          const existingResult = await this.releaseCommandResultFromRow(client, insertedCommand.row);
+          await client.query("COMMIT");
+          return existingResult;
+        }
 
         await client.query("COMMIT");
 
@@ -7423,14 +8649,15 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
             validation_summary,
             actor,
             reason,
+            release_evidence,
             idempotency_key,
             applied_at
           )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, CASE WHEN $12 THEN NULL ELSE now() END)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11::jsonb, $12, CASE WHEN $13 THEN NULL ELSE now() END)
           ON CONFLICT (idempotency_key) DO UPDATE
           SET idempotency_key = EXCLUDED.idempotency_key
           RETURNING id, project_id, channel, deployment_id, previous_deployment_id, status, generated_config,
-                    validation_summary, created_at, applied_at, failed_reason
+                    validation_summary, release_evidence, created_at, applied_at, failed_reason
         `,
         [
           routeRevisionId,
@@ -7443,6 +8670,7 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
           validationSummary,
           JSON.stringify(command.actor),
           command.reason.trim(),
+          releaseEvidenceJson,
           command.idempotencyKey,
           dryRun
         ]
@@ -7490,38 +8718,27 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
         ? `${releaseVerb(action)} dry run completed.`
         : `${releaseVerb(action)} route applied.`;
 
-      await client.query(
-        `
-          INSERT INTO siteflow_release_commands (
-            idempotency_key,
-            operation_id,
-            action,
-            project_id,
-            channel,
-            current_deployment_id,
-            target_deployment_id,
-            actor,
-            reason,
-            state,
-            message,
-            route_revision_id
-          )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, 'succeeded', $10, $11)
-        `,
-        [
-          command.idempotencyKey,
-          operationId,
-          action,
-          command.projectId,
-          command.channel,
-          previousDeploymentId,
-          command.targetDeploymentId,
-          JSON.stringify(command.actor),
-          command.reason.trim(),
-          message,
-          routeRevision.id
-        ]
-      );
+      const insertedCommand = await this.insertReleaseCommand(client, {
+        idempotencyKey: command.idempotencyKey,
+        operationId,
+        action,
+        projectId: command.projectId,
+        channel: command.channel,
+        currentDeploymentId: previousDeploymentId,
+        targetDeploymentId: command.targetDeploymentId,
+        actor: command.actor,
+        reason: command.reason.trim(),
+        state: "succeeded",
+        message,
+        routeRevisionId: routeRevision.id,
+        releaseEvidenceJson
+      });
+
+      if (!insertedCommand.inserted) {
+        const existingResult = await this.releaseCommandResultFromRow(client, insertedCommand.row);
+        await client.query("COMMIT");
+        return existingResult;
+      }
 
       await client.query("COMMIT");
 

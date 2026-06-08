@@ -28,6 +28,10 @@ export interface SiteFlowEnvFileOptions {
   version: string;
   image: string;
   baseDomain?: string;
+  siteflowEnv?: "development" | "production";
+  workerPollIntervalMs?: number;
+  buildImage?: string;
+  buildImageAllowlist?: string[];
   path?: string;
 }
 
@@ -97,13 +101,118 @@ function normalizeApiPort(value: number | undefined) {
   return port;
 }
 
+function normalizeWorkerPollIntervalMs(value: number | undefined) {
+  const intervalMs = value ?? 5000;
+
+  if (!Number.isInteger(intervalMs) || intervalMs < 1) {
+    throw new Error("Worker poll interval must be a positive integer.");
+  }
+
+  return intervalMs;
+}
+
+export const defaultProductionBuildImage = "node:20-bookworm-slim";
+export const defaultBuildMaxArtifactBytes = "536870912";
+export const defaultBuildMaxArtifactFiles = "20000";
+export const defaultBuildMinFreeBytes = "1073741824";
+export const defaultPrebuiltMaxUploadBytes = "536870912";
+export const defaultPrebuiltMaxFiles = "20000";
+
+function hasDockerDigest(image: string) {
+  return /@sha256:[a-f0-9]{64}$/i.test(image);
+}
+
+function normalizeDockerImageReference(value: string | undefined, label: string) {
+  const normalized = (value ?? "").trim();
+
+  if (
+    !normalized
+    || normalized.length > 255
+    || normalized.startsWith("-")
+    || /[\s\x00-\x1f\x7f]/.test(normalized)
+    || normalized.includes("://")
+    || normalized.includes("..")
+    || normalized.includes("//")
+  ) {
+    throw new Error(`${label} must be a valid Docker image reference.`);
+  }
+
+  return normalized;
+}
+
+export function normalizeProductionImage(value: string | undefined, label: string) {
+  const normalized = normalizeDockerImageReference(value, label);
+
+  if (!hasDockerDigest(normalized)) {
+    throw new Error(`${label} must be pinned by sha256 digest for production.`);
+  }
+
+  return normalized;
+}
+
+function imageTag(image: string) {
+  if (hasDockerDigest(image)) {
+    return undefined;
+  }
+
+  const lastSlash = image.lastIndexOf("/");
+  const lastColon = image.lastIndexOf(":");
+
+  if (lastColon <= lastSlash) {
+    return undefined;
+  }
+
+  return image.slice(lastColon + 1);
+}
+
+export function normalizeBuildImage(value: string | undefined) {
+  const normalized = normalizeDockerImageReference(value ?? defaultProductionBuildImage, "SITEFLOW_BUILD_IMAGE");
+  const tag = imageTag(normalized);
+
+  if (!hasDockerDigest(normalized) && tag === undefined) {
+    throw new Error("SITEFLOW_BUILD_IMAGE must include an explicit tag or sha256 digest.");
+  }
+
+  if (tag?.toLowerCase() === "latest") {
+    throw new Error("SITEFLOW_BUILD_IMAGE must not use the mutable latest tag.");
+  }
+
+  return normalized;
+}
+
+export function normalizeBuildImageAllowlist(value: string[] | undefined, buildImage: string) {
+  const entries = value?.map((entry) => entry.trim()).filter(Boolean) ?? [];
+
+  if (entries.some((entry) => entry.startsWith("-") || /\s/.test(entry))) {
+    throw new Error("SITEFLOW_BUILD_IMAGE_ALLOWLIST must contain comma-separated Docker image references or prefix* entries.");
+  }
+
+  if (entries.length > 0 || hasDockerDigest(buildImage)) {
+    return entries;
+  }
+
+  return [buildImage];
+}
+
+function buildImageEnvLines(buildImage: string, buildImageAllowlist: string[], indent = "") {
+  const lines = [`${indent}SITEFLOW_BUILD_IMAGE${indent ? ": " : "="}${indent ? `"${buildImage}"` : buildImage}`];
+
+  if (buildImageAllowlist.length > 0) {
+    const value = buildImageAllowlist.join(",");
+    lines.push(`${indent}SITEFLOW_BUILD_IMAGE_ALLOWLIST${indent ? ": " : "="}${indent ? `"${value}"` : value}`);
+  }
+
+  return lines;
+}
+
 function proxyHeaders() {
   return [
     "        proxy_http_version 1.1;",
     "        proxy_set_header Host $host;",
     "        proxy_set_header X-Forwarded-Host $host;",
     "        proxy_set_header X-Forwarded-Proto $scheme;",
-    "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+    "        proxy_set_header X-Forwarded-For $remote_addr;",
+    "        proxy_set_header X-Real-IP $remote_addr;",
     "        proxy_set_header Connection \"\";"
   ].join("\n");
 }
@@ -111,6 +220,17 @@ function proxyHeaders() {
 function proxyLocation() {
   return [
     "    location / {",
+    "        proxy_pass http://siteflow_api;",
+    proxyHeaders(),
+    "    }"
+  ].join("\n");
+}
+
+function apiProxyLocation(match: string) {
+  return [
+    `    location ${match} {`,
+    "        limit_req zone=siteflow_api burst=60 nodelay;",
+    "        limit_req_status 429;",
     "        proxy_pass http://siteflow_api;",
     proxyHeaders(),
     "    }"
@@ -134,7 +254,9 @@ export function renderManagedNginxConfig(options: ManagedNginxConfigOptions): Ma
     "upstream siteflow_api {",
     `    server 127.0.0.1:${apiPort};`,
     "    keepalive 32;",
-    "}"
+    "}",
+    "",
+    "limit_req_zone $binary_remote_addr zone=siteflow_api:10m rate=120r/m;"
   ];
 
   if (controlPlaneHost) {
@@ -145,6 +267,10 @@ export function renderManagedNginxConfig(options: ManagedNginxConfigOptions): Ma
       `    server_name ${controlPlaneHost};`,
       "",
       `    client_max_body_size ${clientMaxBodySize};`,
+      "",
+      apiProxyLocation("= /api"),
+      "",
+      apiProxyLocation("^~ /api/"),
       "",
       proxyLocation(),
       "}"
@@ -172,6 +298,10 @@ export function renderManagedNginxConfig(options: ManagedNginxConfigOptions): Ma
       "        return 404;",
       "    }",
       "",
+      "    location = /readyz {",
+      "        return 404;",
+      "    }",
+      "",
       proxyLocation(),
       "}"
     );
@@ -189,12 +319,28 @@ export function renderManagedNginxConfig(options: ManagedNginxConfigOptions): Ma
 }
 
 export function renderSiteFlowEnvFile(options: SiteFlowEnvFileOptions): RenderedInstallAsset {
+  const runtimeImage = options.siteflowEnv === "development"
+    ? normalizeDockerImageReference(options.image, "SITEFLOW_IMAGE")
+    : normalizeProductionImage(options.image, "SITEFLOW_IMAGE");
+  const buildImage = normalizeBuildImage(options.buildImage);
+  const buildImageAllowlist = normalizeBuildImageAllowlist(options.buildImageAllowlist, buildImage);
   const lines = [
+    `SITEFLOW_ENV=${options.siteflowEnv ?? "production"}`,
     `SITEFLOW_VERSION=${options.version}`,
-    `SITEFLOW_IMAGE=${options.image}`,
+    `SITEFLOW_IMAGE=${runtimeImage}`,
     `SITEFLOW_API_PORT=${options.apiPort}`,
     `SITEFLOW_ARTIFACT_ROOT=${options.artifactRoot}`,
-    `SITEFLOW_PUBLIC_SCHEME=${options.publicScheme}`
+    `SITEFLOW_PUBLIC_SCHEME=${options.publicScheme}`,
+    "SITEFLOW_TRUST_PROXY=loopback",
+    `SITEFLOW_WORKER_POLL_INTERVAL_MS=${normalizeWorkerPollIntervalMs(options.workerPollIntervalMs)}`,
+    "SITEFLOW_BUILD_RUNNER=docker",
+    "SITEFLOW_BUILD_NETWORK=none",
+    `SITEFLOW_BUILD_MAX_ARTIFACT_BYTES=${defaultBuildMaxArtifactBytes}`,
+    `SITEFLOW_BUILD_MAX_ARTIFACT_FILES=${defaultBuildMaxArtifactFiles}`,
+    `SITEFLOW_BUILD_MIN_FREE_BYTES=${defaultBuildMinFreeBytes}`,
+    `SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES=${defaultPrebuiltMaxUploadBytes}`,
+    `SITEFLOW_PREBUILT_MAX_FILES=${defaultPrebuiltMaxFiles}`,
+    ...buildImageEnvLines(buildImage, buildImageAllowlist)
   ];
 
   if (options.baseDomain) {
@@ -207,17 +353,52 @@ export function renderSiteFlowEnvFile(options: SiteFlowEnvFileOptions): Rendered
 export function renderComposeFile(options: ComposeFileOptions): RenderedInstallAsset {
   const databaseName = options.databaseName ?? "siteflow";
   const databaseUser = options.databaseUser ?? "siteflow";
-  const postgresImage = options.postgresImage ?? "postgres:16-alpine";
+  const productionProfile = options.siteflowEnv !== "development";
+  const runtimeImage = productionProfile
+    ? normalizeProductionImage(options.image, "SITEFLOW_IMAGE")
+    : normalizeDockerImageReference(options.image, "SITEFLOW_IMAGE");
+  const postgresImage = productionProfile
+    ? normalizeProductionImage(options.postgresImage, "SITEFLOW_POSTGRES_IMAGE")
+    : normalizeDockerImageReference(options.postgresImage ?? "postgres:16-alpine", "SITEFLOW_POSTGRES_IMAGE");
   const postgresData = `${options.dataDir}/postgres`;
+  const evidenceRoot = `${options.dataDir}/evidence`;
+  const backupAutomationRunRecord = `${evidenceRoot}/backup-automation-run.json`;
   const apiPort = normalizeApiPort(options.apiPort);
-  const envLines = [
-    `      SITEFLOW_API_PORT: "${apiPort}"`,
+  const workerPollIntervalMs = normalizeWorkerPollIntervalMs(options.workerPollIntervalMs);
+  const buildImage = normalizeBuildImage(options.buildImage);
+  const buildImageAllowlist = normalizeBuildImageAllowlist(options.buildImageAllowlist, buildImage);
+  const sharedEnvLines = [
+    `      SITEFLOW_ENV: "${options.siteflowEnv ?? "production"}"`,
     `      SITEFLOW_ARTIFACT_ROOT: "${options.artifactRoot}"`,
-    `      SITEFLOW_PUBLIC_SCHEME: "${options.publicScheme}"`
+    `      SITEFLOW_PUBLIC_SCHEME: "${options.publicScheme}"`,
+    '      SITEFLOW_TRUST_PROXY: "loopback"'
+  ];
+  const apiEnvLines = [
+    ...sharedEnvLines,
+    `      DATABASE_URL: "postgres://${databaseUser}@postgres:5432/${databaseName}"`,
+    `      SITEFLOW_API_PORT: "${apiPort}"`,
+    `      SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES: "${defaultPrebuiltMaxUploadBytes}"`,
+    `      SITEFLOW_PREBUILT_MAX_FILES: "${defaultPrebuiltMaxFiles}"`,
+    `      SITEFLOW_BACKUP_AUTOMATION_RUN_RECORD: "${backupAutomationRunRecord}"`
+  ];
+  const workerEnvLines = [
+    ...sharedEnvLines,
+    `      DATABASE_URL: "postgres://${databaseUser}@postgres:5432/${databaseName}"`,
+    `      SITEFLOW_BUILD_RUNNER: "docker"`,
+    `      SITEFLOW_BUILD_NETWORK: "none"`,
+    `      SITEFLOW_BUILD_MAX_ARTIFACT_BYTES: "${defaultBuildMaxArtifactBytes}"`,
+    `      SITEFLOW_BUILD_MAX_ARTIFACT_FILES: "${defaultBuildMaxArtifactFiles}"`,
+    `      SITEFLOW_BUILD_MIN_FREE_BYTES: "${defaultBuildMinFreeBytes}"`,
+    ...buildImageEnvLines(buildImage, buildImageAllowlist, "      "),
+    `      TMPDIR: "${options.artifactRoot}"`,
+    `      SITEFLOW_WORKER_POLL_INTERVAL_MS: "${workerPollIntervalMs}"`
   ];
 
   if (options.baseDomain) {
-    envLines.push(`      SITEFLOW_BASE_DOMAIN: "${normalizeDnsName(options.baseDomain, "Wildcard base domain")}"`);
+    const baseDomain = `      SITEFLOW_BASE_DOMAIN: "${normalizeDnsName(options.baseDomain, "Wildcard base domain")}"`;
+
+    apiEnvLines.push(baseDomain);
+    workerEnvLines.push(baseDomain);
   }
 
   const content = [
@@ -234,36 +415,127 @@ export function renderComposeFile(options: ComposeFileOptions): RenderedInstallA
     `      - ${postgresData}:/var/lib/postgresql/data`,
     "    secrets:",
     "      - siteflow_postgres_password",
+    "    healthcheck:",
+    '      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]',
+    "      interval: 10s",
+    "      timeout: 5s",
+    "      retries: 6",
     "",
     "  api:",
-    `    image: ${options.image}`,
+    `    image: ${runtimeImage}`,
     "    restart: unless-stopped",
+    '    user: "1000:1000"',
+    "    init: true",
+    "    read_only: true",
+    "    cap_drop:",
+    "      - ALL",
+    "    security_opt:",
+    "      - no-new-privileges:true",
     "    depends_on:",
-    "      - postgres",
+    "      postgres:",
+    "        condition: service_healthy",
     "    environment:",
-    ...envLines,
+    ...apiEnvLines,
+    "      SITEFLOW_APP_SECRET_FILE: /run/secrets/siteflow_app_secret",
     "      SITEFLOW_API_TOKEN_FILE: /run/secrets/siteflow_api_token",
+    "      SITEFLOW_METRICS_TOKEN_FILE: /run/secrets/siteflow_metrics_token",
+    "      SITEFLOW_POSTGRES_PASSWORD_FILE: /run/secrets/siteflow_postgres_password",
+    "      SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_github_webhook_secret",
+    "      SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_gitlab_webhook_secret",
+    "      SITEFLOW_GITEA_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_gitea_webhook_secret",
+    "      SITEFLOW_GENERIC_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_generic_webhook_secret",
+    "    ports:",
+    `      - \"127.0.0.1:${apiPort}:${apiPort}\"`,
+    "    volumes:",
+    `      - ${options.artifactRoot}:${options.artifactRoot}`,
+    `      - ${evidenceRoot}:${evidenceRoot}:ro`,
+    "    tmpfs:",
+    "      - /tmp:rw,noexec,nosuid,nodev,size=64m",
+    "    secrets:",
+    "      - siteflow_app_secret",
+    "      - siteflow_api_token",
+    "      - siteflow_metrics_token",
+    "      - siteflow_postgres_password",
+    "      - siteflow_github_webhook_secret",
+    "      - siteflow_gitlab_webhook_secret",
+    "      - siteflow_gitea_webhook_secret",
+    "      - siteflow_generic_webhook_secret",
+    "    healthcheck:",
+    `      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:${apiPort}/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]`,
+    "      interval: 30s",
+    "      timeout: 5s",
+    "      retries: 5",
+    "      start_period: 30s",
+    "",
+    "  worker:",
+    `    image: ${runtimeImage}`,
+    "    restart: unless-stopped",
+    '    user: "${SITEFLOW_WORKER_USER:-0:0}"',
+    "    group_add:",
+    '      - "${SITEFLOW_DOCKER_SOCKET_GID:-0}"',
+    "    init: true",
+    "    read_only: true",
+    "    cap_drop:",
+    "      - ALL",
+    "    security_opt:",
+    "      - no-new-privileges:true",
+    "    depends_on:",
+    "      postgres:",
+    "        condition: service_healthy",
+    "      api:",
+    "        condition: service_healthy",
+    "    environment:",
+    ...workerEnvLines,
+    "      SITEFLOW_APP_SECRET_FILE: /run/secrets/siteflow_app_secret",
     "      SITEFLOW_POSTGRES_PASSWORD_FILE: /run/secrets/siteflow_postgres_password",
     "    command:",
     "      - sh",
     "      - -ec",
     "      - |",
-    "        export SITEFLOW_API_TOKEN=\"$(cat /run/secrets/siteflow_api_token)\"",
-    `        export DATABASE_URL=\"postgres://${databaseUser}:$(cat /run/secrets/siteflow_postgres_password)@postgres:5432/${databaseName}\"`,
-    "        exec node dist-server/server/index.js",
-    "    ports:",
-    `      - \"127.0.0.1:${apiPort}:${apiPort}\"`,
+    "        : \"$${SITEFLOW_BASE_DOMAIN:?SITEFLOW_BASE_DOMAIN is required for worker preview routes}\"",
+    "        if ! command -v docker >/dev/null 2>&1; then",
+    "          echo \"SITEFLOW_BUILD_RUNNER=docker requires the Docker CLI inside the worker image.\" >&2",
+    "          exit 1",
+    "        fi",
+    "        if ! docker info >/dev/null 2>&1; then",
+    "          echo \"SITEFLOW_BUILD_RUNNER=docker requires access to a Docker daemon. This compose file mounts /var/run/docker.sock for trusted single-host operators.\" >&2",
+    "          exit 1",
+    "        fi",
+    "        exec node dist-worker/worker/index.js",
     "    volumes:",
     `      - ${options.artifactRoot}:${options.artifactRoot}`,
+    "      - /var/run/docker.sock:/var/run/docker.sock",
+    "    tmpfs:",
+    "      - /tmp:rw,noexec,nosuid,nodev,size=512m",
     "    secrets:",
-    "      - siteflow_api_token",
+    "      - siteflow_app_secret",
     "      - siteflow_postgres_password",
+    "    healthcheck:",
+    '      test: ["CMD", "node", "dist-worker/worker/index.js", "--healthcheck"]',
+    "      interval: 30s",
+    "      timeout: 5s",
+    "      retries: 5",
+    "      start_period: 30s",
+    "    # Trusted single-host operator profile: the Docker socket lets this worker control the host Docker daemon.",
+    "    # This is a minimum production runner, not a multi-tenant sandbox boundary.",
     "",
     "secrets:",
+    "  siteflow_app_secret:",
+    `    file: ${options.configDir}/secrets/app-secret.secret`,
     "  siteflow_api_token:",
     `    file: ${options.configDir}/secrets/api-token.secret`,
+    "  siteflow_metrics_token:",
+    `    file: ${options.configDir}/secrets/metrics-token.secret`,
     "  siteflow_postgres_password:",
-    `    file: ${options.configDir}/secrets/postgres-password.secret`
+    `    file: ${options.configDir}/secrets/postgres-password.secret`,
+    "  siteflow_github_webhook_secret:",
+    `    file: ${options.configDir}/secrets/github-webhook.secret`,
+    "  siteflow_gitlab_webhook_secret:",
+    `    file: ${options.configDir}/secrets/gitlab-webhook.secret`,
+    "  siteflow_gitea_webhook_secret:",
+    `    file: ${options.configDir}/secrets/gitea-webhook.secret`,
+    "  siteflow_generic_webhook_secret:",
+    `    file: ${options.configDir}/secrets/generic-webhook.secret`
   ].join("\n");
 
   return renderedAsset(options.path ?? "/opt/siteflow/compose.yaml", `${content}\n`);

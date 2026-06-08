@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { brotliCompressSync, gzipSync } from "node:zlib";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { ArtifactManifest, FunctionEntrypoint, SiteFlowId } from "../src/domain/siteflow.js";
 
@@ -9,6 +9,7 @@ export interface FunctionArtifactInput {
   sourcePath: string;
   artifactPath: string;
   runtime: FunctionEntrypoint["runtime"];
+  runtimeIsolation?: FunctionEntrypoint["runtimeIsolation"];
   handler?: FunctionEntrypoint["handler"];
   methods?: string[];
   timeoutMs?: number;
@@ -23,6 +24,11 @@ export interface ArtifactExtraFileInput {
   contents: string | Buffer;
 }
 
+export interface ArtifactBlockedContentValue {
+  label: string;
+  value: string;
+}
+
 export interface ArtifactPublishOptions {
   buildJobId: SiteFlowId;
   sourceEventId: SiteFlowId;
@@ -32,6 +38,9 @@ export interface ArtifactPublishOptions {
   functions?: FunctionArtifactInput[];
   extraFiles?: ArtifactExtraFileInput[];
   metadata?: Record<string, unknown>;
+  maxArtifactBytes?: number;
+  maxArtifactFiles?: number;
+  blockedContentValues?: ArtifactBlockedContentValue[];
 }
 
 export interface PublishedBuildArtifact {
@@ -46,12 +55,19 @@ export interface PublishedBuildArtifact {
 
 interface ArtifactFile {
   relativePath: string;
-  bytes: Buffer;
+  size: number;
+  sourcePath?: string;
+  bytes?: Buffer;
 }
 
 interface PrecompressionStats {
   br: number;
   gzip: number;
+}
+
+interface ArtifactPublisherDependencies {
+  randomUUID: () => string;
+  writeFile: typeof writeFile;
 }
 
 const compressibleExtensions = new Set([
@@ -80,11 +96,133 @@ function safeArtifactPath(filePath: string) {
   return normalized;
 }
 
+function artifactFileSize(file: ArtifactFile) {
+  return file.bytes ? file.bytes.byteLength : file.size;
+}
+
+async function artifactFileBytes(file: ArtifactFile) {
+  if (file.bytes) {
+    return file.bytes;
+  }
+
+  if (!file.sourcePath) {
+    throw new Error(`Artifact file has no source path: ${file.relativePath}`);
+  }
+
+  file.bytes = await readFile(file.sourcePath);
+  file.size = file.bytes.byteLength;
+  return file.bytes;
+}
+
+function artifactDisplayPath(root: string, fullPath: string) {
+  const relative = toPosixPath(path.relative(root, fullPath));
+
+  return relative ? safeArtifactPath(relative) : ".";
+}
+
+async function pathExists(filePath: string) {
+  try {
+    await lstat(filePath);
+    return true;
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return false;
+    }
+
+    throw error;
+  }
+}
+
+async function assertDeploymentTargetAvailable(targetRoot: string) {
+  if (await pathExists(targetRoot)) {
+    throw new Error(`Deployment artifact target already exists: ${targetRoot}.`);
+  }
+}
+
+async function removeDirectoryBestEffort(directory: string) {
+  try {
+    await rm(directory, { recursive: true, force: true });
+  } catch {
+    // The deployment bytes are already immutable at this point; lock cleanup must not turn a publish into a failure.
+  }
+}
+
+function normalizedBlockedContentValues(values: ArtifactBlockedContentValue[] | undefined) {
+  const seen = new Set<string>();
+  const normalized: ArtifactBlockedContentValue[] = [];
+
+  for (const entry of values ?? []) {
+    const value = entry.value.trim();
+
+    if (value.length < 8 || seen.has(value)) {
+      continue;
+    }
+
+    seen.add(value);
+    normalized.push({
+      label: entry.label.trim() || "secret",
+      value
+    });
+  }
+
+  return normalized;
+}
+
+async function assertNoBlockedContentValues(files: ArtifactFile[], values: ArtifactBlockedContentValue[]) {
+  if (values.length === 0) {
+    return;
+  }
+
+  const needles = values.map((entry) => ({
+    label: entry.label,
+    bytes: Buffer.from(entry.value, "utf8")
+  }));
+
+  for (const file of files) {
+    const bytes = await artifactFileBytes(file);
+
+    for (const needle of needles) {
+      if (bytes.includes(needle.bytes)) {
+        throw new Error(`Build artifact contains blocked secret value for ${needle.label} in ${file.relativePath}.`);
+      }
+    }
+  }
+}
+
+function assertArtifactBudget(files: ArtifactFile[], options: ArtifactPublishOptions, stage: string) {
+  if (options.maxArtifactFiles !== undefined && files.length > options.maxArtifactFiles) {
+    throw new Error(
+      `Build artifact exceeds SITEFLOW_BUILD_MAX_ARTIFACT_FILES during ${stage}: ${files.length} > ${options.maxArtifactFiles}.`
+    );
+  }
+
+  if (options.maxArtifactBytes !== undefined) {
+    const totalBytes = files.reduce((total, file) => total + artifactFileSize(file), 0);
+
+    if (totalBytes > options.maxArtifactBytes) {
+      throw new Error(
+        `Build artifact exceeds SITEFLOW_BUILD_MAX_ARTIFACT_BYTES during ${stage}: ${totalBytes} > ${options.maxArtifactBytes}.`
+      );
+    }
+  }
+}
+
 async function collectArtifactFiles(root: string, current: string, files: ArtifactFile[]) {
+  const currentStats = await lstat(current);
+
+  if (currentStats.isSymbolicLink()) {
+    throw new Error(`Build artifact output contains unsupported symlink entry: ${artifactDisplayPath(root, current)}.`);
+  }
+
+  if (!currentStats.isDirectory()) {
+    throw new Error(`Build artifact output contains unsupported non-directory entry: ${artifactDisplayPath(root, current)}.`);
+  }
+
   const entries = await readdir(current, { withFileTypes: true });
 
   for (const entry of entries) {
     const fullPath = path.join(current, entry.name);
+    const relativePath = safeArtifactPath(toPosixPath(path.relative(root, fullPath)));
 
     if (entry.isDirectory()) {
       await collectArtifactFiles(root, fullPath, files);
@@ -92,13 +230,68 @@ async function collectArtifactFiles(root: string, current: string, files: Artifa
     }
 
     if (!entry.isFile()) {
+      throw new Error(
+        entry.isSymbolicLink()
+          ? `Build artifact output contains unsupported symlink entry: ${relativePath}.`
+          : `Build artifact output contains unsupported non-file entry: ${relativePath}.`
+      );
+    }
+
+    const stats = await stat(fullPath);
+
+    files.push({
+      relativePath,
+      sourcePath: fullPath,
+      size: stats.size
+    });
+  }
+}
+
+function unsafeSourceMapSource(source: string) {
+  const normalized = source.replace(/\\/g, "/");
+
+  return path.posix.isAbsolute(normalized) ||
+    /^[A-Za-z]:\//.test(normalized) ||
+    normalized === ".." ||
+    normalized.startsWith("../") ||
+    normalized.includes("/../") ||
+    /(?:^|\/)\.env(?:\.|$)/.test(normalized) ||
+    normalized.includes("node_modules/.cache/");
+}
+
+async function assertNoUnsafeSourceMaps(files: ArtifactFile[]) {
+  for (const file of files) {
+    if (!file.relativePath.endsWith(".map")) {
       continue;
     }
 
-    files.push({
-      relativePath: safeArtifactPath(toPosixPath(path.relative(root, fullPath))),
-      bytes: await readFile(fullPath)
-    });
+    let parsed: unknown;
+
+    try {
+      parsed = JSON.parse((await artifactFileBytes(file)).toString("utf8")) as unknown;
+    } catch {
+      throw new Error(`Build artifact source map must be valid JSON: ${file.relativePath}.`);
+    }
+
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`Build artifact source map must be a JSON object: ${file.relativePath}.`);
+    }
+
+    const record = parsed as Record<string, unknown>;
+
+    if (
+      Array.isArray(record.sourcesContent) &&
+      record.sourcesContent.some((entry) => typeof entry === "string" && entry.trim())
+    ) {
+      throw new Error(`Build artifact source map embeds sourcesContent: ${file.relativePath}.`);
+    }
+
+    if (
+      Array.isArray(record.sources) &&
+      record.sources.some((entry) => typeof entry === "string" && unsafeSourceMapSource(entry))
+    ) {
+      throw new Error(`Build artifact source map exposes unsafe source paths: ${file.relativePath}.`);
+    }
   }
 }
 
@@ -114,7 +307,7 @@ function shouldPrecompress(file: ArtifactFile) {
   return compressibleExtensions.has(path.posix.extname(file.relativePath).toLowerCase());
 }
 
-function addPrecompressedArtifactFiles(files: ArtifactFile[], artifactPaths: Set<string>): PrecompressionStats {
+async function addPrecompressedArtifactFiles(files: ArtifactFile[], artifactPaths: Set<string>): Promise<PrecompressionStats> {
   const sourceFiles = [...files];
   const stats: PrecompressionStats = {
     br: 0,
@@ -126,14 +319,17 @@ function addPrecompressedArtifactFiles(files: ArtifactFile[], artifactPaths: Set
       continue;
     }
 
+    const bytes = await artifactFileBytes(file);
     const variants: ArtifactFile[] = [
       {
         relativePath: `${file.relativePath}.br`,
-        bytes: brotliCompressSync(file.bytes)
+        bytes: brotliCompressSync(bytes),
+        size: 0
       },
       {
         relativePath: `${file.relativePath}.gz`,
-        bytes: gzipSync(file.bytes)
+        bytes: gzipSync(bytes),
+        size: 0
       }
     ];
 
@@ -143,6 +339,7 @@ function addPrecompressedArtifactFiles(files: ArtifactFile[], artifactPaths: Set
       }
 
       files.push(variant);
+      variant.size = variant.bytes?.byteLength ?? 0;
       artifactPaths.add(variant.relativePath);
 
       if (variant.relativePath.endsWith(".br")) {
@@ -156,8 +353,30 @@ function addPrecompressedArtifactFiles(files: ArtifactFile[], artifactPaths: Set
   return stats;
 }
 
+const defaultArtifactPublisherDependencies: ArtifactPublisherDependencies = {
+  randomUUID,
+  writeFile
+};
+
+export function createArtifactPublisher(dependencies: Partial<ArtifactPublisherDependencies> = {}) {
+  const resolvedDependencies: ArtifactPublisherDependencies = {
+    ...defaultArtifactPublisherDependencies,
+    ...dependencies
+  };
+
+  return (options: ArtifactPublishOptions) => publishBuildArtifactWithDependencies(options, resolvedDependencies);
+}
+
 export async function publishBuildArtifact(options: ArtifactPublishOptions): Promise<PublishedBuildArtifact> {
+  return publishBuildArtifactWithDependencies(options, defaultArtifactPublisherDependencies);
+}
+
+async function publishBuildArtifactWithDependencies(
+  options: ArtifactPublishOptions,
+  dependencies: ArtifactPublisherDependencies
+): Promise<PublishedBuildArtifact> {
   const outputDirectory = path.resolve(options.outputDirectory);
+  const artifactRoot = path.resolve(options.artifactRoot);
   const entrypoint = safeArtifactPath(options.entrypoint ?? "index.html");
   const files: ArtifactFile[] = [];
 
@@ -176,6 +395,7 @@ export async function publishBuildArtifact(options: ArtifactPublishOptions): Pro
       path: entry.path,
       sourcePath: safeArtifactPath(entry.artifactPath),
       runtime: entry.runtime,
+      runtimeIsolation: entry.runtimeIsolation ?? "same_process",
       handler: entry.handler ?? "default"
     };
 
@@ -214,9 +434,16 @@ export async function publishBuildArtifact(options: ArtifactPublishOptions): Pro
       throw new Error(`Function artifact path conflicts with static artifact: ${artifactPath}`);
     }
 
+    const stats = await lstat(entry.sourcePath);
+
+    if (stats.isSymbolicLink() || !stats.isFile()) {
+      throw new Error(`Function artifact source must be a regular file: ${artifactPath}.`);
+    }
+
     files.push({
       relativePath: artifactPath,
-      bytes: await readFile(entry.sourcePath)
+      sourcePath: entry.sourcePath,
+      size: stats.size
     });
     artifactPaths.add(artifactPath);
   }
@@ -228,36 +455,70 @@ export async function publishBuildArtifact(options: ArtifactPublishOptions): Pro
       throw new Error(`Extra artifact path conflicts with existing artifact: ${artifactPath}`);
     }
 
+    const bytes = Buffer.isBuffer(entry.contents) ? entry.contents : Buffer.from(entry.contents, "utf8");
     files.push({
       relativePath: artifactPath,
-      bytes: Buffer.isBuffer(entry.contents) ? entry.contents : Buffer.from(entry.contents, "utf8")
+      bytes,
+      size: bytes.byteLength
     });
     artifactPaths.add(artifactPath);
   }
 
-  const precompressed = addPrecompressedArtifactFiles(files, artifactPaths);
+  assertArtifactBudget(files, options, "publish preflight");
+  await assertNoBlockedContentValues(files, normalizedBlockedContentValues(options.blockedContentValues));
+  await assertNoUnsafeSourceMaps(files);
+  const precompressed = await addPrecompressedArtifactFiles(files, artifactPaths);
+  assertArtifactBudget(files, options, "publish finalization");
 
-  const deploymentId = `dep_${randomUUID().replace(/-/g, "")}`;
-  const targetRoot = path.resolve(options.artifactRoot, deploymentId);
+  const deploymentId = `dep_${dependencies.randomUUID().replace(/-/g, "")}`;
+  const targetRoot = path.join(artifactRoot, deploymentId);
+  const stagingRoot = path.join(artifactRoot, `.publish-${deploymentId}-${dependencies.randomUUID().replace(/-/g, "")}`);
+  const targetLockRoot = path.join(artifactRoot, `.publish-lock-${deploymentId}`);
   const checksum = createHash("sha256");
   let totalBytes = 0;
+  let stagingCreated = false;
+  let targetLockAcquired = false;
+  let promoted = false;
 
-  await mkdir(targetRoot, { recursive: true });
+  try {
+    await mkdir(artifactRoot, { recursive: true });
+    await assertDeploymentTargetAvailable(targetRoot);
+    await mkdir(targetLockRoot);
+    targetLockAcquired = true;
+    await assertDeploymentTargetAvailable(targetRoot);
+    await mkdir(stagingRoot);
+    stagingCreated = true;
 
-  for (const file of files.sort((left, right) => left.relativePath.localeCompare(right.relativePath))) {
-    const targetPath = path.resolve(targetRoot, ...file.relativePath.split("/"));
+    for (const file of files.sort((left, right) => left.relativePath.localeCompare(right.relativePath))) {
+      const targetPath = path.resolve(stagingRoot, ...file.relativePath.split("/"));
+      const bytes = await artifactFileBytes(file);
 
-    if (!targetPath.startsWith(`${targetRoot}${path.sep}`)) {
-      throw new Error(`Artifact file escapes deployment root: ${file.relativePath}`);
+      if (!targetPath.startsWith(`${stagingRoot}${path.sep}`)) {
+        throw new Error(`Artifact file escapes deployment root: ${file.relativePath}`);
+      }
+
+      await mkdir(path.dirname(targetPath), { recursive: true });
+      await dependencies.writeFile(targetPath, bytes);
+
+      checksum.update(file.relativePath);
+      checksum.update("\0");
+      checksum.update(bytes);
+      totalBytes += bytes.byteLength;
     }
 
-    await mkdir(path.dirname(targetPath), { recursive: true });
-    await writeFile(targetPath, file.bytes);
+    await assertDeploymentTargetAvailable(targetRoot);
+    await rename(stagingRoot, targetRoot);
+    promoted = true;
+  } catch (error) {
+    if (stagingCreated && !promoted) {
+      await rm(stagingRoot, { recursive: true, force: true });
+    }
 
-    checksum.update(file.relativePath);
-    checksum.update("\0");
-    checksum.update(file.bytes);
-    totalBytes += file.bytes.byteLength;
+    throw error;
+  } finally {
+    if (targetLockAcquired) {
+      await removeDirectoryBestEffort(targetLockRoot);
+    }
   }
 
   const digest = checksum.digest("hex");

@@ -10,6 +10,6 @@
     "rootDir": ".",
     "types": ["node"]
   },
-  "include": ["cli/**/*.ts", "src/lib/api/deployContracts.ts"],
+  "include": ["cli/**/*.ts", "src/lib/api/deployContracts.ts", "src/lib/sealedSecrets.ts"],
   "exclude": ["cli/**/*.test.ts"]
 }

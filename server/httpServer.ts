@@ -1,15 +1,34 @@
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
+import { spawn } from "node:child_process";
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
+import { BlockList, isIP } from "node:net";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import type { Actor, FunctionEntrypoint, PermissionScope, RepositoryBinding, RoutingHeader, RoutingRule, SourceEventInput } from "../src/domain/siteflow.js";
-import { redactLogLine } from "../src/lib/redaction.js";
-import type { PrebuiltImageConfig } from "../src/lib/api/deployContracts.js";
-import { assertReleaseChannel, SiteFlowNotFoundError, type ArtifactRoute, type LogDrainDeliveryPlan, type SiteFlowReadRepository } from "./readRepository.js";
+import type { Actor, FunctionEntrypoint, PermissionScope, RepositoryBinding, RoutingHeader, RoutingRule, SourceEventInput, SourceProvider } from "../src/domain/siteflow.js";
+import { redactLogLine, redactSecrets } from "../src/lib/redaction.js";
+import { metricDefinition, renderPrometheusTypeLine } from "../src/lib/observabilityMetrics.js";
+import {
+  assertPrebuiltUploadBudget,
+  defaultPrebuiltMaxUploadBytes,
+  defaultPrebuiltMaxUploadFiles,
+  type PrebuiltDeployCommand,
+  type PrebuiltImageConfig,
+  type PrebuiltUploadBudget
+} from "../src/lib/api/deployContracts.js";
+import { assertReleaseChannel, SiteFlowNotFoundError, type ArtifactRoute, type LogDrainDeliveryPlan, type SiteFlowAuthPrincipal, type SiteFlowReadRepository } from "./readRepository.js";
+import {
+  evaluateReleaseEvidenceBundle,
+  type ReleaseEvidenceBundleCheckOptions,
+  type ReleaseEvidenceBundleResult
+} from "../scripts/releaseEvidenceBundleCheck.js";
 
 export type FunctionModuleLoader = (functionPath: string) => Promise<Record<string, unknown>>;
 export type DrainFetch = (input: string, init?: RequestInit) => Promise<Response>;
+export type ReleaseEvidenceEvaluator = (
+  rawEvidence: unknown,
+  options: ReleaseEvidenceBundleCheckOptions
+) => ReleaseEvidenceBundleResult;
 
 export interface SiteFlowServerOptions {
   repository: SiteFlowReadRepository;
@@ -18,9 +37,69 @@ export interface SiteFlowServerOptions {
   apiToken?: string;
   baseDomain?: string;
   githubWebhookSecret?: string;
+  gitWebhookSecrets?: Partial<Record<SourceProvider, string>>;
+  maxBodyBytes?: number;
+  prebuiltMaxUploadBytes?: number;
+  prebuiltMaxFiles?: number;
+  rateLimit?: false | SiteFlowRateLimitOptions;
   functionModuleLoader?: FunctionModuleLoader;
   drainFetch?: DrainFetch;
+  requestLogger?: SiteFlowRequestLogger;
+  readinessCheck?: SiteFlowReadinessCheck;
+  metricsToken?: string;
+  runtimeMetricsCollector?: SiteFlowRuntimeMetricsCollector;
+  secureCookies?: boolean;
+  trustProxy?: SiteFlowTrustedProxyPolicy;
+  releaseEvidenceEvaluator?: ReleaseEvidenceEvaluator;
+  productionRuntime?: boolean;
+  allowSameProcessFunctionRuntime?: boolean;
 }
+
+export type SiteFlowTrustedProxyPolicy = boolean | "loopback" | "private" | string[];
+
+export interface SiteFlowRateLimitOptions {
+  maxRequests?: number;
+  windowMs?: number;
+  now?: () => number;
+}
+
+export interface SiteFlowRequestLogEntry {
+  requestId: string;
+  method: string;
+  path: string;
+  status: number;
+  durationMs: number;
+  errorClass?: string;
+}
+
+export type SiteFlowRequestLogger = (entry: SiteFlowRequestLogEntry) => void | Promise<void>;
+
+export type SiteFlowReadinessStatus = "ready" | "not_ready";
+export type SiteFlowReadinessDetailValue = "ok" | "ready" | "configured" | "missing" | "degraded" | "unavailable" | "not_ready" | boolean | number | null;
+
+export interface SiteFlowReadinessResult {
+  status?: SiteFlowReadinessStatus;
+  details?: Record<string, unknown>;
+}
+
+export type SiteFlowReadinessCheck = () => SiteFlowReadinessResult | void | Promise<SiteFlowReadinessResult | void>;
+
+export interface SiteFlowRuntimeMetrics {
+  queuedBuildJobs?: number;
+  runningBuildJobs?: number;
+  staleBuildJobs?: number;
+  oldestQueuedBuildAgeSeconds?: number;
+  oldestRunningBuildHeartbeatAgeSeconds?: number;
+  backupAutomationLastSuccessAgeSeconds?: number;
+  backupRestoreDrillLastSuccessAgeSeconds?: number;
+  backupOffloadLastSuccessAgeSeconds?: number;
+  backupPruneLastSuccessAgeSeconds?: number;
+  backupOffloadLastRunFailed?: number;
+  backupPruneLastRunFailed?: number;
+  backupMetricsCollectionError?: number;
+}
+
+export type SiteFlowRuntimeMetricsCollector = () => SiteFlowRuntimeMetrics | Promise<SiteFlowRuntimeMetrics>;
 
 interface RouteContext {
   request: IncomingMessage;
@@ -42,6 +121,10 @@ interface ResolvedArtifactFile {
 }
 
 const functionConcurrency = new Map<string, number>();
+const requestBodyLimitBytes = new WeakMap<IncomingMessage, number>();
+const defaultMaxBodyBytes = 1024 * 1024;
+const defaultApiRateLimitMaxRequests = 120;
+const defaultApiRateLimitWindowMs = 60_000;
 const accessControlAllowHeaders = [
   "content-type",
   "accept",
@@ -51,7 +134,8 @@ const accessControlAllowHeaders = [
   "if-modified-since",
   "if-match",
   "if-unmodified-since",
-  "if-range"
+  "if-range",
+  "x-siteflow-csrf"
 ].join(", ");
 const accessControlAllowMethods = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
 const accessControlMaxAge = "86400";
@@ -79,6 +163,16 @@ const accessControlExposeHeaders = [
   "x-siteflow-image-format",
   "x-siteflow-image-source"
 ].join(", ");
+const operatorSessionCookieName = "siteflow_session";
+const operatorSessionCsrfHeaderName = "x-siteflow-csrf";
+const operatorSessionCsrfHeaderValue = "same-origin";
+const supportedGitWebhookProviders = new Set<SourceProvider>(["github", "gitlab", "gitea", "generic"]);
+const allPermissionScopes: PermissionScope[] = ["read", "write", "admin"];
+const rootApiTokenActor: Actor = {
+  id: "siteflow:server",
+  name: "SiteFlow server",
+  role: "system"
+};
 
 function setCorsHeaders(response: ServerResponse, allowedOrigin: string, options?: { preflight?: boolean }) {
   response.setHeader("access-control-allow-origin", allowedOrigin);
@@ -98,6 +192,49 @@ class ImageOptimizationInputError extends Error {
     this.name = "ImageOptimizationInputError";
   }
 }
+
+class RequestBodyTooLargeError extends Error {
+  constructor(readonly maxBytes: number) {
+    super("Request body is too large.");
+    this.name = "RequestBodyTooLargeError";
+  }
+}
+
+class PrebuiltUploadTooLargeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PrebuiltUploadTooLargeError";
+  }
+}
+
+interface RateLimitBucket {
+  count: number;
+  resetAt: number;
+}
+
+interface ResolvedRateLimitOptions {
+  maxRequests: number;
+  windowMs: number;
+  now: () => number;
+}
+
+interface SiteFlowHttpMetrics {
+  requestTotal: number;
+  error5xxTotal: number;
+  rateLimitedTotal: number;
+  durationMsSum: number;
+  durationMsCount: number;
+}
+
+const allowedReadinessDetailValues = new Set([
+  "ok",
+  "ready",
+  "configured",
+  "missing",
+  "degraded",
+  "unavailable",
+  "not_ready"
+]);
 
 const nativeImport = new Function("specifier", "return import(specifier)") as (specifier: string) => Promise<Record<string, unknown>>;
 
@@ -122,11 +259,247 @@ function sendJson(response: ServerResponse, statusCode: number, body: unknown, a
   response.end(JSON.stringify(body));
 }
 
-async function readRawBody(request: IncomingMessage) {
+function sendText(response: ServerResponse, statusCode: number, body: string, allowedOrigin?: string, method?: string) {
+  response.statusCode = statusCode;
+  response.setHeader("content-type", "text/plain; charset=utf-8");
+
+  if (allowedOrigin) {
+    setCorsHeaders(response, allowedOrigin);
+  }
+
+  if (method === "HEAD") {
+    response.removeHeader("content-length");
+    response.end();
+    return;
+  }
+
+  response.end(body);
+}
+
+function createHttpMetrics(): SiteFlowHttpMetrics {
+  return {
+    requestTotal: 0,
+    error5xxTotal: 0,
+    rateLimitedTotal: 0,
+    durationMsSum: 0,
+    durationMsCount: 0
+  };
+}
+
+function recordHttpMetrics(metrics: SiteFlowHttpMetrics, response: ServerResponse, startedAt: number) {
+  const statusCode = response.statusCode || 500;
+  const durationMs = Math.max(0, Date.now() - startedAt);
+
+  metrics.requestTotal += 1;
+  metrics.durationMsSum += durationMs;
+  metrics.durationMsCount += 1;
+
+  if (statusCode >= 500) {
+    metrics.error5xxTotal += 1;
+  }
+
+  if (statusCode === 429) {
+    metrics.rateLimitedTotal += 1;
+  }
+}
+
+function metricNumber(value: number | undefined) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function metricAgeSeconds(value: number | undefined) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : -1;
+}
+
+function metricFlag(value: number | boolean | undefined) {
+  if (typeof value === "boolean") {
+    return value ? 1 : 0;
+  }
+
+  return value === 1 ? 1 : 0;
+}
+
+function hasBackupMetricValues(metrics: SiteFlowRuntimeMetrics) {
+  return [
+    metrics.backupAutomationLastSuccessAgeSeconds,
+    metrics.backupRestoreDrillLastSuccessAgeSeconds,
+    metrics.backupOffloadLastSuccessAgeSeconds,
+    metrics.backupPruneLastSuccessAgeSeconds,
+    metrics.backupOffloadLastRunFailed,
+    metrics.backupPruneLastRunFailed,
+    metrics.backupMetricsCollectionError
+  ].some((value) => value !== undefined);
+}
+
+function prometheusTypeLine(name: string) {
+  const definition = metricDefinition(name);
+
+  if (!definition) {
+    throw new Error(`Unknown SiteFlow metric: ${name}`);
+  }
+
+  return renderPrometheusTypeLine(definition);
+}
+
+function renderRuntimeMetrics(metrics: SiteFlowRuntimeMetrics, collectionError: boolean) {
+  const backupCollectionError = collectionError || !hasBackupMetricValues(metrics)
+    ? 1
+    : metricFlag(metrics.backupMetricsCollectionError);
+
+  return [
+    prometheusTypeLine("siteflow_build_jobs_queued"),
+    `siteflow_build_jobs_queued ${metricNumber(metrics.queuedBuildJobs)}`,
+    prometheusTypeLine("siteflow_build_jobs_running"),
+    `siteflow_build_jobs_running ${metricNumber(metrics.runningBuildJobs)}`,
+    prometheusTypeLine("siteflow_build_jobs_stale"),
+    `siteflow_build_jobs_stale ${metricNumber(metrics.staleBuildJobs)}`,
+    prometheusTypeLine("siteflow_build_job_oldest_queued_age_seconds"),
+    `siteflow_build_job_oldest_queued_age_seconds ${metricNumber(metrics.oldestQueuedBuildAgeSeconds)}`,
+    prometheusTypeLine("siteflow_build_job_oldest_running_heartbeat_age_seconds"),
+    `siteflow_build_job_oldest_running_heartbeat_age_seconds ${metricNumber(metrics.oldestRunningBuildHeartbeatAgeSeconds)}`,
+    prometheusTypeLine("siteflow_runtime_metrics_collection_error"),
+    `siteflow_runtime_metrics_collection_error ${collectionError ? 1 : 0}`,
+    prometheusTypeLine("siteflow_backup_automation_last_success_age_seconds"),
+    `siteflow_backup_automation_last_success_age_seconds ${metricAgeSeconds(metrics.backupAutomationLastSuccessAgeSeconds)}`,
+    prometheusTypeLine("siteflow_backup_restore_drill_last_success_age_seconds"),
+    `siteflow_backup_restore_drill_last_success_age_seconds ${metricAgeSeconds(metrics.backupRestoreDrillLastSuccessAgeSeconds)}`,
+    prometheusTypeLine("siteflow_backup_offload_last_success_age_seconds"),
+    `siteflow_backup_offload_last_success_age_seconds ${metricAgeSeconds(metrics.backupOffloadLastSuccessAgeSeconds)}`,
+    prometheusTypeLine("siteflow_backup_prune_last_success_age_seconds"),
+    `siteflow_backup_prune_last_success_age_seconds ${metricAgeSeconds(metrics.backupPruneLastSuccessAgeSeconds)}`,
+    prometheusTypeLine("siteflow_backup_offload_last_run_failed"),
+    `siteflow_backup_offload_last_run_failed ${metricFlag(metrics.backupOffloadLastRunFailed)}`,
+    prometheusTypeLine("siteflow_backup_prune_last_run_failed"),
+    `siteflow_backup_prune_last_run_failed ${metricFlag(metrics.backupPruneLastRunFailed)}`,
+    prometheusTypeLine("siteflow_backup_metrics_collection_error"),
+    `siteflow_backup_metrics_collection_error ${backupCollectionError}`
+  ];
+}
+
+async function renderHttpMetrics(metrics: SiteFlowHttpMetrics, runtimeMetricsCollector?: SiteFlowRuntimeMetricsCollector) {
+  let runtimeMetricLines = renderRuntimeMetrics({}, true);
+
+  if (runtimeMetricsCollector) {
+    try {
+      runtimeMetricLines = renderRuntimeMetrics(await runtimeMetricsCollector(), false);
+    } catch {
+      runtimeMetricLines = renderRuntimeMetrics({}, true);
+    }
+  }
+
+  return [
+    prometheusTypeLine("siteflow_http_requests_total"),
+    `siteflow_http_requests_total ${metrics.requestTotal}`,
+    prometheusTypeLine("siteflow_http_5xx_total"),
+    `siteflow_http_5xx_total ${metrics.error5xxTotal}`,
+    prometheusTypeLine("siteflow_http_429_total"),
+    `siteflow_http_429_total ${metrics.rateLimitedTotal}`,
+    prometheusTypeLine("siteflow_http_request_duration_ms_sum"),
+    `siteflow_http_request_duration_ms_sum ${metrics.durationMsSum}`,
+    prometheusTypeLine("siteflow_http_request_duration_ms_count"),
+    `siteflow_http_request_duration_ms_count ${metrics.durationMsCount}`,
+    ...runtimeMetricLines,
+    ""
+  ].join("\n");
+}
+
+function destroyRequestAfterResponse(request: IncomingMessage, response: ServerResponse) {
+  if (request.destroyed) {
+    return;
+  }
+
+  if (response.writableEnded) {
+    request.destroy();
+    return;
+  }
+
+  response.once("finish", () => {
+    if (!request.destroyed) {
+      request.destroy();
+    }
+  });
+}
+
+function nonNegativeInteger(value: number | undefined, fallback: number) {
+  if (value === undefined) {
+    return fallback;
+  }
+
+  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
+}
+
+function positiveInteger(value: number | undefined, fallback: number) {
+  return Number.isFinite(value) && value !== undefined && value > 0 ? Math.floor(value) : fallback;
+}
+
+function maxBodyBytes(options: SiteFlowServerOptions) {
+  return nonNegativeInteger(options.maxBodyBytes, defaultMaxBodyBytes);
+}
+
+function prebuiltUploadBudget(options: SiteFlowServerOptions): Required<PrebuiltUploadBudget> {
+  return {
+    maxUploadBytes: positiveInteger(options.prebuiltMaxUploadBytes, defaultPrebuiltMaxUploadBytes),
+    maxFiles: positiveInteger(options.prebuiltMaxFiles, defaultPrebuiltMaxUploadFiles)
+  };
+}
+
+function prebuiltRequestBodyLimitBytes(options: SiteFlowServerOptions) {
+  const budget = prebuiltUploadBudget(options);
+  const base64Bytes = Math.ceil(budget.maxUploadBytes * 4 / 3);
+  const metadataBytes = budget.maxFiles * 512;
+
+  return Math.max(maxBodyBytes(options), base64Bytes + metadataBytes + defaultMaxBodyBytes);
+}
+
+function assertPrebuiltUploadWithinBudget(command: PrebuiltDeployCommand, options: SiteFlowServerOptions) {
+  if (!Array.isArray(command.files)) {
+    throw new SyntaxError("Prebuilt deploy requires a files array.");
+  }
+
+  try {
+    assertPrebuiltUploadBudget(command.files, prebuiltUploadBudget(options), "Prebuilt deploy upload");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Prebuilt deploy upload failed budget validation.";
+
+    if (message.includes("SITEFLOW_PREBUILT_MAX_")) {
+      throw new PrebuiltUploadTooLargeError(message);
+    }
+
+    throw new SyntaxError(message);
+  }
+}
+
+function rateLimitOptions(options: SiteFlowServerOptions): ResolvedRateLimitOptions | undefined {
+  if (options.rateLimit === false) {
+    return undefined;
+  }
+
+  return {
+    maxRequests: positiveInteger(options.rateLimit?.maxRequests, defaultApiRateLimitMaxRequests),
+    windowMs: positiveInteger(options.rateLimit?.windowMs, defaultApiRateLimitWindowMs),
+    now: options.rateLimit?.now ?? Date.now
+  };
+}
+
+async function readRawBody(request: IncomingMessage, maxBytes = requestBodyLimitBytes.get(request) ?? defaultMaxBodyBytes) {
+  const declaredLength = optionalNumber(headerValue(request, "content-length"));
+
+  if (declaredLength !== undefined && declaredLength > maxBytes) {
+    throw new RequestBodyTooLargeError(maxBytes);
+  }
+
   const chunks: Buffer[] = [];
+  let totalBytes = 0;
 
   for await (const chunk of request) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buffer.byteLength;
+
+    if (totalBytes > maxBytes) {
+      throw new RequestBodyTooLargeError(maxBytes);
+    }
+
+    chunks.push(buffer);
   }
 
   return Buffer.concat(chunks);
@@ -204,22 +577,312 @@ function bearerToken(request: IncomingMessage) {
   return header.slice("Bearer ".length).trim();
 }
 
+function secretEquals(actual: string, expected: string) {
+  const actualBuffer = createHash("sha256").update(actual, "utf8").digest();
+  const expectedBuffer = createHash("sha256").update(expected, "utf8").digest();
+
+  return timingSafeEqual(actualBuffer, expectedBuffer);
+}
+
 function headerValue(request: IncomingMessage, name: string) {
   const value = request.headers[name.toLowerCase()];
   return Array.isArray(value) ? value[0] : value;
+}
+
+function headerValues(request: IncomingMessage, name: string) {
+  const normalized = name.toLowerCase();
+  const values: string[] = [];
+
+  for (let index = 0; index < request.rawHeaders.length; index += 2) {
+    if (request.rawHeaders[index]?.toLowerCase() === normalized && request.rawHeaders[index + 1]) {
+      values.push(request.rawHeaders[index + 1]);
+    }
+  }
+
+  if (values.length > 0) {
+    return values;
+  }
+
+  const value = request.headers[normalized];
+  return Array.isArray(value) ? value : value ? [value] : [];
 }
 
 function firstHeaderToken(value: string | undefined) {
   return value?.split(",")[0]?.trim();
 }
 
-function requestOrigin(request: IncomingMessage) {
-  const forwardedHost = firstHeaderToken(headerValue(request, "x-forwarded-host"));
-  const forwardedProto = firstHeaderToken(headerValue(request, "x-forwarded-proto"));
-  const host = forwardedHost || request.headers.host || "127.0.0.1";
-  const proto = forwardedProto || "http";
+function normalizedRemoteAddress(value: string | undefined) {
+  if (!value) {
+    return undefined;
+  }
+
+  const address = value.trim().toLowerCase();
+  const ipv4Mapped = address.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+
+  if (ipv4Mapped?.[1] && isIP(ipv4Mapped[1]) === 4) {
+    return ipv4Mapped[1];
+  }
+
+  return isIP(address) ? address : undefined;
+}
+
+function isLoopbackAddress(address: string | undefined) {
+  const normalized = normalizedRemoteAddress(address);
+
+  if (!normalized) {
+    return false;
+  }
+
+  if (isIP(normalized) === 4) {
+    return normalized.startsWith("127.");
+  }
+
+  return normalized === "::1";
+}
+
+function isPrivateAddress(address: string | undefined) {
+  const normalized = normalizedRemoteAddress(address);
+
+  if (!normalized) {
+    return false;
+  }
+
+  if (isLoopbackAddress(normalized)) {
+    return true;
+  }
+
+  if (isIP(normalized) === 4) {
+    const octets = normalized.split(".").map((entry) => Number(entry));
+    const [first, second] = octets;
+
+    return first === 10 ||
+      (first === 172 && second >= 16 && second <= 31) ||
+      (first === 192 && second === 168) ||
+      (first === 169 && second === 254);
+  }
+
+  return normalized.startsWith("fc") || normalized.startsWith("fd") || normalized.startsWith("fe80:");
+}
+
+function trustedProxyBlockList(entries: string[]) {
+  const blockList = new BlockList();
+
+  for (const rawEntry of entries) {
+    const entry = rawEntry.trim();
+
+    if (!entry) {
+      continue;
+    }
+
+    const [address, prefix] = entry.split("/");
+    const normalized = normalizedRemoteAddress(address);
+    const family = normalized ? isIP(normalized) : 0;
+
+    if (!normalized || family === 0) {
+      return undefined;
+    }
+
+    const type = family === 4 ? "ipv4" : "ipv6";
+
+    if (prefix === undefined) {
+      blockList.addAddress(normalized, type);
+      continue;
+    }
+
+    const prefixLength = Number(prefix);
+    const maxPrefix = family === 4 ? 32 : 128;
+
+    if (!Number.isInteger(prefixLength) || prefixLength < 0 || prefixLength > maxPrefix) {
+      return undefined;
+    }
+
+    blockList.addSubnet(normalized, prefixLength, type);
+  }
+
+  return blockList;
+}
+
+function isTrustedProxyRequest(request: IncomingMessage, options: SiteFlowServerOptions | undefined) {
+  const policy = options?.trustProxy;
+
+  if (policy === true) {
+    return true;
+  }
+
+  if (!policy) {
+    return false;
+  }
+
+  const remoteAddress = normalizedRemoteAddress(request.socket.remoteAddress);
+
+  if (!remoteAddress) {
+    return false;
+  }
+
+  if (policy === "loopback") {
+    return isLoopbackAddress(remoteAddress);
+  }
+
+  if (policy === "private") {
+    return isPrivateAddress(remoteAddress);
+  }
+
+  if (Array.isArray(policy)) {
+    const blockList = trustedProxyBlockList(policy);
+    const family = isIP(remoteAddress);
+
+    return Boolean(blockList?.check(remoteAddress, family === 4 ? "ipv4" : "ipv6"));
+  }
+
+  return false;
+}
+
+function trustedForwardedHeaderToken(request: IncomingMessage, options: SiteFlowServerOptions | undefined, name: string) {
+  return isTrustedProxyRequest(request, options) ? firstHeaderToken(headerValue(request, name)) : undefined;
+}
+
+function requestHost(request: IncomingMessage, options?: SiteFlowServerOptions) {
+  return trustedForwardedHeaderToken(request, options, "x-forwarded-host") || request.headers.host || "";
+}
+
+function requestScheme(request: IncomingMessage, options?: SiteFlowServerOptions) {
+  const forwardedProto = trustedForwardedHeaderToken(request, options, "x-forwarded-proto");
+
+  if (forwardedProto) {
+    return forwardedProto;
+  }
+
+  return (request.socket as { encrypted?: boolean }).encrypted ? "https" : "http";
+}
+
+function requestOrigin(request: IncomingMessage, options?: SiteFlowServerOptions) {
+  const host = requestHost(request, options) || "127.0.0.1";
+  const proto = requestScheme(request, options);
 
   return `${proto}://${host}`;
+}
+
+function cookieValue(request: IncomingMessage, name: string) {
+  const cookieHeader = headerValue(request, "cookie");
+
+  if (!cookieHeader) {
+    return undefined;
+  }
+
+  for (const entry of cookieHeader.split(";")) {
+    const separatorIndex = entry.indexOf("=");
+
+    if (separatorIndex === -1) {
+      continue;
+    }
+
+    const key = entry.slice(0, separatorIndex).trim();
+    const value = entry.slice(separatorIndex + 1).trim();
+
+    if (key === name) {
+      try {
+        return decodeURIComponent(value);
+      } catch {
+        return undefined;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function operatorSessionToken(request: IncomingMessage) {
+  return cookieValue(request, operatorSessionCookieName)?.trim() || undefined;
+}
+
+function isMutatingMethod(method: string | undefined) {
+  return method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE";
+}
+
+function authorizeOperatorSessionCsrf(request: IncomingMessage, response: ServerResponse, options: SiteFlowServerOptions) {
+  if (!isMutatingMethod(request.method)) {
+    return true;
+  }
+
+  if (headerValue(request, operatorSessionCsrfHeaderName)?.trim() === operatorSessionCsrfHeaderValue) {
+    return true;
+  }
+
+  sendJson(
+    response,
+    403,
+    { message: "SiteFlow operator session writes require a same-origin CSRF header." },
+    options.allowedOrigin,
+    request.method
+  );
+  return false;
+}
+
+function shouldUseSecureCookie(request: IncomingMessage, options?: SiteFlowServerOptions) {
+  if (options?.secureCookies) {
+    return true;
+  }
+
+  const forwardedProto = trustedForwardedHeaderToken(request, options, "x-forwarded-proto");
+
+  if (forwardedProto) {
+    return forwardedProto === "https";
+  }
+
+  return Boolean((request.socket as { encrypted?: boolean }).encrypted);
+}
+
+function appendSetCookie(response: ServerResponse, cookie: string) {
+  const current = response.getHeader("set-cookie");
+
+  if (!current) {
+    response.setHeader("set-cookie", cookie);
+    return;
+  }
+
+  response.setHeader("set-cookie", Array.isArray(current) ? [...current, cookie] : [String(current), cookie]);
+}
+
+function operatorSessionCookie(secret: string, expiresAt: string, maxAgeSeconds: number, request: IncomingMessage, options?: SiteFlowServerOptions) {
+  const attributes = [
+    `${operatorSessionCookieName}=${encodeURIComponent(secret)}`,
+    "HttpOnly",
+    "SameSite=Lax",
+    "Path=/",
+    `Max-Age=${maxAgeSeconds}`,
+    `Expires=${new Date(expiresAt).toUTCString()}`
+  ];
+
+  if (shouldUseSecureCookie(request, options)) {
+    attributes.push("Secure");
+  }
+
+  return attributes.join("; ");
+}
+
+function expiredOperatorSessionCookie(request: IncomingMessage, options?: SiteFlowServerOptions) {
+  const attributes = [
+    `${operatorSessionCookieName}=`,
+    "HttpOnly",
+    "SameSite=Lax",
+    "Path=/",
+    "Max-Age=0",
+    "Expires=Thu, 01 Jan 1970 00:00:00 GMT"
+  ];
+
+  if (shouldUseSecureCookie(request, options)) {
+    attributes.push("Secure");
+  }
+
+  return attributes.join("; ");
+}
+
+function operatorSessionResponse(result: { status: string; session: unknown; message: string }) {
+  return {
+    status: result.status,
+    session: result.session,
+    message: result.message
+  };
 }
 
 function requestHeaders(request: IncomingMessage) {
@@ -241,18 +904,61 @@ function requestHeaders(request: IncomingMessage) {
   return headers;
 }
 
-function deployHookUrl(request: IncomingMessage, token: string) {
-  return `${requestOrigin(request).replace(/\/+$/, "")}/api/deploy-hooks/${encodeURIComponent(token)}/trigger`;
+function deployHookUrl(request: IncomingMessage, token: string, options?: SiteFlowServerOptions) {
+  return `${requestOrigin(request, options).replace(/\/+$/, "")}/api/deploy-hooks/${encodeURIComponent(token)}/trigger`;
 }
 
-function requestBucketKey(request: IncomingMessage) {
+function requestLogPath(request: IncomingMessage) {
+  try {
+    const pathname = new URL(request.url ?? "/", "http://siteflow.local").pathname;
+    const segments = pathname.split("/");
+
+    if (segments[1] === "api" && segments[2] === "deploy-hooks" && segments[3]) {
+      segments[3] = "[token]";
+      return segments.join("/");
+    }
+
+    return pathname;
+  } catch {
+    return "/";
+  }
+}
+
+function logRequestCompletion(
+  options: SiteFlowServerOptions,
+  entry: Omit<SiteFlowRequestLogEntry, "durationMs" | "status">,
+  response: ServerResponse,
+  startedAt: number
+) {
+  if (!options.requestLogger) {
+    return;
+  }
+
+  const statusCode = response.statusCode || 500;
+  const durationMs = Math.max(0, Date.now() - startedAt);
+
+  try {
+    const errorClass = entry.errorClass ?? (statusCode >= 400 ? "ExpectedHttpError" : undefined);
+
+    void Promise.resolve(options.requestLogger({
+      ...entry,
+      status: statusCode,
+      ...(errorClass ? { errorClass } : {}),
+      durationMs
+    })).catch(() => undefined);
+  } catch {
+    // Request logging must never affect control-plane response semantics.
+  }
+}
+
+function requestBucketKey(request: IncomingMessage, options?: SiteFlowServerOptions) {
   const explicit = headerValue(request, "x-siteflow-bucket-key")?.trim();
 
   if (explicit) {
     return explicit;
   }
 
-  const forwardedFor = firstHeaderToken(headerValue(request, "x-forwarded-for"));
+  const forwardedFor = trustedForwardedHeaderToken(request, options, "x-forwarded-for");
 
   if (forwardedFor) {
     return forwardedFor;
@@ -265,8 +971,67 @@ function requestBucketKey(request: IncomingMessage) {
   return fallback || undefined;
 }
 
-function requestIp(request: IncomingMessage) {
-  return firstHeaderToken(headerValue(request, "x-forwarded-for")) ?? request.socket.remoteAddress;
+function requestRateLimitBucketKey(request: IncomingMessage, options?: SiteFlowServerOptions) {
+  const forwardedFor = trustedForwardedHeaderToken(request, options, "x-forwarded-for");
+
+  if (forwardedFor) {
+    return forwardedFor;
+  }
+
+  const remoteAddress = request.socket.remoteAddress;
+  const userAgent = headerValue(request, "user-agent");
+  const fallback = [remoteAddress, userAgent].filter(Boolean).join(":");
+
+  return fallback || undefined;
+}
+
+function pruneExpiredRateLimitBuckets(buckets: Map<string, RateLimitBucket>, now: number) {
+  for (const [key, bucket] of buckets) {
+    if (bucket.resetAt <= now) {
+      buckets.delete(key);
+    }
+  }
+}
+
+function allowApiRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  options: SiteFlowServerOptions,
+  buckets: Map<string, RateLimitBucket>
+) {
+  const limits = rateLimitOptions(options);
+
+  if (!limits) {
+    return true;
+  }
+
+  const now = limits.now();
+  const key = requestRateLimitBucketKey(request, options) ?? "anonymous";
+  const existing = buckets.get(key);
+
+  pruneExpiredRateLimitBuckets(buckets, now);
+
+  if (!existing || existing.resetAt <= now) {
+    buckets.set(key, {
+      count: 1,
+      resetAt: now + limits.windowMs
+    });
+    return true;
+  }
+
+  if (existing.count >= limits.maxRequests) {
+    const retryAfterSeconds = Math.max(1, Math.ceil((existing.resetAt - now) / 1000));
+    response.setHeader("retry-after", String(retryAfterSeconds));
+    sendJson(response, 429, { message: "SiteFlow API rate limit exceeded." }, options.allowedOrigin, request.method);
+    return false;
+  }
+
+  existing.count += 1;
+  return true;
+}
+
+function requestIp(request: IncomingMessage, options?: SiteFlowServerOptions) {
+  return trustedForwardedHeaderToken(request, options, "x-forwarded-for") ?? request.socket.remoteAddress;
 }
 
 function lowerCaseRequestHeaders(request: IncomingMessage) {
@@ -282,14 +1047,390 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function recordField(value: Record<string, unknown>, key: string) {
-  const field = value[key];
+function permissionLevel(permission: PermissionScope) {
+  return permission === "read" ? 0 : permission === "write" ? 1 : 2;
+}
+
+function hasPermission(scopes: PermissionScope[], required: PermissionScope) {
+  return scopes.some((scope) => permissionLevel(scope) >= permissionLevel(required));
+}
+
+function rootApiTokenPrincipal(): SiteFlowAuthPrincipal {
+  return {
+    kind: "root_api_token",
+    scopes: allPermissionScopes,
+    actor: rootApiTokenActor
+  };
+}
+
+function fallbackApiTokenPrincipal(scopes: PermissionScope[]): SiteFlowAuthPrincipal {
+  return {
+    kind: "api_token",
+    scopes,
+    actor: {
+      id: "api-token:resolved",
+      name: "SiteFlow API token",
+      role: "system"
+    }
+  };
+}
+
+function fallbackOperatorSessionPrincipal(scopes: PermissionScope[]): SiteFlowAuthPrincipal {
+  return {
+    kind: "operator_session",
+    scopes,
+    actor: {
+      id: "operator-session:resolved",
+      name: "SiteFlow operator session",
+      role: "operator"
+    }
+  };
+}
+
+function bodyWithActor(body: unknown, actor: Actor) {
+  return {
+    ...(isRecord(body) ? body : {}),
+    actor
+  };
+}
+
+function evidenceString(value: unknown) {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function nestedEvidenceObject(candidate: Record<string, unknown> | undefined, key: string) {
+  return candidate && isRecord(candidate[key]) ? candidate[key] : undefined;
+}
+
+function releaseEvidencePayload(evidence: Record<string, unknown>) {
+  const bundle = nestedEvidenceObject(evidence, "bundle") ?? nestedEvidenceObject(evidence, "evidence") ?? evidence;
+  const evidencePath = evidenceString(evidence.evidencePath) ?? evidenceString(evidence.sourcePath) ?? "request.releaseEvidence";
+
+  return { bundle, evidencePath };
+}
+
+function releaseEvidenceMetadataFromBundle(
+  rawBundle: unknown,
+  evidencePath: string,
+  check: ReleaseEvidenceBundleResult
+) {
+  if (!isRecord(rawBundle)) {
+    throw new SyntaxError("Production releaseEvidence must contain a release evidence bundle object.");
+  }
+
+  const release = nestedEvidenceObject(rawBundle, "release");
+  const commitRef = evidenceString(check.selectedEvidence.releaseCommitRef);
+  const repository = evidenceString(check.selectedEvidence.repository);
+  const branch = evidenceString(check.selectedEvidence.branch);
+
+  if (!commitRef || !repository || !branch) {
+    throw new SyntaxError("Production release evidence bundle must include repository, branch, and commitRef.");
+  }
+
+  return {
+    evidencePath,
+    checkedAt: check.checkedAt,
+    status: "passed" as const,
+    commitRef,
+    repository,
+    branch,
+    targetEnvironment: evidenceString(rawBundle.targetEnvironment) ?? evidenceString(release?.targetEnvironment) ?? "production",
+    ...(evidenceString(release?.releaseTicket) ? { releaseTicket: evidenceString(release?.releaseTicket) } : {}),
+    ...(evidenceString(release?.operatorName) ? { operatorName: evidenceString(release?.operatorName) } : {})
+  };
+}
+
+function requireProductionReleaseEvidence(
+  channel: string,
+  body: unknown,
+  operation: string,
+  options: SiteFlowServerOptions
+) {
+  if (channel !== "production") {
+    return undefined;
+  }
+
+  if (!isRecord(body) || !isRecord(body.releaseEvidence)) {
+    throw new SyntaxError(`Production ${operation} requires a full releaseEvidence bundle from a passing release:evidence check.`);
+  }
+
+  const { bundle, evidencePath } = releaseEvidencePayload(body.releaseEvidence);
+  const check = (options.releaseEvidenceEvaluator ?? evaluateReleaseEvidenceBundle)(bundle, {
+    evidencePath,
+    targetEnvironment: "production"
+  });
+
+  if (check.status !== "passed") {
+    const failed = check.checks
+      .filter((entry) => entry.status !== "pass")
+      .map((entry) => entry.name)
+      .slice(0, 5)
+      .join(", ");
+    throw new SyntaxError(`Production release evidence bundle did not pass${failed ? `: ${failed}` : "."}`);
+  }
+
+  const metadata = releaseEvidenceMetadataFromBundle(bundle, evidencePath, check);
+
+  if (metadata.targetEnvironment !== "production") {
+    throw new SyntaxError("Production release evidence bundle must target production.");
+  }
+
+  return metadata;
+}
+
+function bodyWithProductionReleaseEvidence(
+  channel: string,
+  body: unknown,
+  operation: string,
+  options: SiteFlowServerOptions
+) {
+  const metadata = requireProductionReleaseEvidence(channel, body, operation, options);
+  const normalizedBody = { ...(isRecord(body) ? body : {}) };
+
+  if (!metadata) {
+    delete normalizedBody.releaseEvidence;
+    return normalizedBody;
+  }
+
+  return {
+    ...normalizedBody,
+    releaseEvidence: metadata
+  };
+}
+
+function bodyWithOptionalProductionReleaseEvidence(
+  channel: string,
+  body: unknown,
+  operation: string,
+  options: SiteFlowServerOptions
+) {
+  if (!isRecord(body) || body.releaseEvidence === undefined) {
+    const normalizedBody = { ...(isRecord(body) ? body : {}) };
+
+    if (channel !== "production") {
+      delete normalizedBody.releaseEvidence;
+    }
+
+    return normalizedBody;
+  }
+
+  return bodyWithProductionReleaseEvidence(channel, body, operation, options);
+}
+
+function productionRollingAbortReleaseEvidenceException(reason: string) {
+  return {
+    type: "production_rolling_abort_stop_rollout",
+    targetEnvironment: "production",
+    acceptedWithoutReleaseEvidence: true,
+    reason
+  };
+}
+
+function bodyWithProductionRollingAbortException(channel: string, body: unknown, options: SiteFlowServerOptions) {
+  const normalizedBody = bodyWithOptionalProductionReleaseEvidence(channel, body, "rolling release abort", options);
+
+  if (channel !== "production") {
+    delete normalizedBody.releaseEvidenceException;
+    return normalizedBody;
+  }
+
+  const reason = evidenceString(normalizedBody.reason);
+
+  if (!reason) {
+    throw new SyntaxError("Production rolling release abort requires a non-empty audit reason because it records a stop-rollout release evidence exception.");
+  }
+
+  const suppliedException = isRecord(normalizedBody.releaseEvidenceException)
+    ? normalizedBody.releaseEvidenceException
+    : undefined;
+
+  if (
+    suppliedException &&
+    (
+      evidenceString(suppliedException.type) !== "production_rolling_abort_stop_rollout" ||
+      evidenceString(suppliedException.targetEnvironment) !== "production" ||
+      suppliedException.acceptedWithoutReleaseEvidence !== true ||
+      evidenceString(suppliedException.reason) !== reason
+    )
+  ) {
+    throw new SyntaxError("Production rolling release abort releaseEvidenceException must record stop-rollout type, production targetEnvironment, acceptedWithoutReleaseEvidence=true, and matching reason.");
+  }
+
+  return {
+    ...normalizedBody,
+    reason,
+    releaseEvidenceException: productionRollingAbortReleaseEvidenceException(reason)
+  };
+}
+
+function bodyWithOptionalPrebuiltReleaseEvidence(body: unknown, options: SiteFlowServerOptions) {
+  if (!isRecord(body) || body.releaseEvidence === undefined) {
+    return body;
+  }
+
+  return bodyWithProductionReleaseEvidence("production", body, "prebuilt deploy upload", options);
+}
+
+function bodyWithRequestedBy(body: unknown, requestedBy: Actor) {
+  return {
+    ...(isRecord(body) ? body : {}),
+    requestedBy
+  };
+}
+
+function bodyWithoutClientPrincipal(body: unknown) {
+  const sanitized = { ...(isRecord(body) ? body : {}) };
+  delete sanitized.actor;
+  delete sanitized.requestedBy;
+  return sanitized;
+}
+
+function isPermissionScope(value: unknown): value is PermissionScope {
+  return value === "read" || value === "write" || value === "admin";
+}
+
+function operatorSessionCommandFromBody(body: unknown) {
+  if (!isRecord(body)) {
+    throw new SyntaxError("Operator session body must be a JSON object.");
+  }
+
+  const subject = body.subject;
+  const scopes = body.scopes ?? allPermissionScopes;
+  const projectIdsValue = body.projectIds;
+  const ttlSecondsValue = body.ttlSeconds;
+  const actor = body.actor;
+  let ttlSeconds: number | undefined;
+  let projectIds: string[] | undefined;
+
+  if (subject !== undefined && typeof subject !== "string") {
+    throw new SyntaxError("Operator session subject must be a string.");
+  }
+
+  if (!Array.isArray(scopes) || scopes.length === 0 || !scopes.every(isPermissionScope)) {
+    throw new SyntaxError("Operator session scopes must include read, write, or admin.");
+  }
+
+  if (projectIdsValue !== undefined) {
+    if (!Array.isArray(projectIdsValue) || projectIdsValue.length === 0 || !projectIdsValue.every((entry) => typeof entry === "string")) {
+      throw new SyntaxError("Operator session projectIds must be a non-empty string array when provided.");
+    }
+
+    projectIds = Array.from(new Set(projectIdsValue.map((entry) => entry.trim())));
+
+    if (projectIds.some((entry) => !entry || entry.length > 120)) {
+      throw new SyntaxError("Operator session projectIds must be non-empty project ids 120 characters or fewer.");
+    }
+  }
+
+  if (
+    ttlSecondsValue !== undefined &&
+    (typeof ttlSecondsValue !== "number" || !Number.isInteger(ttlSecondsValue) || ttlSecondsValue < 60 || ttlSecondsValue > 86_400)
+  ) {
+    throw new SyntaxError("Operator session ttlSeconds must be an integer from 60 to 86400.");
+  }
+
+  if (ttlSecondsValue !== undefined) {
+    ttlSeconds = ttlSecondsValue;
+  }
+
+  if (actor !== undefined && !isRecord(actor)) {
+    throw new SyntaxError("Operator session actor must be a JSON object.");
+  }
+
+  return {
+    subject,
+    scopes: Array.from(new Set(scopes)),
+    projectIds,
+    ttlSeconds,
+    actor: actor as Actor | undefined
+  };
+}
+
+function operatorSessionRevokeAllCommandFromBody(body: unknown, actor: Actor, projectId?: string) {
+  if (!isRecord(body)) {
+    throw new SyntaxError("Operator session revoke-all body must be a JSON object.");
+  }
+
+  if (body.reason !== undefined && typeof body.reason !== "string") {
+    throw new SyntaxError("Operator session revoke-all reason must be a string.");
+  }
+
+  const reason = body.reason?.trim() || undefined;
+
+  return {
+    projectId,
+    actor,
+    reason
+  };
+}
+
+function sanitizedReadinessDetails(details: unknown): Record<string, SiteFlowReadinessDetailValue> {
+  if (!isRecord(details)) {
+    return {};
+  }
+
+  const sanitized: Record<string, SiteFlowReadinessDetailValue> = {};
+
+  for (const [key, value] of Object.entries(details)) {
+    if (!/^[a-z][a-z0-9_.-]{0,63}$/i.test(key)) {
+      continue;
+    }
+
+    if (typeof value === "string") {
+      if (allowedReadinessDetailValues.has(value)) {
+        sanitized[key] = value as SiteFlowReadinessDetailValue;
+      }
+      continue;
+    }
+
+    if (typeof value === "boolean" || value === null) {
+      sanitized[key] = value;
+      continue;
+    }
+
+    if (typeof value === "number" && Number.isFinite(value)) {
+      sanitized[key] = value;
+    }
+  }
+
+  return sanitized;
+}
+
+async function readinessBody(options: SiteFlowServerOptions): Promise<{ statusCode: number; body: { status: SiteFlowReadinessStatus; details: Record<string, SiteFlowReadinessDetailValue> } }> {
+  try {
+    const result = await options.readinessCheck?.();
+    const status = result?.status === "not_ready" ? "not_ready" : "ready";
+
+    return {
+      statusCode: status === "ready" ? 200 : 503,
+      body: {
+        status,
+        details: sanitizedReadinessDetails(result?.details)
+      }
+    };
+  } catch {
+    return {
+      statusCode: 503,
+      body: {
+        status: "not_ready",
+        details: {}
+      }
+    };
+  }
+}
+
+function recordField(value: Record<string, unknown> | undefined, key: string) {
+  const field = value?.[key];
   return isRecord(field) ? field : undefined;
 }
 
 function stringField(value: Record<string, unknown> | undefined, key: string) {
   const field = value?.[key];
   return typeof field === "string" ? field : undefined;
+}
+
+function statusValue(value: unknown) {
+  return typeof value === "string" ? value.trim().toLowerCase() : undefined;
 }
 
 function numberField(value: Record<string, unknown> | undefined, key: string) {
@@ -305,19 +1446,92 @@ function requireString(value: string | undefined, label: string) {
   return value.trim();
 }
 
-function verifyGitHubSignature(rawBody: Buffer, signatureHeader: string | undefined, secret: string) {
-  if (!signatureHeader?.startsWith("sha256=")) {
+function safeCompareUtf8(actualValue: string | undefined, expectedValue: string) {
+  if (!actualValue) {
     return false;
   }
 
-  const expected = Buffer.from(`sha256=${createHmac("sha256", secret).update(rawBody).digest("hex")}`, "utf8");
-  const actual = Buffer.from(signatureHeader, "utf8");
+  const expected = Buffer.from(expectedValue, "utf8");
+  const actual = Buffer.from(actualValue, "utf8");
 
   if (actual.length !== expected.length) {
     return false;
   }
 
   return timingSafeEqual(actual, expected);
+}
+
+function verifySha256HexSignature(rawBody: Buffer, signatureHeader: string | undefined, secret: string) {
+  if (!signatureHeader?.startsWith("sha256=")) {
+    return false;
+  }
+
+  return safeCompareUtf8(signatureHeader, `sha256=${createHmac("sha256", secret).update(rawBody).digest("hex")}`);
+}
+
+function verifyGitHubSignature(rawBody: Buffer, signatureHeader: string | undefined, secret: string) {
+  return verifySha256HexSignature(rawBody, signatureHeader, secret);
+}
+
+const gitLabWebhookTimestampToleranceMs = 5 * 60 * 1000;
+
+function decodeGitLabSigningKey(secret: string) {
+  if (!secret.startsWith("whsec_")) {
+    return secret;
+  }
+
+  const encoded = secret.slice("whsec_".length).replace(/-/g, "+").replace(/_/g, "/");
+  const padded = encoded.padEnd(encoded.length + (4 - encoded.length % 4) % 4, "=");
+  const decoded = Buffer.from(padded, "base64");
+
+  return decoded.byteLength > 0 ? decoded : undefined;
+}
+
+function gitLabWebhookTimestampFresh(timestamp: string | undefined, nowMs = Date.now()) {
+  if (!timestamp) {
+    return false;
+  }
+
+  const numeric = Number(timestamp);
+  const timestampMs = Number.isFinite(numeric)
+    ? numeric > 1_000_000_000_000 ? numeric : numeric * 1000
+    : Date.parse(timestamp);
+
+  return Number.isFinite(timestampMs) && Math.abs(nowMs - timestampMs) <= gitLabWebhookTimestampToleranceMs;
+}
+
+function gitLabSignatureValues(signatureHeaders: string[]) {
+  return signatureHeaders.flatMap((value) =>
+    Array.from(value.matchAll(/(?:^|[\s,])v1[=,]([^,\s]+)/g), (match) => match[1]).filter(Boolean)
+  );
+}
+
+function verifyGitLabSignature(rawBody: Buffer, signatureHeaders: string[], secret: string, deliveryId: string | undefined, timestamp: string | undefined) {
+  if (!deliveryId || !gitLabWebhookTimestampFresh(timestamp)) {
+    return false;
+  }
+
+  const signingKey = decodeGitLabSigningKey(secret);
+
+  if (!signingKey) {
+    return false;
+  }
+
+  const signedPayload = Buffer.concat([
+    Buffer.from(`${deliveryId}.${timestamp}.`, "utf8"),
+    rawBody
+  ]);
+  const expected = createHmac("sha256", signingKey).update(signedPayload).digest("base64");
+
+  return gitLabSignatureValues(signatureHeaders).some((signature) => safeCompareUtf8(signature, expected));
+}
+
+function verifyGiteaSignature(rawBody: Buffer, signatureHeader: string | undefined, hubSignatureHeader: string | undefined, secret: string) {
+  if (signatureHeader) {
+    return safeCompareUtf8(signatureHeader, createHmac("sha256", secret).update(rawBody).digest("hex"));
+  }
+
+  return verifySha256HexSignature(rawBody, hubSignatureHeader, secret);
 }
 
 async function deliverLogDrain(
@@ -388,6 +1602,7 @@ function repositoryFromGitHub(payload: Record<string, unknown>): RepositoryBindi
   const owner = recordField(repository ?? {}, "owner");
   const fullName = stringField(repository, "full_name");
   const fallbackOwner = fullName?.split("/")[0];
+  const remoteUrl = requireString(stringField(repository, "ssh_url") ?? stringField(repository, "clone_url") ?? stringField(repository, "git_url"), "GitHub repository remoteUrl");
 
   return {
     provider: "github",
@@ -397,7 +1612,8 @@ function repositoryFromGitHub(payload: Record<string, unknown>): RepositoryBindi
     providerPayload: {
       id: numberField(repository, "id"),
       fullName,
-      htmlUrl: stringField(repository, "html_url")
+      htmlUrl: stringField(repository, "html_url"),
+      remoteUrl
     }
   };
 }
@@ -413,7 +1629,8 @@ function sanitizeGitHubRepositoryPayload(payload: Record<string, unknown>) {
     id: numberField(repository, "id"),
     fullName: stringField(repository, "full_name"),
     htmlUrl: stringField(repository, "html_url"),
-    defaultBranch: stringField(repository, "default_branch")
+    defaultBranch: stringField(repository, "default_branch"),
+    remoteUrl: stringField(repository, "ssh_url") ?? stringField(repository, "clone_url") ?? stringField(repository, "git_url")
   };
 }
 
@@ -505,48 +1722,534 @@ function normalizeGitHubWebhook(eventName: string, payload: unknown, deliveryId:
   return undefined;
 }
 
-async function authorizeMutation(
+function actorFromProvider(provider: SourceProvider, rawName: string | undefined, fallbackName: string): Actor {
+  const name = rawName?.trim() || fallbackName;
+
+  return {
+    id: `${provider}:${name}`,
+    name,
+    role: "developer"
+  };
+}
+
+function ownerAndNameFromPath(pathWithNamespace: string | undefined, fallbackName: string | undefined) {
+  const parts = pathWithNamespace?.split("/").filter(Boolean) ?? [];
+
+  return {
+    owner: parts.length > 1 ? parts.slice(0, -1).join("/") : undefined,
+    name: parts.at(-1) ?? fallbackName
+  };
+}
+
+function repositoryFromGitLab(payload: Record<string, unknown>): RepositoryBinding {
+  const project = recordField(payload, "project") ?? recordField(payload, "repository");
+  const pathWithNamespace = stringField(project, "path_with_namespace");
+  const fromPath = ownerAndNameFromPath(pathWithNamespace, stringField(project, "name"));
+  const namespace = recordField(project, "namespace");
+  const remoteUrl = requireString(stringField(project, "git_ssh_url") ??
+    stringField(project, "ssh_url_to_repo") ??
+    stringField(project, "git_http_url") ??
+    stringField(project, "http_url_to_repo") ??
+    stringField(project, "web_url"), "GitLab repository remoteUrl");
+
+  return {
+    provider: "gitlab",
+    owner: requireString(stringField(namespace, "path") ?? stringField(namespace, "name") ?? fromPath.owner, "GitLab repository owner"),
+    name: requireString(stringField(project, "name") ?? fromPath.name, "GitLab repository name"),
+    defaultBranch: stringField(project, "default_branch") ?? "main",
+    providerPayload: {
+      id: numberField(project, "id"),
+      pathWithNamespace,
+      webUrl: stringField(project, "web_url"),
+      remoteUrl
+    }
+  };
+}
+
+function normalizeGitLabPush(payload: Record<string, unknown>, deliveryId: string, receivedAt: string): SourceEventInput | undefined {
+  const ref = requireString(stringField(payload, "ref"), "GitLab push ref");
+  const commitSha = requireString(stringField(payload, "after") ?? stringField(payload, "checkout_sha"), "GitLab push commit sha");
+
+  if (/^0+$/.test(commitSha)) {
+    return undefined;
+  }
+
+  const commits = Array.isArray(payload.commits) ? payload.commits.filter(isRecord) : [];
+  const commit = commits.find((entry) => stringField(entry, "id") === commitSha) ?? commits.at(-1);
+  const author = recordField(commit ?? {}, "author");
+  const actorName = stringField(payload, "user_username") ?? stringField(payload, "user_name") ?? stringField(author, "name") ?? "GitLab";
+
+  return {
+    provider: "gitlab",
+    deliveryId,
+    kind: "push",
+    repository: repositoryFromGitLab(payload),
+    branch: branchFromGitRef(ref),
+    commitSha,
+    commitMessage: stringField(commit, "message") ?? "GitLab push",
+    commitAuthor: stringField(author, "name") ?? actorName,
+    receivedAt,
+    actor: actorFromProvider("gitlab", actorName, "GitLab"),
+    providerPayload: {
+      event: "push",
+      ref,
+      before: stringField(payload, "before"),
+      after: commitSha
+    }
+  };
+}
+
+function normalizeGitLabMergeRequest(payload: Record<string, unknown>, deliveryId: string, receivedAt: string): SourceEventInput {
+  const attrs = recordField(payload, "object_attributes");
+  const lastCommit = recordField(attrs, "last_commit") ?? recordField(payload, "last_commit");
+  const author = recordField(lastCommit ?? {}, "author");
+  const iid = numberField(attrs, "iid") ?? numberField(payload, "iid");
+  const actorName = stringField(payload, "user_username") ?? stringField(payload, "user_name") ?? stringField(author, "name") ?? "GitLab";
+
+  if (typeof iid !== "number") {
+    throw new Error("GitLab merge request iid is required.");
+  }
+
+  return {
+    provider: "gitlab",
+    deliveryId,
+    kind: "pull_request",
+    repository: repositoryFromGitLab(payload),
+    branch: requireString(stringField(attrs, "source_branch"), "GitLab merge request source branch"),
+    commitSha: requireString(stringField(lastCommit, "id") ?? stringField(attrs, "last_commit_sha"), "GitLab merge request commit sha"),
+    commitMessage: stringField(attrs, "title") ?? `Merge request !${iid}`,
+    commitAuthor: stringField(author, "name") ?? actorName,
+    pullRequestNumber: iid,
+    receivedAt,
+    actor: actorFromProvider("gitlab", actorName, "GitLab"),
+    providerPayload: {
+      event: "merge_request",
+      action: stringField(attrs, "action"),
+      mergeRequest: {
+        iid,
+        sourceBranch: stringField(attrs, "source_branch"),
+        targetBranch: stringField(attrs, "target_branch"),
+        url: stringField(attrs, "url")
+      }
+    }
+  };
+}
+
+function normalizeGitLabWebhook(eventName: string, payload: unknown, deliveryId: string): SourceEventInput | undefined {
+  if (!isRecord(payload)) {
+    throw new Error("GitLab webhook payload must be a JSON object.");
+  }
+
+  const receivedAt = new Date().toISOString();
+  const objectKind = statusValue(payload.object_kind) ?? statusValue(payload.event_name) ?? statusValue(eventName);
+
+  if (objectKind === "push" || eventName === "Push Hook") {
+    return normalizeGitLabPush(payload, deliveryId, receivedAt);
+  }
+
+  if (objectKind === "merge_request" || eventName === "Merge Request Hook") {
+    return normalizeGitLabMergeRequest(payload, deliveryId, receivedAt);
+  }
+
+  return undefined;
+}
+
+function repositoryFromGitea(payload: Record<string, unknown>): RepositoryBinding {
+  const repository = recordField(payload, "repository");
+  const owner = recordField(repository ?? {}, "owner");
+  const fullName = stringField(repository, "full_name");
+  const fromPath = ownerAndNameFromPath(fullName, stringField(repository, "name"));
+  const remoteUrl = requireString(stringField(repository, "ssh_url") ?? stringField(repository, "clone_url") ?? stringField(repository, "html_url"), "Gitea repository remoteUrl");
+
+  return {
+    provider: "gitea",
+    owner: requireString(stringField(owner, "username") ?? stringField(owner, "login") ?? stringField(owner, "name") ?? fromPath.owner, "Gitea repository owner"),
+    name: requireString(stringField(repository, "name") ?? fromPath.name, "Gitea repository name"),
+    defaultBranch: stringField(repository, "default_branch") ?? "main",
+    providerPayload: {
+      id: numberField(repository, "id"),
+      fullName,
+      htmlUrl: stringField(repository, "html_url"),
+      remoteUrl
+    }
+  };
+}
+
+function normalizeGiteaPush(payload: Record<string, unknown>, deliveryId: string, receivedAt: string): SourceEventInput | undefined {
+  const ref = requireString(stringField(payload, "ref"), "Gitea push ref");
+  const commitSha = requireString(stringField(payload, "after"), "Gitea push commit sha");
+
+  if (/^0+$/.test(commitSha)) {
+    return undefined;
+  }
+
+  const headCommit = recordField(payload, "head_commit");
+  const author = recordField(headCommit ?? {}, "author");
+  const sender = recordField(payload, "sender");
+  const actorName = stringField(sender, "login") ?? stringField(sender, "username") ?? stringField(author, "name") ?? "Gitea";
+
+  return {
+    provider: "gitea",
+    deliveryId,
+    kind: "push",
+    repository: repositoryFromGitea(payload),
+    branch: branchFromGitRef(ref),
+    commitSha,
+    commitMessage: stringField(headCommit, "message") ?? "Gitea push",
+    commitAuthor: stringField(author, "name") ?? actorName,
+    receivedAt,
+    actor: actorFromProvider("gitea", actorName, "Gitea"),
+    providerPayload: {
+      event: "push",
+      ref,
+      before: stringField(payload, "before"),
+      after: commitSha
+    }
+  };
+}
+
+function normalizeGiteaPullRequest(payload: Record<string, unknown>, deliveryId: string, receivedAt: string): SourceEventInput {
+  const pullRequest = recordField(payload, "pull_request");
+  const head = recordField(pullRequest ?? {}, "head");
+  const user = recordField(pullRequest ?? {}, "user");
+  const number = numberField(pullRequest, "number") ?? numberField(payload, "number");
+  const actorName = stringField(user, "login") ?? stringField(user, "username") ?? stringField(recordField(payload, "sender"), "login") ?? "Gitea";
+
+  if (typeof number !== "number") {
+    throw new Error("Gitea pull request number is required.");
+  }
+
+  return {
+    provider: "gitea",
+    deliveryId,
+    kind: "pull_request",
+    repository: repositoryFromGitea(payload),
+    branch: requireString(stringField(head, "ref"), "Gitea pull request head ref"),
+    commitSha: requireString(stringField(head, "sha"), "Gitea pull request head sha"),
+    commitMessage: stringField(pullRequest, "title") ?? `Pull request #${number}`,
+    commitAuthor: actorName,
+    pullRequestNumber: number,
+    receivedAt,
+    actor: actorFromProvider("gitea", actorName, "Gitea"),
+    providerPayload: {
+      event: "pull_request",
+      action: stringField(payload, "action"),
+      pullRequest: {
+        number,
+        headRef: stringField(head, "ref"),
+        headSha: stringField(head, "sha"),
+        htmlUrl: stringField(pullRequest, "html_url")
+      }
+    }
+  };
+}
+
+function normalizeGiteaWebhook(eventName: string, payload: unknown, deliveryId: string): SourceEventInput | undefined {
+  if (!isRecord(payload)) {
+    throw new Error("Gitea webhook payload must be a JSON object.");
+  }
+
+  const receivedAt = new Date().toISOString();
+
+  if (eventName === "push") {
+    return normalizeGiteaPush(payload, deliveryId, receivedAt);
+  }
+
+  if (eventName === "pull_request") {
+    return normalizeGiteaPullRequest(payload, deliveryId, receivedAt);
+  }
+
+  return undefined;
+}
+
+function repositoryFromGeneric(payload: Record<string, unknown>): RepositoryBinding {
+  const repository = recordField(payload, "repository");
+  const remoteUrl = requireString(stringField(repository, "remoteUrl") ?? stringField(repository, "url"), "Generic repository remoteUrl");
+
+  return {
+    provider: "generic",
+    owner: requireString(stringField(repository, "owner"), "Generic repository owner"),
+    name: requireString(stringField(repository, "name"), "Generic repository name"),
+    defaultBranch: stringField(repository, "defaultBranch") ?? stringField(repository, "default_branch") ?? "main",
+    providerPayload: {
+      remoteUrl,
+      url: remoteUrl,
+      webUrl: stringField(repository, "webUrl") ?? stringField(repository, "web_url")
+    }
+  };
+}
+
+function normalizeGenericWebhook(eventName: string, payload: unknown, deliveryId: string): SourceEventInput | undefined {
+  if (!isRecord(payload)) {
+    throw new Error("Generic webhook payload must be a JSON object.");
+  }
+
+  const kind = statusValue(payload.kind) ?? statusValue(eventName);
+
+  if (kind !== "push" && kind !== "pull_request") {
+    return undefined;
+  }
+
+  const actor = recordField(payload, "actor");
+  const actorName = stringField(actor, "name") ?? stringField(actor, "login") ?? "Generic";
+  const ref = stringField(payload, "ref");
+  const commitSha = requireString(stringField(payload, "commitSha") ?? stringField(payload, "commit_sha") ?? stringField(payload, "after"), "Generic webhook commitSha");
+
+  if (kind === "push" && /^0+$/.test(commitSha)) {
+    return undefined;
+  }
+
+  return {
+    provider: "generic",
+    deliveryId,
+    kind,
+    repository: repositoryFromGeneric(payload),
+    branch: requireString(stringField(payload, "branch") ?? (ref ? branchFromGitRef(ref) : undefined), "Generic webhook branch"),
+    commitSha,
+    commitMessage: stringField(payload, "commitMessage") ?? stringField(payload, "commit_message") ?? "Generic webhook",
+    commitAuthor: stringField(payload, "commitAuthor") ?? stringField(payload, "commit_author") ?? actorName,
+    pullRequestNumber: kind === "pull_request" ? numberField(payload, "pullRequestNumber") ?? numberField(payload, "pull_request_number") : undefined,
+    receivedAt: new Date().toISOString(),
+    actor: {
+      id: stringField(actor, "id") ?? `generic:${actorName}`,
+      name: actorName,
+      role: "developer"
+    },
+    providerPayload: {
+      event: kind,
+      ref,
+      repository: {
+        owner: stringField(recordField(payload, "repository"), "owner"),
+        name: stringField(recordField(payload, "repository"), "name")
+      }
+    }
+  };
+}
+
+function normalizeGitWebhook(provider: SourceProvider, eventName: string, payload: unknown, deliveryId: string): SourceEventInput | undefined {
+  if (provider === "github") {
+    return normalizeGitHubWebhook(eventName, payload, deliveryId);
+  }
+
+  if (provider === "gitlab") {
+    return normalizeGitLabWebhook(eventName, payload, deliveryId);
+  }
+
+  if (provider === "gitea") {
+    return normalizeGiteaWebhook(eventName, payload, deliveryId);
+  }
+
+  return normalizeGenericWebhook(eventName, payload, deliveryId);
+}
+
+function contentType(request: IncomingMessage) {
+  return headerValue(request, "content-type")?.split(";")[0]?.trim().toLowerCase();
+}
+
+function parseGitWebhookPayload(provider: SourceProvider, request: IncomingMessage, rawBody: Buffer) {
+  const bodyText = rawBody.toString("utf8");
+
+  if (!bodyText.trim()) {
+    return {};
+  }
+
+  if (provider === "gitea" && contentType(request) === "application/x-www-form-urlencoded") {
+    const payload = new URLSearchParams(bodyText).get("payload");
+
+    if (!payload?.trim()) {
+      throw new Error("Gitea form webhook payload is required.");
+    }
+
+    return JSON.parse(payload) as unknown;
+  }
+
+  return JSON.parse(bodyText) as unknown;
+}
+
+function gitWebhookSecret(provider: SourceProvider, options: SiteFlowServerOptions) {
+  return options.gitWebhookSecrets?.[provider] ?? (provider === "github" ? options.githubWebhookSecret : undefined);
+}
+
+function gitWebhookDeliveryId(provider: SourceProvider, request: IncomingMessage) {
+  if (provider === "github") {
+    return headerValue(request, "x-github-delivery");
+  }
+
+  if (provider === "gitlab") {
+    return headerValue(request, "webhook-id") ?? headerValue(request, "x-gitlab-event-uuid");
+  }
+
+  if (provider === "gitea") {
+    return headerValue(request, "x-gitea-delivery") ?? headerValue(request, "x-gogs-delivery") ?? headerValue(request, "x-github-delivery");
+  }
+
+  return headerValue(request, "x-siteflow-delivery");
+}
+
+function gitWebhookEventName(provider: SourceProvider, request: IncomingMessage) {
+  if (provider === "github") {
+    return headerValue(request, "x-github-event");
+  }
+
+  if (provider === "gitlab") {
+    return headerValue(request, "x-gitlab-event");
+  }
+
+  if (provider === "gitea") {
+    return headerValue(request, "x-gitea-event") ?? headerValue(request, "x-gogs-event") ?? headerValue(request, "x-github-event");
+  }
+
+  return headerValue(request, "x-siteflow-event");
+}
+
+function gitWebhookSignatureValid(provider: SourceProvider, request: IncomingMessage, rawBody: Buffer, secret: string, deliveryId: string) {
+  if (provider === "github") {
+    return verifyGitHubSignature(rawBody, headerValue(request, "x-hub-signature-256"), secret);
+  }
+
+  if (provider === "gitlab") {
+    return verifyGitLabSignature(rawBody, headerValues(request, "webhook-signature"), secret, deliveryId, headerValue(request, "webhook-timestamp"));
+  }
+
+  if (provider === "gitea") {
+    return verifyGiteaSignature(rawBody, headerValue(request, "x-gitea-signature") ?? headerValue(request, "x-gogs-signature"), headerValue(request, "x-hub-signature-256"), secret);
+  }
+
+  return verifySha256HexSignature(rawBody, headerValue(request, "x-siteflow-signature"), secret);
+}
+
+function gitWebhookProviderLabel(provider: SourceProvider) {
+  return provider === "gitea" ? "Gitea" : provider === "gitlab" ? "GitLab" : provider === "github" ? "GitHub" : "generic Git";
+}
+
+async function authorizeRequest(
   request: IncomingMessage,
   response: ServerResponse,
   options: SiteFlowServerOptions,
   permission: PermissionScope,
   projectId?: string
-) {
+): Promise<SiteFlowAuthPrincipal | undefined> {
   const token = bearerToken(request);
 
-  if (!options.apiToken && !token) {
-    return true;
+  if (token && options.apiToken && secretEquals(token, options.apiToken)) {
+    return rootApiTokenPrincipal();
   }
 
-  if (token && token === options.apiToken) {
-    return true;
+  if (token) {
+    const principal = await options.repository.resolveTokenPrincipal?.(token, projectId);
+    const scopes = principal?.scopes ?? await options.repository.resolveTokenPermissions(token, projectId);
+
+    if (scopes && hasPermission(scopes, permission)) {
+      return principal ?? fallbackApiTokenPrincipal(scopes);
+    }
+
+    sendJson(response, 403, { message: `SiteFlow API token does not include ${permission} permission.` }, options.allowedOrigin, request.method);
+    return undefined;
   }
+
+  const sessionToken = operatorSessionToken(request);
+
+  if (sessionToken) {
+    const principal = await options.repository.resolveSessionPrincipal?.(sessionToken, projectId);
+    const scopes = principal?.scopes ?? await options.repository.resolveSessionPermissions(sessionToken, projectId);
+
+    if (scopes && hasPermission(scopes, permission)) {
+      return authorizeOperatorSessionCsrf(request, response, options)
+        ? principal ?? fallbackOperatorSessionPrincipal(scopes)
+        : undefined;
+    }
+
+    if (scopes) {
+      sendJson(response, 403, { message: `SiteFlow operator session does not include ${permission} permission.` }, options.allowedOrigin, request.method);
+      return undefined;
+    }
+
+    sendJson(response, 401, { message: "SiteFlow operator session is invalid or expired." }, options.allowedOrigin, request.method);
+    return undefined;
+  }
+
+  if (!options.apiToken) {
+    sendJson(response, 503, { message: "SiteFlow API token is not configured." }, options.allowedOrigin, request.method);
+    return undefined;
+  }
+
+  sendJson(response, 401, { message: "SiteFlow API token is required." }, options.allowedOrigin, request.method);
+  return undefined;
+}
+
+async function authorizeBearerRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  options: SiteFlowServerOptions,
+  permission: PermissionScope,
+  projectId?: string
+): Promise<SiteFlowAuthPrincipal | undefined> {
+  const token = bearerToken(request);
 
   if (!token) {
     sendJson(response, 401, { message: "SiteFlow API token is required." }, options.allowedOrigin, request.method);
-    return false;
+    return undefined;
   }
 
-  if (await options.repository.authorizeToken(token, permission, projectId)) {
-    return true;
+  if (options.apiToken && secretEquals(token, options.apiToken)) {
+    return rootApiTokenPrincipal();
+  }
+
+  const principal = await options.repository.resolveTokenPrincipal?.(token, projectId);
+  const scopes = principal?.scopes ?? await options.repository.resolveTokenPermissions(token, projectId);
+
+  if (scopes && hasPermission(scopes, permission)) {
+    return principal ?? fallbackApiTokenPrincipal(scopes);
   }
 
   sendJson(response, 403, { message: `SiteFlow API token does not include ${permission} permission.` }, options.allowedOrigin, request.method);
-  return false;
+  return undefined;
+}
+
+function authorizeMetricsRequest(request: IncomingMessage, response: ServerResponse, options: SiteFlowServerOptions) {
+  const metricsToken = options.metricsToken?.trim();
+
+  if (!metricsToken) {
+    return true;
+  }
+
+  const token = bearerToken(request);
+
+  if (!token) {
+    sendJson(response, 401, { message: "SiteFlow metrics token is required." }, options.allowedOrigin, request.method);
+    return false;
+  }
+
+  if (!secretEquals(token, metricsToken)) {
+    sendJson(response, 403, { message: "SiteFlow metrics token is invalid." }, options.allowedOrigin, request.method);
+    return false;
+  }
+
+  return true;
 }
 
 async function authenticatedPermissions(request: IncomingMessage, options: SiteFlowServerOptions, projectId?: string): Promise<PermissionScope[]> {
   const token = bearerToken(request);
 
-  if (token && token === options.apiToken) {
+  if (token && options.apiToken && secretEquals(token, options.apiToken)) {
     return ["read", "write", "admin"];
   }
 
-  if (!token) {
-    return options.apiToken ? [] : ["read", "write", "admin"];
+  if (token) {
+    const principal = await options.repository.resolveTokenPrincipal?.(token, projectId);
+
+    return principal?.scopes ?? await options.repository.resolveTokenPermissions(token, projectId) ?? [];
   }
 
-  return await options.repository.resolveTokenPermissions(token, projectId) ?? [];
+  const sessionToken = operatorSessionToken(request);
+
+  if (!sessionToken) {
+    return [];
+  }
+
+  const principal = await options.repository.resolveSessionPrincipal?.(sessionToken, projectId);
+
+  return principal?.scopes ?? await options.repository.resolveSessionPermissions(sessionToken, projectId) ?? [];
 }
 
 function contentTypeFor(filePath: string) {
@@ -830,9 +2533,8 @@ async function selectEncodedArtifactFile(request: IncomingMessage, filePath: str
   return { filePath };
 }
 
-function imageRouteHost(request: IncomingMessage) {
-  const forwardedHost = firstHeaderToken(headerValue(request, "x-forwarded-host"));
-  const rawHost = forwardedHost || request.headers.host || "";
+function imageRouteHost(request: IncomingMessage, options?: SiteFlowServerOptions) {
+  const rawHost = requestHost(request, options);
   return rawHost.toLowerCase().split(":")[0];
 }
 
@@ -1158,12 +2860,26 @@ function redactionPatternsFor(values: Record<string, string> | undefined) {
 }
 
 function captureLogArg(value: unknown, secretPatterns: RegExp[]) {
+  const redactionOptions = { extraPatterns: secretPatterns };
+
   if (typeof value === "string") {
-    return redactLogLine(value, { extraPatterns: secretPatterns });
+    return redactLogLine(value, redactionOptions);
   }
 
   try {
-    return redactLogLine(JSON.stringify(value), { extraPatterns: secretPatterns });
+    const logValue = value instanceof Error
+      ? {
+          name: value.name,
+          message: value.message,
+          stack: value.stack,
+          ...Object.fromEntries(Object.entries(value))
+        }
+      : value;
+    const serialized = JSON.stringify(redactSecrets(logValue, redactionOptions));
+
+    return typeof serialized === "string"
+      ? redactLogLine(serialized, redactionOptions)
+      : redactLogLine(String(serialized), redactionOptions);
   } catch {
     return "[unserializable]";
   }
@@ -1257,6 +2973,396 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number) {
     if (timeout) {
       clearTimeout(timeout);
     }
+  }
+}
+
+interface IsolatedFunctionRuntimeResponse {
+  status: number;
+  headers: [string, string][];
+  setCookie?: string[];
+  bodyBase64?: string;
+}
+
+interface IsolatedFunctionRuntimeResult {
+  response: Response;
+  logs: string[];
+}
+
+class IsolatedFunctionRuntimeError extends Error {
+  readonly logs: string[];
+
+  constructor(message: string, logs: string[] = []) {
+    super(message);
+    this.name = "IsolatedFunctionRuntimeError";
+    this.logs = logs;
+  }
+}
+
+const isolatedFunctionRunnerScript = String.raw`
+const { createWriteStream } = require("node:fs");
+const { pathToFileURL } = require("node:url");
+
+const protocol = createWriteStream(null, { fd: 3 });
+const logs = [];
+
+function send(payload) {
+  protocol.end(JSON.stringify({ ...payload, logs }));
+}
+
+function readStdin() {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    process.stdin.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    process.stdin.on("error", reject);
+    process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+  });
+}
+
+function serializeLogArg(value) {
+  if (typeof value === "string") {
+    return value;
+  }
+
+  try {
+    if (value instanceof Error) {
+      return JSON.stringify({
+        name: value.name,
+        message: value.message,
+        stack: value.stack,
+        ...Object.fromEntries(Object.entries(value))
+      });
+    }
+
+    const serialized = JSON.stringify(value);
+    return typeof serialized === "string" ? serialized : String(value);
+  } catch {
+    return "[unserializable]";
+  }
+}
+
+for (const method of ["log", "warn", "error"]) {
+  console[method] = (...args) => {
+    logs.push(args.map(serializeLogArg).join(" "));
+  };
+}
+
+function responseStatusForbidsBody(status) {
+  return status === 204 || status === 205 || status === 304;
+}
+
+function responseBody(value) {
+  if (typeof value === "string" || value instanceof ArrayBuffer) {
+    return value;
+  }
+
+  if (ArrayBuffer.isView(value)) {
+    return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+  }
+
+  return String(value);
+}
+
+function responseHeadersFromObject(value) {
+  const headers = new Headers();
+
+  for (const [key, rawValue] of Object.entries(value ?? {})) {
+    if (typeof rawValue === "string") {
+      headers.set(key, rawValue);
+      continue;
+    }
+
+    if (Array.isArray(rawValue)) {
+      for (const entry of rawValue) {
+        if (typeof entry === "string") {
+          headers.append(key, entry);
+        }
+      }
+    }
+  }
+
+  return headers;
+}
+
+function runtimeResultToResponse(result) {
+  if (result instanceof Response) {
+    return result;
+  }
+
+  if (result === undefined || result === null) {
+    return new Response(null, { status: 204 });
+  }
+
+  if (typeof result === "string" || result instanceof ArrayBuffer || ArrayBuffer.isView(result)) {
+    return new Response(responseBody(result));
+  }
+
+  if (result && typeof result === "object" && !Array.isArray(result)) {
+    const status = typeof result.status === "number" ? result.status : 200;
+    const headers = responseHeadersFromObject(result.headers && typeof result.headers === "object" && !Array.isArray(result.headers) ? result.headers : undefined);
+    const body = result.body;
+
+    if (responseStatusForbidsBody(status)) {
+      return new Response(null, { status, headers });
+    }
+
+    if (body === undefined || body === null) {
+      return new Response(null, { status, headers });
+    }
+
+    if (typeof body === "string" || body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+      return new Response(responseBody(body), { status, headers });
+    }
+
+    if (!headers.has("content-type")) {
+      headers.set("content-type", "application/json; charset=utf-8");
+    }
+
+    return new Response(JSON.stringify(body), { status, headers });
+  }
+
+  return new Response(String(result));
+}
+
+(async () => {
+  try {
+    const payload = JSON.parse(await readStdin());
+    const requestBody = payload.request.bodyBase64 === undefined
+      ? undefined
+      : Buffer.from(payload.request.bodyBase64, "base64");
+    const request = new Request(payload.request.url, {
+      method: payload.request.method,
+      headers: payload.request.headers,
+      body: requestBody,
+      ...(requestBody ? { duplex: "half" } : {})
+    });
+    const runtimeModule = await import(pathToFileURL(payload.modulePath).href + "?siteflow_invocation=" + encodeURIComponent(payload.requestId));
+    const handler = payload.handler === "handler" ? runtimeModule.handler : runtimeModule.default ?? runtimeModule.handler;
+
+    if (typeof handler !== "function") {
+      throw new Error("Function " + payload.functionPath + " does not export a callable handler.");
+    }
+
+    const runtimeResponse = await runtimeResultToResponse(await handler(request, payload.context));
+    const body = responseStatusForbidsBody(runtimeResponse.status)
+      ? Buffer.alloc(0)
+      : Buffer.from(await runtimeResponse.arrayBuffer());
+    const setCookie = typeof runtimeResponse.headers.getSetCookie === "function"
+      ? runtimeResponse.headers.getSetCookie()
+      : [];
+    const headers = [];
+
+    runtimeResponse.headers.forEach((value, key) => {
+      if (key.toLowerCase() === "set-cookie" && setCookie.length > 0) {
+        return;
+      }
+
+      headers.push([key, value]);
+    });
+
+    send({
+      ok: true,
+      response: {
+        status: runtimeResponse.status,
+        headers,
+        setCookie,
+        bodyBase64: body.toString("base64")
+      }
+    });
+  } catch (error) {
+    send({
+      ok: false,
+      errorMessage: error instanceof Error ? error.message : "Function invocation failed."
+    });
+    process.exitCode = 1;
+  }
+})().catch((error) => {
+  send({
+    ok: false,
+    errorMessage: error instanceof Error ? error.message : "Function invocation failed."
+  });
+  process.exitCode = 1;
+});
+`;
+
+function isolatedFunctionEnvironment(runtimeEnvironment: Record<string, string>): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = { ...runtimeEnvironment };
+
+  for (const key of ["SystemRoot", "WINDIR", "TEMP", "TMP"]) {
+    if (process.env[key] !== undefined && environment[key] === undefined) {
+      environment[key] = process.env[key];
+    }
+  }
+
+  environment.SITEFLOW_FUNCTION_RUNTIME_ISOLATION = "isolated_process";
+  return environment;
+}
+
+async function readProcessPipe(pipe: NodeJS.ReadableStream | null | undefined): Promise<Buffer> {
+  if (!pipe) {
+    return Buffer.alloc(0);
+  }
+
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of pipe) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  return Buffer.concat(chunks);
+}
+
+function childOutputLogs(buffer: Buffer, label: string, secretPatterns: RegExp[]) {
+  const text = buffer.toString("utf8").trim();
+
+  if (!text) {
+    return [];
+  }
+
+  return text
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => redactLogLine(`${label}: ${line}`, { extraPatterns: secretPatterns }));
+}
+
+function isolatedRuntimeHeaders(headers: [string, string][], setCookie: string[] | undefined) {
+  const next = new Headers(headers);
+
+  for (const cookie of setCookie ?? []) {
+    next.append("set-cookie", cookie);
+  }
+
+  return next;
+}
+
+function headerEntries(headers: Headers): [string, string][] {
+  const entries: [string, string][] = [];
+  headers.forEach((value, key) => entries.push([key, value]));
+  return entries;
+}
+
+function isolatedRuntimeResponse(payload: IsolatedFunctionRuntimeResponse) {
+  const body = payload.bodyBase64 ? Buffer.from(payload.bodyBase64, "base64") : undefined;
+
+  return new Response(responseStatusForbidsBody(payload.status) ? null : body, {
+    status: payload.status,
+    headers: isolatedRuntimeHeaders(payload.headers, payload.setCookie)
+  });
+}
+
+function parseIsolatedRuntimeProtocol(value: Buffer) {
+  if (value.byteLength === 0) {
+    throw new Error("Isolated function runtime did not return a protocol response.");
+  }
+
+  const parsed: unknown = JSON.parse(value.toString("utf8"));
+
+  if (!isRecord(parsed)) {
+    throw new Error("Isolated function runtime returned an invalid protocol response.");
+  }
+
+  return parsed;
+}
+
+async function invokeIsolatedFunction(
+  functionPath: string,
+  entry: FunctionEntrypoint,
+  request: Request,
+  requestBody: Buffer | undefined,
+  context: {
+    params: Record<string, string>;
+    path: string;
+    requestId: string;
+    deploymentId: string;
+    env: Record<string, string>;
+  },
+  timeoutMs: number,
+  secretPatterns: RegExp[]
+): Promise<IsolatedFunctionRuntimeResult> {
+  const child = spawn(process.execPath, ["-e", isolatedFunctionRunnerScript], {
+    env: isolatedFunctionEnvironment(context.env),
+    stdio: ["pipe", "pipe", "pipe", "pipe"],
+    windowsHide: true
+  });
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    child.kill("SIGKILL");
+  }, timeoutMs);
+  const protocolPipe = child.stdio[3] as NodeJS.ReadableStream | null | undefined;
+  const stdout = readProcessPipe(child.stdout);
+  const stderr = readProcessPipe(child.stderr);
+  const protocol = readProcessPipe(protocolPipe);
+  const close = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
+
+  child.stdin.end(JSON.stringify({
+    modulePath: functionPath,
+    handler: entry.handler,
+    functionPath: entry.path,
+    requestId: context.requestId,
+    request: {
+      url: request.url,
+      method: request.method,
+      headers: headerEntries(request.headers),
+      bodyBase64: requestBody ? requestBody.toString("base64") : undefined
+    },
+    context
+  }));
+
+  try {
+    const [exit, stdoutBuffer, stderrBuffer, protocolBuffer] = await Promise.all([close, stdout, stderr, protocol]);
+    const directLogs = [
+      ...childOutputLogs(stdoutBuffer, "stdout", secretPatterns),
+      ...childOutputLogs(stderrBuffer, "stderr", secretPatterns)
+    ];
+
+    if (timedOut) {
+      throw new IsolatedFunctionRuntimeError(`Function invocation timed out after ${timeoutMs}ms.`, directLogs);
+    }
+
+    const payload = parseIsolatedRuntimeProtocol(protocolBuffer);
+    const runtimeLogs = Array.isArray(payload.logs)
+      ? payload.logs
+        .filter((entry): entry is string => typeof entry === "string")
+        .map((entry) => redactLogLine(entry, { extraPatterns: secretPatterns }))
+      : [];
+    const logs = [...runtimeLogs, ...directLogs];
+
+    if (payload.ok !== true) {
+      throw new IsolatedFunctionRuntimeError(
+        typeof payload.errorMessage === "string" ? payload.errorMessage : "Function invocation failed.",
+        logs
+      );
+    }
+
+    if (!isRecord(payload.response)) {
+      throw new IsolatedFunctionRuntimeError("Isolated function runtime returned an invalid response.", logs);
+    }
+
+    const responsePayload = payload.response;
+
+    if (
+      typeof responsePayload.status !== "number" ||
+      !Array.isArray(responsePayload.headers) ||
+      !responsePayload.headers.every((header) => Array.isArray(header) && typeof header[0] === "string" && typeof header[1] === "string") ||
+      (responsePayload.setCookie !== undefined && (!Array.isArray(responsePayload.setCookie) || !responsePayload.setCookie.every((cookie) => typeof cookie === "string"))) ||
+      (responsePayload.bodyBase64 !== undefined && typeof responsePayload.bodyBase64 !== "string")
+    ) {
+      throw new IsolatedFunctionRuntimeError("Isolated function runtime returned an invalid response payload.", logs);
+    }
+
+    if (exit.code !== 0) {
+      throw new IsolatedFunctionRuntimeError(`Isolated function runtime exited with code ${exit.code ?? "unknown"}.`, logs);
+    }
+
+    return {
+      response: isolatedRuntimeResponse(responsePayload as unknown as IsolatedFunctionRuntimeResponse),
+      logs
+    };
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -1540,9 +3646,19 @@ async function invokeFunctionRoute(context: RouteContext, route: ArtifactRoute, 
   const secretPatterns = redactionPatternsFor(runtimeEnvironment);
   const timeoutMs = entry.timeoutMs ?? 10000;
   const concurrencyLimit = entry.concurrency ?? 50;
+  const runtimeIsolation = entry.runtimeIsolation ?? "same_process";
   let releaseConcurrency: (() => void) | undefined;
 
   try {
+    if (options.productionRuntime && runtimeIsolation !== "isolated_process" && !options.allowSameProcessFunctionRuntime) {
+      responseStatus = 503;
+      errorMessage = `Same-process function runtime is disabled in production for ${entry.path}.`;
+      logs.push(redactLogLine(errorMessage, { extraPatterns: secretPatterns }));
+      response.setHeader("x-siteflow-function-runtime", "disabled");
+      sendJson(response, 503, { message: "Function runtime is disabled in production.", requestId }, options.allowedOrigin, requestMethod);
+      return;
+    }
+
     if (currentFunctionConcurrency(route, entry) >= concurrencyLimit) {
       responseStatus = 429;
       errorMessage = `Function concurrency limit exceeded for ${entry.path}.`;
@@ -1563,37 +3679,55 @@ async function invokeFunctionRoute(context: RouteContext, route: ArtifactRoute, 
     releaseConcurrency = enterFunctionInvocation(route, entry);
     const functionPath = safeFunctionPath(route, entry.sourcePath);
     const requestBody = requestMethod === "GET" || requestMethod === "HEAD" ? undefined : await readRawBody(request);
-    const runtimeRequest = new Request(new URL(request.url ?? "/", requestOrigin(request)), {
+    const runtimeRequest = new Request(new URL(request.url ?? "/", requestOrigin(request, options)), {
       method: requestMethod,
       headers: requestHeaders(request),
       body: requestBody,
       ...(requestBody ? { duplex: "half" } : {})
     } as RequestInit & { duplex?: "half" });
-    const module = await (options.functionModuleLoader ?? loadFunctionModule)(functionPath);
-    const handler = entry.handler === "handler" ? module.handler : module.default ?? module.handler;
+    const runtimeContext = {
+      params: {},
+      path: url.pathname,
+      requestId,
+      deploymentId: route.deploymentId,
+      env: runtimeEnvironment
+    };
+    let runtimeResponse: Response;
 
-    if (typeof handler !== "function") {
-      throw new Error(`Function ${entry.path} does not export a callable handler.`);
-    }
+    if (runtimeIsolation === "isolated_process") {
+      const isolated = await invokeIsolatedFunction(
+        functionPath,
+        entry,
+        runtimeRequest,
+        requestBody,
+        runtimeContext,
+        timeoutMs,
+        secretPatterns
+      );
+      runtimeResponse = isolated.response;
+      logs = isolated.logs;
+      response.setHeader("x-siteflow-function-runtime", "isolated_process");
+    } else {
+      const module = await (options.functionModuleLoader ?? loadFunctionModule)(functionPath);
+      const handler = entry.handler === "handler" ? module.handler : module.default ?? module.handler;
 
-    const captured = await captureFunctionLogs(
-      () => withTimeout(
-        withRuntimeEnvironment(
-          runtimeEnvironment,
-          async () => runtimeResultToResponse(await handler(runtimeRequest, {
-            params: {},
-            path: url.pathname,
-            requestId,
-            deploymentId: route.deploymentId,
-            env: runtimeEnvironment
-          }))
+      if (typeof handler !== "function") {
+        throw new Error(`Function ${entry.path} does not export a callable handler.`);
+      }
+
+      const captured = await captureFunctionLogs(
+        () => withTimeout(
+          withRuntimeEnvironment(
+            runtimeEnvironment,
+            async () => runtimeResultToResponse(await handler(runtimeRequest, runtimeContext))
+          ),
+          timeoutMs
         ),
-        timeoutMs
-      ),
-      secretPatterns
-    );
-    const runtimeResponse = captured.value;
-    logs = captured.logs;
+        secretPatterns
+      );
+      runtimeResponse = captured.value;
+      logs = captured.logs;
+    }
     responseStatus = runtimeResponse.status;
 
     response.statusCode = runtimeResponse.status;
@@ -1621,9 +3755,19 @@ async function invokeFunctionRoute(context: RouteContext, route: ArtifactRoute, 
     }
   } catch (error) {
     errorMessage = error instanceof Error ? error.message : "Function invocation failed.";
+    if (error instanceof IsolatedFunctionRuntimeError) {
+      logs.push(...error.logs);
+    }
     logs.push(redactLogLine(errorMessage, { extraPatterns: secretPatterns }));
-    responseStatus = /timed out/i.test(errorMessage) ? 504 : 500;
-    sendJson(response, responseStatus, { message: responseStatus === 504 ? "Function invocation timed out." : "Function invocation failed.", requestId }, options.allowedOrigin, requestMethod);
+
+    if (error instanceof RequestBodyTooLargeError) {
+      responseStatus = 413;
+      destroyRequestAfterResponse(request, response);
+      sendJson(response, 413, { message: error.message, requestId }, options.allowedOrigin, requestMethod);
+    } else {
+      responseStatus = /timed out/i.test(errorMessage) ? 504 : 500;
+      sendJson(response, responseStatus, { message: responseStatus === 504 ? "Function invocation timed out." : "Function invocation failed.", requestId }, options.allowedOrigin, requestMethod);
+    }
   } finally {
     releaseConcurrency?.();
     await options.repository.recordFunctionInvocation({
@@ -1645,14 +3789,14 @@ async function invokeFunctionRoute(context: RouteContext, route: ArtifactRoute, 
 
 async function tryServeArtifactRoute(context: RouteContext, options: SiteFlowServerOptions) {
   const { request, response, url } = context;
-  const rawHost = firstHeaderToken(headerValue(request, "x-forwarded-host")) || request.headers.host || "";
+  const rawHost = requestHost(request, options);
   const host = rawHost.toLowerCase().split(":")[0];
 
   if (!host) {
     return false;
   }
 
-  const route = await options.repository.resolveArtifactRoute(host, requestBucketKey(request));
+  const route = await options.repository.resolveArtifactRoute(host, requestBucketKey(request, options));
 
   if (!route) {
     return false;
@@ -1661,7 +3805,7 @@ async function tryServeArtifactRoute(context: RouteContext, options: SiteFlowSer
   if (route.projectId) {
     const firewall = await options.repository.evaluateFirewall({
       projectId: route.projectId,
-      ip: requestIp(request),
+      ip: requestIp(request, options),
       path: url.pathname,
       method: request.method ?? "GET",
       headers: lowerCaseRequestHeaders(request),
@@ -1852,13 +3996,13 @@ async function tryServeImageOptimizationRoute(context: RouteContext, options: Si
     return true;
   }
 
-  const host = imageRouteHost(request);
+  const host = imageRouteHost(request, options);
 
   if (!host) {
     throw new ImageOptimizationInputError("Image optimization requires a request host.");
   }
 
-  const route = await options.repository.resolveArtifactRoute(host, requestBucketKey(request));
+  const route = await options.repository.resolveArtifactRoute(host, requestBucketKey(request, options));
 
   if (!route) {
     throw new SiteFlowNotFoundError("Image optimization route was not found.");
@@ -1936,7 +4080,7 @@ async function tryServeImageOptimizationRoute(context: RouteContext, options: Si
   return true;
 }
 
-async function handleApiRoute(context: RouteContext, options: SiteFlowServerOptions) {
+async function handleApiRoute(context: RouteContext, options: SiteFlowServerOptions, rateLimitBuckets: Map<string, RateLimitBucket>, metrics: SiteFlowHttpMetrics) {
   const { request, response, segments, url } = context;
   const repository = options.repository;
 
@@ -1945,8 +4089,32 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     return;
   }
 
-  if ((request.method === "GET" || request.method === "HEAD") && segments.length === 3 && segments[0] === "api" && segments[1] === "auth" && segments[2] === "verify") {
-    if (!await authorizeMutation(request, response, options, "read")) {
+  if ((request.method === "GET" || request.method === "HEAD") && segments.length === 1 && segments[0] === "readyz") {
+    const result = await readinessBody(options);
+    sendJson(response, result.statusCode, result.body, options.allowedOrigin, request.method);
+    return;
+  }
+
+  if ((request.method === "GET" || request.method === "HEAD") && segments.length === 1 && segments[0] === "metrics") {
+    if (!authorizeMetricsRequest(request, response, options)) {
+      return;
+    }
+
+    sendText(response, 200, await renderHttpMetrics(metrics, options.runtimeMetricsCollector), options.allowedOrigin, request.method);
+    return;
+  }
+
+  if (segments[0] !== "api") {
+    notFound(response, options.allowedOrigin, request.method);
+    return;
+  }
+
+  if (!allowApiRequest(request, response, options, rateLimitBuckets)) {
+    return;
+  }
+
+  if ((request.method === "GET" || request.method === "HEAD") && segments.length === 3 && segments[1] === "auth" && segments[2] === "verify") {
+    if (!await authorizeRequest(request, response, options, "read")) {
       return;
     }
 
@@ -1960,13 +4128,103 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     return;
   }
 
-  if (segments[0] !== "api") {
-    notFound(response, options.allowedOrigin, request.method);
+  if (request.method === "POST" && segments.length === 3 && segments[1] === "auth" && segments[2] === "session") {
+    const auth = await authorizeRequest(request, response, options, "admin");
+    if (!auth) {
+      return;
+    }
+
+    const command = {
+      ...operatorSessionCommandFromBody(await readJsonBody(request)),
+      actor: auth.actor
+    };
+    const ttlSeconds = command.ttlSeconds ?? 3600;
+    const result = await repository.createOperatorSession(command);
+    appendSetCookie(response, operatorSessionCookie(result.secret, result.session.expiresAt, ttlSeconds, request, options));
+    sendJson(response, 201, operatorSessionResponse(result), options.allowedOrigin);
+    return;
+  }
+
+  if (request.method === "POST" && segments.length === 4 && segments[1] === "auth" && segments[2] === "session" && segments[3] === "rotate") {
+    const sessionToken = operatorSessionToken(request);
+
+    if (!sessionToken) {
+      appendSetCookie(response, expiredOperatorSessionCookie(request, options));
+      sendJson(response, 401, { message: "SiteFlow operator session is required." }, options.allowedOrigin);
+      return;
+    }
+
+    const principal = await repository.resolveSessionPrincipal?.(sessionToken) ?? undefined;
+    const scopes = principal?.scopes ?? await repository.resolveSessionPermissions(sessionToken);
+
+    if (!scopes) {
+      appendSetCookie(response, expiredOperatorSessionCookie(request, options));
+      sendJson(response, 401, { message: "SiteFlow operator session is invalid or expired." }, options.allowedOrigin);
+      return;
+    }
+
+    if (!authorizeOperatorSessionCsrf(request, response, options)) {
+      return;
+    }
+
+    const result = await repository.rotateOperatorSession(sessionToken);
+
+    if (!result) {
+      appendSetCookie(response, expiredOperatorSessionCookie(request, options));
+      sendJson(response, 401, { message: "SiteFlow operator session is invalid or expired." }, options.allowedOrigin);
+      return;
+    }
+
+    appendSetCookie(response, operatorSessionCookie(result.secret, result.session.expiresAt, result.maxAgeSeconds, request, options));
+    sendJson(response, 200, operatorSessionResponse(result), options.allowedOrigin);
+    return;
+  }
+
+  if (request.method === "DELETE" && segments.length === 3 && segments[1] === "auth" && segments[2] === "session") {
+    const sessionToken = operatorSessionToken(request);
+
+    if (!sessionToken) {
+      appendSetCookie(response, expiredOperatorSessionCookie(request, options));
+      sendJson(response, 401, { message: "SiteFlow operator session is required." }, options.allowedOrigin);
+      return;
+    }
+
+    const principal = await repository.resolveSessionPrincipal?.(sessionToken) ?? undefined;
+    const scopes = principal?.scopes ?? await repository.resolveSessionPermissions(sessionToken);
+
+    if (!scopes) {
+      appendSetCookie(response, expiredOperatorSessionCookie(request, options));
+      sendJson(response, 401, { message: "SiteFlow operator session is invalid or expired." }, options.allowedOrigin);
+      return;
+    }
+
+    if (!authorizeOperatorSessionCsrf(request, response, options)) {
+      return;
+    }
+
+    const result = await repository.revokeOperatorSession(sessionToken);
+    appendSetCookie(response, expiredOperatorSessionCookie(request, options));
+    sendJson(response, 200, result, options.allowedOrigin);
+    return;
+  }
+
+  if (request.method === "POST" && segments.length === 4 && segments[1] === "auth" && segments[2] === "sessions" && segments[3] === "revoke-all") {
+    const auth = await authorizeBearerRequest(request, response, options, "admin");
+    if (!auth) {
+      return;
+    }
+
+    sendJson(
+      response,
+      200,
+      await repository.revokeAllOperatorSessions(operatorSessionRevokeAllCommandFromBody(await readJsonBody(request), auth.actor)),
+      options.allowedOrigin
+    );
     return;
   }
 
   if (request.method === "POST" && segments.length === 4 && segments[1] === "deploy-hooks" && segments[2] && segments[3] === "trigger") {
-    const body = (await readJsonBody(request)) as Record<string, unknown>;
+    const body = bodyWithoutClientPrincipal(await readJsonBody(request));
     const result = await repository.triggerDeployHook({
       ...body,
       token: decodeURIComponent(segments[2])
@@ -1976,37 +4234,56 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     return;
   }
 
-  if (request.method === "POST" && segments.length === 4 && segments[1] === "webhooks" && segments[2] === "git" && segments[3] === "github") {
-    if (!options.githubWebhookSecret) {
-      sendJson(response, 503, { message: "GitHub webhook secret is not configured." }, options.allowedOrigin);
+  if (request.method === "POST" && segments.length === 4 && segments[1] === "webhooks" && segments[2] === "git" && segments[3]) {
+    const provider = decodeURIComponent(segments[3]) as SourceProvider;
+
+    if (!supportedGitWebhookProviders.has(provider)) {
+      sendJson(response, 404, { message: `Unsupported git webhook provider: ${provider}.` }, options.allowedOrigin);
       return;
     }
 
-    const deliveryId = headerValue(request, "x-github-delivery");
-    const eventName = headerValue(request, "x-github-event");
+    const label = gitWebhookProviderLabel(provider);
+    const secret = gitWebhookSecret(provider, options);
+
+    if (!secret) {
+      sendJson(response, 503, { message: `${label} webhook secret is not configured.` }, options.allowedOrigin);
+      return;
+    }
+
+    const deliveryId = gitWebhookDeliveryId(provider, request);
+    const eventName = gitWebhookEventName(provider, request);
 
     if (!deliveryId || !eventName) {
-      sendJson(response, 400, { message: "GitHub delivery and event headers are required." }, options.allowedOrigin);
+      sendJson(response, 400, { message: `${label} delivery and event headers are required.` }, options.allowedOrigin);
       return;
     }
 
     const rawBody = await readRawBody(request);
 
-    if (!verifyGitHubSignature(rawBody, headerValue(request, "x-hub-signature-256"), options.githubWebhookSecret)) {
-      sendJson(response, 401, { message: "GitHub webhook signature verification failed." }, options.allowedOrigin);
+    if (!gitWebhookSignatureValid(provider, request, rawBody, secret, deliveryId)) {
+      sendJson(response, 401, { message: `${label} webhook signature verification failed.` }, options.allowedOrigin);
       return;
     }
 
-    const payload = rawBody.toString("utf8").trim() ? JSON.parse(rawBody.toString("utf8")) as unknown : {};
-    const event = normalizeGitHubWebhook(eventName, payload, deliveryId);
+    let event: SourceEventInput | undefined;
+
+    try {
+      const payload = parseGitWebhookPayload(provider, request, rawBody);
+      event = normalizeGitWebhook(provider, eventName, payload, deliveryId);
+    } catch (error) {
+      sendJson(response, 400, {
+        message: error instanceof Error ? error.message : `${label} webhook payload is invalid.`
+      }, options.allowedOrigin);
+      return;
+    }
 
     if (!event) {
-      sendJson(response, 202, { status: "ignored", message: `GitHub ${eventName} webhook ignored.` }, options.allowedOrigin);
+      sendJson(response, 202, { status: "ignored", message: `${label} ${eventName} webhook ignored.` }, options.allowedOrigin);
       return;
     }
 
     const result = await repository.ingestGitWebhook({
-      provider: "github",
+      provider,
       deliveryId,
       event
     });
@@ -2016,38 +4293,63 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
   }
 
   if ((request.method === "GET" || request.method === "HEAD") && segments.length === 2 && segments[1] === "projects") {
+    if (!await authorizeRequest(request, response, options, "read")) {
+      return;
+    }
+
     sendJson(response, 200, await repository.listProjects(), options.allowedOrigin, request.method);
     return;
   }
 
   if (request.method === "POST" && segments.length === 2 && segments[1] === "projects") {
-    if (!await authorizeMutation(request, response, options, "admin")) {
+    const auth = await authorizeRequest(request, response, options, "admin");
+    if (!auth) {
       return;
     }
 
-    sendJson(response, 201, await repository.createProject((await readJsonBody(request)) as never), options.allowedOrigin);
+    sendJson(response, 201, await repository.createProject(bodyWithActor(await readJsonBody(request), auth.actor) as never), options.allowedOrigin);
     return;
   }
 
   if (segments[1] === "projects" && segments[2]) {
     const projectId = decodeURIComponent(segments[2]);
 
+    if (request.method === "POST" && segments.length === 6 && segments[3] === "auth" && segments[4] === "sessions" && segments[5] === "revoke-all") {
+      const auth = await authorizeBearerRequest(request, response, options, "admin", projectId);
+      if (!auth) {
+        return;
+      }
+
+      sendJson(
+        response,
+        200,
+        await repository.revokeAllOperatorSessions(operatorSessionRevokeAllCommandFromBody(await readJsonBody(request), auth.actor, projectId)),
+        options.allowedOrigin
+      );
+      return;
+    }
+
     if ((request.method === "GET" || request.method === "HEAD") && segments.length === 3) {
+      if (!await authorizeRequest(request, response, options, "read", projectId)) {
+        return;
+      }
+
       sendJson(response, 200, await repository.getProject(projectId), options.allowedOrigin, request.method);
       return;
     }
 
     if (request.method === "PATCH" && segments.length === 3) {
-      if (!await authorizeMutation(request, response, options, "admin", projectId)) {
+      const auth = await authorizeRequest(request, response, options, "admin", projectId);
+      if (!auth) {
         return;
       }
 
-      sendJson(response, 200, await repository.updateProject(projectId, (await readJsonBody(request)) as never), options.allowedOrigin);
+      sendJson(response, 200, await repository.updateProject(projectId, bodyWithActor(await readJsonBody(request), auth.actor) as never), options.allowedOrigin);
       return;
     }
 
     if (request.method === "DELETE" && segments.length === 3) {
-      if (!await authorizeMutation(request, response, options, "admin", projectId)) {
+      if (!await authorizeRequest(request, response, options, "admin", projectId)) {
         return;
       }
 
@@ -2056,7 +4358,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if ((request.method === "GET" || request.method === "HEAD") && segments.length === 4 && segments[3] === "settings") {
-      if (!await authorizeMutation(request, response, options, "read", projectId)) {
+      if (!await authorizeRequest(request, response, options, "read", projectId)) {
         return;
       }
 
@@ -2074,11 +4376,19 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if ((request.method === "GET" || request.method === "HEAD") && segments.length === 4 && segments[3] === "environments") {
+      if (!await authorizeRequest(request, response, options, "read", projectId)) {
+        return;
+      }
+
       sendJson(response, 200, await repository.getProjectEnvironmentSettings(projectId), options.allowedOrigin, request.method);
       return;
     }
 
     if ((request.method === "GET" || request.method === "HEAD") && segments.length === 4 && segments[3] === "analytics") {
+      if (!await authorizeRequest(request, response, options, "read", projectId)) {
+        return;
+      }
+
       sendJson(response, 200, await repository.getAnalyticsDashboard(projectId), options.allowedOrigin, request.method);
       return;
     }
@@ -2088,7 +4398,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
         response,
         202,
         await repository.ingestAnalyticsEvent({
-          ...((await readJsonBody(request)) as Record<string, unknown>),
+          ...bodyWithoutClientPrincipal(await readJsonBody(request)),
           projectId
         } as never),
         options.allowedOrigin
@@ -2097,12 +4407,16 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if ((request.method === "GET" || request.method === "HEAD") && segments.length === 4 && segments[3] === "logs") {
+      if (!await authorizeRequest(request, response, options, "read", projectId)) {
+        return;
+      }
+
       sendJson(response, 200, await repository.queryLogs(logQueryFromUrl(projectId, url) as never), options.allowedOrigin, request.method);
       return;
     }
 
     if ((request.method === "GET" || request.method === "HEAD") && segments.length === 4 && segments[3] === "log-queries") {
-      if (!await authorizeMutation(request, response, options, "read", projectId)) {
+      if (!await authorizeRequest(request, response, options, "read", projectId)) {
         return;
       }
 
@@ -2111,7 +4425,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if (request.method === "POST" && segments.length === 4 && segments[3] === "log-queries") {
-      if (!await authorizeMutation(request, response, options, "write", projectId)) {
+      const auth = await authorizeRequest(request, response, options, "write", projectId);
+      if (!auth) {
         return;
       }
 
@@ -2119,7 +4434,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
         response,
         201,
         await repository.saveLogQuery({
-          ...((await readJsonBody(request)) as Record<string, unknown>),
+          ...bodyWithActor(await readJsonBody(request), auth.actor),
           projectId
         } as never),
         options.allowedOrigin
@@ -2128,7 +4443,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if ((request.method === "GET" || request.method === "HEAD") && segments.length === 4 && segments[3] === "log-drains") {
-      if (!await authorizeMutation(request, response, options, "read", projectId)) {
+      if (!await authorizeRequest(request, response, options, "read", projectId)) {
         return;
       }
 
@@ -2137,7 +4452,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if (request.method === "POST" && segments.length === 4 && segments[3] === "log-drains") {
-      if (!await authorizeMutation(request, response, options, "admin", projectId)) {
+      const auth = await authorizeRequest(request, response, options, "admin", projectId);
+      if (!auth) {
         return;
       }
 
@@ -2145,7 +4461,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
         response,
         201,
         await repository.createLogDrain({
-          ...((await readJsonBody(request)) as Record<string, unknown>),
+          ...bodyWithActor(await readJsonBody(request), auth.actor),
           projectId
         } as never),
         options.allowedOrigin
@@ -2154,11 +4470,12 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if (request.method === "POST" && segments.length === 6 && segments[3] === "log-drains" && segments[5] === "deliver") {
-      if (!await authorizeMutation(request, response, options, "admin", projectId)) {
+      const auth = await authorizeRequest(request, response, options, "admin", projectId);
+      if (!auth) {
         return;
       }
 
-      const body = (await readJsonBody(request)) as Record<string, unknown>;
+      const body = bodyWithActor(await readJsonBody(request), auth.actor);
       const plan = await repository.prepareLogDrainDelivery({
         ...body,
         projectId,
@@ -2170,7 +4487,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if (request.method === "POST" && segments.length === 4 && segments[3] === "environment-variables") {
-      if (!await authorizeMutation(request, response, options, "admin", projectId)) {
+      const auth = await authorizeRequest(request, response, options, "admin", projectId);
+      if (!auth) {
         return;
       }
 
@@ -2178,7 +4496,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
         response,
         200,
         await repository.upsertEnvironmentVariable({
-          ...((await readJsonBody(request)) as Record<string, unknown>),
+          ...bodyWithActor(await readJsonBody(request), auth.actor),
           projectId
         } as never),
         options.allowedOrigin
@@ -2187,7 +4505,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if (request.method === "POST" && segments.length === 4 && segments[3] === "team-members") {
-      if (!await authorizeMutation(request, response, options, "admin", projectId)) {
+      const auth = await authorizeRequest(request, response, options, "admin", projectId);
+      if (!auth) {
         return;
       }
 
@@ -2195,7 +4514,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
         response,
         200,
         await repository.upsertTeamMember({
-          ...((await readJsonBody(request)) as Record<string, unknown>),
+          ...bodyWithRequestedBy(await readJsonBody(request), auth.actor),
           projectId
         } as never),
         options.allowedOrigin
@@ -2204,7 +4523,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if (request.method === "DELETE" && segments.length === 5 && segments[3] === "team-members") {
-      if (!await authorizeMutation(request, response, options, "admin", projectId)) {
+      const auth = await authorizeRequest(request, response, options, "admin", projectId);
+      if (!auth) {
         return;
       }
 
@@ -2212,7 +4532,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
         response,
         200,
         await repository.removeTeamMember({
-          ...((await readJsonBody(request)) as Record<string, unknown>),
+          ...bodyWithRequestedBy(await readJsonBody(request), auth.actor),
           projectId,
           memberId: decodeURIComponent(segments[4])
         } as never),
@@ -2222,7 +4542,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if (request.method === "POST" && segments.length === 4 && segments[3] === "api-tokens") {
-      if (!await authorizeMutation(request, response, options, "admin", projectId)) {
+      const auth = await authorizeRequest(request, response, options, "admin", projectId);
+      if (!auth) {
         return;
       }
 
@@ -2230,7 +4551,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
         response,
         201,
         await repository.createApiToken({
-          ...((await readJsonBody(request)) as Record<string, unknown>),
+          ...bodyWithActor(await readJsonBody(request), auth.actor),
           projectId
         } as never),
         options.allowedOrigin
@@ -2239,7 +4560,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if (request.method === "DELETE" && segments.length === 5 && segments[3] === "api-tokens") {
-      if (!await authorizeMutation(request, response, options, "admin", projectId)) {
+      const auth = await authorizeRequest(request, response, options, "admin", projectId);
+      if (!auth) {
         return;
       }
 
@@ -2247,7 +4569,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
         response,
         200,
         await repository.revokeApiToken({
-          ...((await readJsonBody(request)) as Record<string, unknown>),
+          ...bodyWithActor(await readJsonBody(request), auth.actor),
           projectId,
           tokenId: decodeURIComponent(segments[4])
         } as never),
@@ -2257,7 +4579,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if ((request.method === "GET" || request.method === "HEAD") && segments.length === 4 && segments[3] === "firewall-rules") {
-      if (!await authorizeMutation(request, response, options, "read", projectId)) {
+      if (!await authorizeRequest(request, response, options, "read", projectId)) {
         return;
       }
 
@@ -2266,7 +4588,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if (request.method === "POST" && segments.length === 4 && segments[3] === "firewall-rules") {
-      if (!await authorizeMutation(request, response, options, "admin", projectId)) {
+      const auth = await authorizeRequest(request, response, options, "admin", projectId);
+      if (!auth) {
         return;
       }
 
@@ -2274,7 +4597,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
         response,
         201,
         await repository.createFirewallRule({
-          ...((await readJsonBody(request)) as Record<string, unknown>),
+          ...bodyWithActor(await readJsonBody(request), auth.actor),
           projectId
         } as never),
         options.allowedOrigin
@@ -2283,7 +4606,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if (request.method === "DELETE" && segments.length === 5 && segments[3] === "firewall-rules") {
-      if (!await authorizeMutation(request, response, options, "admin", projectId)) {
+      const auth = await authorizeRequest(request, response, options, "admin", projectId);
+      if (!auth) {
         return;
       }
 
@@ -2291,7 +4615,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
         response,
         200,
         await repository.disableFirewallRule({
-          ...((await readJsonBody(request)) as Record<string, unknown>),
+          ...bodyWithActor(await readJsonBody(request), auth.actor),
           projectId,
           ruleId: decodeURIComponent(segments[4])
         } as never),
@@ -2301,7 +4625,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if ((request.method === "GET" || request.method === "HEAD") && segments.length === 4 && segments[3] === "edge-config") {
-      if (!await authorizeMutation(request, response, options, "read", projectId)) {
+      if (!await authorizeRequest(request, response, options, "read", projectId)) {
         return;
       }
 
@@ -2310,7 +4634,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if (request.method === "PUT" && segments.length === 5 && segments[3] === "edge-config") {
-      if (!await authorizeMutation(request, response, options, "admin", projectId)) {
+      const auth = await authorizeRequest(request, response, options, "admin", projectId);
+      if (!auth) {
         return;
       }
 
@@ -2318,7 +4643,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
         response,
         200,
         await repository.upsertEdgeConfig({
-          ...((await readJsonBody(request)) as Record<string, unknown>),
+          ...bodyWithActor(await readJsonBody(request), auth.actor),
           projectId,
           key: decodeURIComponent(segments[4])
         } as never),
@@ -2328,7 +4653,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if (request.method === "DELETE" && segments.length === 5 && segments[3] === "edge-config") {
-      if (!await authorizeMutation(request, response, options, "admin", projectId)) {
+      const auth = await authorizeRequest(request, response, options, "admin", projectId);
+      if (!auth) {
         return;
       }
 
@@ -2336,7 +4662,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
         response,
         200,
         await repository.deleteEdgeConfig({
-          ...((await readJsonBody(request)) as Record<string, unknown>),
+          ...bodyWithActor(await readJsonBody(request), auth.actor),
           projectId,
           key: decodeURIComponent(segments[4])
         } as never),
@@ -2347,7 +4673,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
 
     if (segments[3] === "blobs") {
       if ((request.method === "GET" || request.method === "HEAD") && segments.length === 4) {
-        if (!await authorizeMutation(request, response, options, "read", projectId)) {
+        if (!await authorizeRequest(request, response, options, "read", projectId)) {
           return;
         }
 
@@ -2367,7 +4693,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
       }
 
       if (request.method === "POST" && segments.length === 4) {
-        if (!await authorizeMutation(request, response, options, "write", projectId)) {
+        const auth = await authorizeRequest(request, response, options, "write", projectId);
+        if (!auth) {
           return;
         }
 
@@ -2375,7 +4702,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
           response,
           201,
           await repository.putBlob({
-            ...((await readJsonBody(request)) as Record<string, unknown>),
+            ...bodyWithActor(await readJsonBody(request), auth.actor),
             projectId
           } as never),
           options.allowedOrigin
@@ -2387,7 +4714,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
         const pathname = decodeURIComponent(segments.slice(4).join("/"));
 
         if (request.method === "GET" || request.method === "HEAD") {
-          if (!await authorizeMutation(request, response, options, "read", projectId)) {
+          if (!await authorizeRequest(request, response, options, "read", projectId)) {
             return;
           }
 
@@ -2405,7 +4732,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
         }
 
         if (request.method === "DELETE") {
-          if (!await authorizeMutation(request, response, options, "write", projectId)) {
+          const auth = await authorizeRequest(request, response, options, "write", projectId);
+          if (!auth) {
             return;
           }
 
@@ -2413,7 +4741,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
             response,
             200,
             await repository.deleteBlob({
-              ...((await readJsonBody(request)) as Record<string, unknown>),
+              ...bodyWithActor(await readJsonBody(request), auth.actor),
               projectId,
               pathname
             } as never),
@@ -2426,7 +4754,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
 
     if (segments[3] === "cache") {
       if ((request.method === "GET" || request.method === "HEAD") && segments.length === 4) {
-        if (!await authorizeMutation(request, response, options, "read", projectId)) {
+        if (!await authorizeRequest(request, response, options, "read", projectId)) {
           return;
         }
 
@@ -2447,7 +4775,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
       }
 
       if (request.method === "POST" && segments.length === 5 && segments[4] === "purge") {
-        if (!await authorizeMutation(request, response, options, "write", projectId)) {
+        const auth = await authorizeRequest(request, response, options, "write", projectId);
+        if (!auth) {
           return;
         }
 
@@ -2455,7 +4784,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
           response,
           200,
           await repository.purgeCache({
-            ...((await readJsonBody(request)) as Record<string, unknown>),
+            ...bodyWithActor(await readJsonBody(request), auth.actor),
             projectId
           } as never),
           options.allowedOrigin
@@ -2466,7 +4795,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
 
     if (segments[3] === "functions") {
       if ((request.method === "GET" || request.method === "HEAD") && segments.length === 4) {
-        if (!await authorizeMutation(request, response, options, "read", projectId)) {
+        if (!await authorizeRequest(request, response, options, "read", projectId)) {
           return;
         }
 
@@ -2484,7 +4813,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
       }
 
       if ((request.method === "GET" || request.method === "HEAD") && segments.length >= 5) {
-        if (!await authorizeMutation(request, response, options, "read", projectId)) {
+        if (!await authorizeRequest(request, response, options, "read", projectId)) {
           return;
         }
 
@@ -2506,7 +4835,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
 
     if (segments[3] === "routing-rules") {
       if ((request.method === "GET" || request.method === "HEAD") && segments.length === 4) {
-        if (!await authorizeMutation(request, response, options, "read", projectId)) {
+        if (!await authorizeRequest(request, response, options, "read", projectId)) {
           return;
         }
 
@@ -2525,7 +4854,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
       }
 
       if ((request.method === "GET" || request.method === "HEAD") && segments.length === 5 && segments[4] === "match") {
-        if (!await authorizeMutation(request, response, options, "read", projectId)) {
+        if (!await authorizeRequest(request, response, options, "read", projectId)) {
           return;
         }
 
@@ -2543,7 +4872,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
       }
 
       if (request.method === "PUT" && segments.length === 4) {
-        if (!await authorizeMutation(request, response, options, "admin", projectId)) {
+        const auth = await authorizeRequest(request, response, options, "admin", projectId);
+        if (!auth) {
           return;
         }
 
@@ -2551,7 +4881,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
           response,
           200,
           await repository.upsertRoutingRule({
-            ...((await readJsonBody(request)) as Record<string, unknown>),
+            ...bodyWithActor(await readJsonBody(request), auth.actor),
             projectId
           } as never),
           options.allowedOrigin
@@ -2560,7 +4890,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
       }
 
       if (request.method === "DELETE" && segments.length === 5) {
-        if (!await authorizeMutation(request, response, options, "admin", projectId)) {
+        const auth = await authorizeRequest(request, response, options, "admin", projectId);
+        if (!auth) {
           return;
         }
 
@@ -2568,7 +4899,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
           response,
           200,
           await repository.disableRoutingRule({
-            ...((await readJsonBody(request)) as Record<string, unknown>),
+            ...bodyWithActor(await readJsonBody(request), auth.actor),
             projectId,
             ruleId: decodeURIComponent(segments[4])
           } as never),
@@ -2579,7 +4910,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if ((request.method === "GET" || request.method === "HEAD") && segments.length === 4 && segments[3] === "deploy-hooks") {
-      if (!await authorizeMutation(request, response, options, "read", projectId)) {
+      if (!await authorizeRequest(request, response, options, "read", projectId)) {
         return;
       }
 
@@ -2588,12 +4919,13 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if (request.method === "POST" && segments.length === 4 && segments[3] === "deploy-hooks") {
-      if (!await authorizeMutation(request, response, options, "admin", projectId)) {
+      const auth = await authorizeRequest(request, response, options, "admin", projectId);
+      if (!auth) {
         return;
       }
 
       const result = await repository.createDeployHook({
-        ...((await readJsonBody(request)) as Record<string, unknown>),
+        ...bodyWithActor(await readJsonBody(request), auth.actor),
         projectId
       } as never);
 
@@ -2602,7 +4934,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
         201,
         {
           ...result,
-          hookUrl: result.hookUrl ?? deployHookUrl(request, result.token)
+          hookUrl: result.hookUrl ?? deployHookUrl(request, result.token, options)
         },
         options.allowedOrigin
       );
@@ -2610,7 +4942,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if (request.method === "DELETE" && segments.length === 5 && segments[3] === "deploy-hooks") {
-      if (!await authorizeMutation(request, response, options, "admin", projectId)) {
+      const auth = await authorizeRequest(request, response, options, "admin", projectId);
+      if (!auth) {
         return;
       }
 
@@ -2618,7 +4951,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
         response,
         200,
         await repository.revokeDeployHook({
-          ...((await readJsonBody(request)) as Record<string, unknown>),
+          ...bodyWithActor(await readJsonBody(request), auth.actor),
           projectId,
           hookId: decodeURIComponent(segments[4])
         } as never),
@@ -2628,7 +4961,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if ((request.method === "GET" || request.method === "HEAD") && segments.length === 4 && segments[3] === "cron-jobs") {
-      if (!await authorizeMutation(request, response, options, "read", projectId)) {
+      if (!await authorizeRequest(request, response, options, "read", projectId)) {
         return;
       }
 
@@ -2637,7 +4970,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if (request.method === "POST" && segments.length === 4 && segments[3] === "cron-jobs") {
-      if (!await authorizeMutation(request, response, options, "write", projectId)) {
+      const auth = await authorizeRequest(request, response, options, "write", projectId);
+      if (!auth) {
         return;
       }
 
@@ -2645,7 +4979,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
         response,
         201,
         await repository.createCronJob({
-          ...((await readJsonBody(request)) as Record<string, unknown>),
+          ...bodyWithActor(await readJsonBody(request), auth.actor),
           projectId
         } as never),
         options.allowedOrigin
@@ -2654,7 +4988,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if (request.method === "DELETE" && segments.length === 5 && segments[3] === "cron-jobs") {
-      if (!await authorizeMutation(request, response, options, "admin", projectId)) {
+      const auth = await authorizeRequest(request, response, options, "admin", projectId);
+      if (!auth) {
         return;
       }
 
@@ -2662,7 +4997,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
         response,
         200,
         await repository.disableCronJob({
-          ...((await readJsonBody(request)) as Record<string, unknown>),
+          ...bodyWithActor(await readJsonBody(request), auth.actor),
           projectId,
           jobId: decodeURIComponent(segments[4])
         } as never),
@@ -2672,7 +5007,8 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     }
 
     if (request.method === "POST" && segments.length === 6 && segments[3] === "cron-jobs" && segments[5] === "run") {
-      if (!await authorizeMutation(request, response, options, "write", projectId)) {
+      const auth = await authorizeRequest(request, response, options, "write", projectId);
+      if (!auth) {
         return;
       }
 
@@ -2680,7 +5016,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
         response,
         202,
         await repository.runCronJob({
-          ...((await readJsonBody(request)) as Record<string, unknown>),
+          ...bodyWithActor(await readJsonBody(request), auth.actor),
           projectId,
           jobId: decodeURIComponent(segments[4])
         } as never),
@@ -2694,7 +5030,7 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
       assertReleaseChannel(channel);
 
       if ((request.method === "GET" || request.method === "HEAD") && segments.length === 5) {
-        if (!await authorizeMutation(request, response, options, "read", projectId)) {
+        if (!await authorizeRequest(request, response, options, "read", projectId)) {
           return;
         }
 
@@ -2703,15 +5039,17 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
       }
 
       if (request.method === "POST" && segments.length === 6 && segments[5] === "start") {
-        if (!await authorizeMutation(request, response, options, "write", projectId)) {
+        const auth = await authorizeRequest(request, response, options, "write", projectId);
+        if (!auth) {
           return;
         }
+        const body = bodyWithProductionReleaseEvidence(channel, await readJsonBody(request), "rolling release start", options);
 
         sendJson(
           response,
           202,
           await repository.startRollingRelease({
-            ...((await readJsonBody(request)) as Record<string, unknown>),
+            ...bodyWithActor(body, auth.actor),
             projectId,
             channel
           } as never),
@@ -2721,15 +5059,17 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
       }
 
       if (request.method === "POST" && segments.length === 6 && segments[5] === "advance") {
-        if (!await authorizeMutation(request, response, options, "write", projectId)) {
+        const auth = await authorizeRequest(request, response, options, "write", projectId);
+        if (!auth) {
           return;
         }
+        const body = bodyWithProductionReleaseEvidence(channel, await readJsonBody(request), "rolling release advance", options);
 
         sendJson(
           response,
           202,
           await repository.advanceRollingRelease({
-            ...((await readJsonBody(request)) as Record<string, unknown>),
+            ...bodyWithActor(body, auth.actor),
             projectId,
             channel
           } as never),
@@ -2739,15 +5079,17 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
       }
 
       if (request.method === "POST" && segments.length === 6 && segments[5] === "complete") {
-        if (!await authorizeMutation(request, response, options, "write", projectId)) {
+        const auth = await authorizeRequest(request, response, options, "write", projectId);
+        if (!auth) {
           return;
         }
+        const body = bodyWithProductionReleaseEvidence(channel, await readJsonBody(request), "rolling release complete", options);
 
         sendJson(
           response,
           202,
           await repository.completeRollingRelease({
-            ...((await readJsonBody(request)) as Record<string, unknown>),
+            ...bodyWithActor(body, auth.actor),
             projectId,
             channel
           } as never),
@@ -2757,15 +5099,17 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
       }
 
       if (request.method === "POST" && segments.length === 6 && segments[5] === "abort") {
-        if (!await authorizeMutation(request, response, options, "write", projectId)) {
+        const auth = await authorizeRequest(request, response, options, "write", projectId);
+        if (!auth) {
           return;
         }
+        const body = bodyWithProductionRollingAbortException(channel, await readJsonBody(request), options);
 
         sendJson(
           response,
           202,
           await repository.abortRollingRelease({
-            ...((await readJsonBody(request)) as Record<string, unknown>),
+            ...bodyWithActor(body, auth.actor),
             projectId,
             channel
           } as never),
@@ -2780,25 +5124,35 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
       assertReleaseChannel(channel);
 
       if ((request.method === "GET" || request.method === "HEAD") && segments.length === 5 && segments[3] === "release") {
+        if (!await authorizeRequest(request, response, options, "read", projectId)) {
+          return;
+        }
+
         sendJson(response, 200, await repository.getReleaseConsole(projectId, channel), options.allowedOrigin, request.method);
         return;
       }
 
       if ((request.method === "GET" || request.method === "HEAD") && segments.length === 5 && segments[3] === "rollback") {
+        if (!await authorizeRequest(request, response, options, "read", projectId)) {
+          return;
+        }
+
         sendJson(response, 200, await repository.getRollbackConsole(projectId, channel), options.allowedOrigin, request.method);
         return;
       }
 
       if (request.method === "POST" && segments.length === 6 && segments[3] === "release" && segments[5] === "promote") {
-        if (!await authorizeMutation(request, response, options, "write", projectId)) {
+        const auth = await authorizeRequest(request, response, options, "write", projectId);
+        if (!auth) {
           return;
         }
+        const body = bodyWithProductionReleaseEvidence(channel, await readJsonBody(request), "promotion", options);
 
         sendJson(
           response,
           202,
           await repository.promoteDeployment({
-            ...((await readJsonBody(request)) as Record<string, unknown>),
+            ...bodyWithActor(body, auth.actor),
             projectId,
             channel
           } as never),
@@ -2808,15 +5162,17 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
       }
 
       if (request.method === "POST" && segments.length === 6 && segments[3] === "rollback" && segments[5] === "rollback") {
-        if (!await authorizeMutation(request, response, options, "write", projectId)) {
+        const auth = await authorizeRequest(request, response, options, "write", projectId);
+        if (!auth) {
           return;
         }
+        const body = bodyWithProductionReleaseEvidence(channel, await readJsonBody(request), "rollback", options);
 
         sendJson(
           response,
           202,
           await repository.rollbackDeployment({
-            ...((await readJsonBody(request)) as Record<string, unknown>),
+            ...bodyWithActor(body, auth.actor),
             projectId,
             channel
           } as never),
@@ -2828,6 +5184,10 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
   }
 
   if ((request.method === "GET" || request.method === "HEAD") && segments.length === 2 && segments[1] === "deployments") {
+    if (!await authorizeRequest(request, response, options, "read", url.searchParams.get("projectId") ?? undefined)) {
+      return;
+    }
+
     sendJson(response, 200, await repository.listDeployments(url.searchParams.get("projectId") ?? undefined), options.allowedOrigin, request.method);
     return;
   }
@@ -2836,26 +5196,44 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     const deploymentId = decodeURIComponent(segments[2]);
 
     if ((request.method === "GET" || request.method === "HEAD") && segments.length === 3) {
+      if (!await authorizeRequest(request, response, options, "read")) {
+        return;
+      }
+
       sendJson(response, 200, await repository.getDeployment(deploymentId), options.allowedOrigin, request.method);
       return;
     }
 
     if ((request.method === "GET" || request.method === "HEAD") && segments.length === 4 && segments[3] === "logs") {
+      if (!await authorizeRequest(request, response, options, "read")) {
+        return;
+      }
+
       sendJson(response, 200, await repository.getLogChunk(deploymentId, url.searchParams.get("cursor") ?? undefined), options.allowedOrigin, request.method);
       return;
     }
   }
 
   if (request.method === "POST" && segments.length === 3 && segments[1] === "deployments" && segments[2] === "prebuilt") {
-    if (!await authorizeMutation(request, response, options, "write")) {
+    const auth = await authorizeRequest(request, response, options, "write");
+    if (!auth) {
       return;
     }
 
-    sendJson(response, 201, await repository.deployPrebuilt((await readJsonBody(request)) as never), options.allowedOrigin);
+    requestBodyLimitBytes.set(request, prebuiltRequestBodyLimitBytes(options));
+    const body = bodyWithOptionalPrebuiltReleaseEvidence(await readJsonBody(request), options);
+    const command = bodyWithActor(body, auth.actor) as unknown as PrebuiltDeployCommand;
+    assertPrebuiltUploadWithinBudget(command, options);
+
+    sendJson(response, 201, await repository.deployPrebuilt(command), options.allowedOrigin);
     return;
   }
 
   if ((request.method === "GET" || request.method === "HEAD") && segments[1] === "operations" && segments[2] && segments.length === 3) {
+    if (!await authorizeRequest(request, response, options, "read")) {
+      return;
+    }
+
     sendJson(response, 200, await repository.pollOperation(decodeURIComponent(segments[2])), options.allowedOrigin, request.method);
     return;
   }
@@ -2864,7 +5242,22 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
 }
 
 export function createSiteFlowServer(options: SiteFlowServerOptions) {
+  const rateLimitBuckets = new Map<string, RateLimitBucket>();
+  const metrics = createHttpMetrics();
+
   return http.createServer(async (request, response) => {
+    const requestLogEntry: Omit<SiteFlowRequestLogEntry, "durationMs" | "status"> = {
+      requestId: `req_${randomUUID().replace(/-/g, "")}`,
+      method: request.method ?? "UNKNOWN",
+      path: requestLogPath(request)
+    };
+    const startedAt = Date.now();
+
+    response.once("finish", () => {
+      recordHttpMetrics(metrics, response, startedAt);
+      logRequestCompletion(options, requestLogEntry, response, startedAt);
+    });
+
     try {
       if (request.method === "OPTIONS") {
         response.statusCode = 204;
@@ -2880,6 +5273,7 @@ export function createSiteFlowServer(options: SiteFlowServerOptions) {
       const host = request.headers.host ?? "127.0.0.1";
       const url = new URL(request.url ?? "/", `http://${host}`);
       const segments = url.pathname.split("/").filter(Boolean);
+      requestBodyLimitBytes.set(request, maxBodyBytes(options));
 
       if (await tryServeImageOptimizationRoute({ request, response, url, segments }, options)) {
         return;
@@ -2889,25 +5283,41 @@ export function createSiteFlowServer(options: SiteFlowServerOptions) {
         return;
       }
 
-      await handleApiRoute({ request, response, url, segments }, options);
+      await handleApiRoute({ request, response, url, segments }, options, rateLimitBuckets, metrics);
     } catch (error) {
       if (error instanceof SiteFlowNotFoundError) {
+        requestLogEntry.errorClass = error.name;
         sendJson(response, 404, { message: error.message }, options.allowedOrigin, request.method);
         return;
       }
 
+      if (error instanceof RequestBodyTooLargeError) {
+        requestLogEntry.errorClass = error.name;
+        destroyRequestAfterResponse(request, response);
+        sendJson(response, 413, { message: error.message }, options.allowedOrigin, request.method);
+        return;
+      }
+
+      if (error instanceof PrebuiltUploadTooLargeError) {
+        requestLogEntry.errorClass = error.name;
+        sendJson(response, 413, { message: error.message }, options.allowedOrigin, request.method);
+        return;
+      }
+
       if (error instanceof ImageOptimizationInputError) {
+        requestLogEntry.errorClass = error.name;
         sendJson(response, error.statusCode, { message: error.message }, options.allowedOrigin, request.method);
         return;
       }
 
       if (error instanceof SyntaxError || error instanceof Error && error.message.startsWith("Invalid release channel")) {
+        requestLogEntry.errorClass = error instanceof Error ? error.name : "SyntaxError";
         sendJson(response, 400, { message: error.message }, options.allowedOrigin, request.method);
         return;
       }
 
-      const message = error instanceof Error ? error.message : "Unexpected SiteFlow API error.";
-      sendJson(response, 500, { message }, options.allowedOrigin, request.method);
+      requestLogEntry.errorClass = error instanceof Error ? error.name : "UnknownError";
+      sendJson(response, 500, { message: "Unexpected SiteFlow API error." }, options.allowedOrigin, request.method);
     }
   });
 }

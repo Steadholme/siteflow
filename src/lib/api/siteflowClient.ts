@@ -14,6 +14,7 @@ import type {
   RoutingRuleKind,
   SiteFlowId,
   SourceEventInput,
+  SourceProvider,
   WebVitalName
 } from "../../domain/siteflow.js";
 import type {
@@ -77,6 +78,26 @@ export interface ReleaseCommandBase {
   actor: Actor;
   reason: string;
   idempotencyKey: string;
+  releaseEvidence?: ReleaseEvidenceRequest;
+}
+
+export type ReleaseEvidenceRequest = ReleaseEvidenceMetadata | ReleaseEvidenceBundleRequest;
+
+export interface ReleaseEvidenceMetadata {
+  evidencePath: string;
+  checkedAt: string;
+  status: "passed";
+  commitRef: string;
+  repository: string;
+  branch: string;
+  targetEnvironment: string;
+  releaseTicket?: string;
+  operatorName?: string;
+}
+
+export interface ReleaseEvidenceBundleRequest {
+  evidencePath: string;
+  bundle: Record<string, unknown>;
 }
 
 export interface PromoteDeploymentCommand extends ReleaseCommandBase {
@@ -143,6 +164,14 @@ export interface RollingReleaseCommandBase {
   actor: Actor;
   reason: string;
   idempotencyKey: string;
+  releaseEvidence?: ReleaseEvidenceRequest;
+}
+
+export interface ReleaseEvidenceException {
+  type: "production_rolling_abort_stop_rollout";
+  targetEnvironment: "production";
+  acceptedWithoutReleaseEvidence: true;
+  reason: string;
 }
 
 export interface StartRollingReleaseCommand extends RollingReleaseCommandBase {
@@ -156,7 +185,9 @@ export interface AdvanceRollingReleaseCommand extends RollingReleaseCommandBase 
 
 export interface CompleteRollingReleaseCommand extends RollingReleaseCommandBase {}
 
-export interface AbortRollingReleaseCommand extends RollingReleaseCommandBase {}
+export interface AbortRollingReleaseCommand extends RollingReleaseCommandBase {
+  releaseEvidenceException?: ReleaseEvidenceException;
+}
 
 export interface CreateProjectCommand extends ProjectCommandBase {}
 
@@ -199,6 +230,20 @@ export interface RevokeApiTokenCommand {
   projectId?: SiteFlowId;
   tokenId: SiteFlowId;
   actor?: Actor;
+  reason?: string;
+}
+
+export interface CreateOperatorSessionCommand {
+  subject?: string;
+  scopes: Array<"read" | "write" | "admin">;
+  projectIds?: SiteFlowId[];
+  ttlSeconds?: number;
+  actor?: Actor;
+}
+
+export interface RevokeAllOperatorSessionsCommand {
+  projectId?: SiteFlowId;
+  actor: Actor;
   reason?: string;
 }
 
@@ -327,7 +372,7 @@ export interface MatchRoutingRulesCommand {
 }
 
 export interface GitWebhookCommand {
-  provider: "github";
+  provider: SourceProvider;
   deliveryId: string;
   event: SourceEventInput;
 }

@@ -1,9 +1,11 @@
 import { runSiteFlowCli, type CliIo } from "./siteflowCli";
 import type { SiteFlowCommandRunner } from "./doctor";
+import { createHash } from "node:crypto";
 import { brotliDecompressSync, gunzipSync } from "node:zlib";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 function createIo() {
   const output = {
@@ -27,6 +29,326 @@ const passingRunner: SiteFlowCommandRunner = async (command) => ({
   stdout: `${command} ok`,
   stderr: ""
 });
+
+const installRuntimeImage = `ghcr.io/siteflow/siteflow@sha256:${"a".repeat(64)}`;
+const installPostgresImage = `postgres@sha256:${"b".repeat(64)}`;
+const installBuildImage = `node:20-bookworm-slim@sha256:${"c".repeat(64)}`;
+
+const validReleaseGateProductionEnv = {
+  SITEFLOW_ENV: "production",
+  DATABASE_URL: "postgres://siteflow:secret@localhost:5432/siteflow",
+  SITEFLOW_API_PORT: "8787",
+  SITEFLOW_ARTIFACT_ROOT: "/var/lib/siteflow/artifacts",
+  SITEFLOW_PUBLIC_SCHEME: "https",
+  SITEFLOW_API_TOKEN: "siteflow-api-token-0123456789abcdef",
+  SITEFLOW_APP_SECRET: "siteflow-app-secret-0123456789abcdef",
+  SITEFLOW_METRICS_TOKEN: "siteflow-metrics-token-0123456789abcdef",
+  SITEFLOW_ALLOW_UNAUTHENTICATED_METRICS: "0",
+  VITE_SITEFLOW_ALLOW_BROWSER_TOKEN_FALLBACK: "0",
+  SITEFLOW_BUILD_RUNNER: "docker",
+  SITEFLOW_BUILD_IMAGE: "registry.example.com/siteflow/build@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  SITEFLOW_BUILD_IMAGE_ALLOWLIST: "",
+  SITEFLOW_ALLOW_TAGGED_BUILD_IMAGE: "0",
+  SITEFLOW_TRUSTED_SOURCE_BUILDS: "0",
+  SITEFLOW_ALLOW_UNSANDBOXED_BUILDS: "0",
+  SITEFLOW_BUILD_MAX_ARTIFACT_BYTES: "536870912",
+  SITEFLOW_BUILD_MAX_ARTIFACT_FILES: "20000",
+  SITEFLOW_BUILD_MIN_FREE_BYTES: "1073741824",
+  SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES: "536870912",
+  SITEFLOW_PREBUILT_MAX_FILES: "20000",
+  SITEFLOW_BUILD_STEP_TIMEOUT_MS: "900000",
+  SITEFLOW_GIT_TIMEOUT_MS: "300000",
+  SITEFLOW_BUILD_NETWORK: "none"
+};
+
+const validReleaseGateCliWorkflow = [
+  "name: CI",
+  "jobs:",
+  "  test-build:",
+  "    steps:",
+  "      - run: npm run --silent release:dependency:policy -- --json",
+  "      - run: npm ci",
+  "      - run: npm run --silent release:source:check -- --json",
+  "      - run: npm test -- --run",
+  "      - run: npm run build",
+  "      - run: npm run --silent release:artifacts:check -- --json",
+  "      - run: npm run test:e2e",
+  "      - run: npm run siteflow -- release-gate --allow-dirty --allow-manual-branch-protection"
+].join("\n");
+
+const validReleasePreflightCliWorkflow = [
+  "name: Release Preflight",
+  "on:",
+  "  workflow_dispatch:",
+  "    inputs:",
+  "      siteflow_api_url:",
+  "      candidate_deployment_id:",
+  "      direct_api_url:",
+  "      release_image_run_id:",
+  "      trust_proxy_policy:",
+  "      api_instance_count:",
+  "      api_process_count:",
+  "      ingress_count:",
+  "      api_rate_limit_scope:",
+  "      api_rate_limit_enforcement_point:",
+  "permissions:",
+  "  contents: read",
+  "  checks: read",
+  "  actions: read",
+  "jobs:",
+  "  preflight:",
+  "    steps:",
+  "      - run: echo 'repo input must match'",
+  "      - run: echo 'build_image must be pinned'",
+  "      - run: npm run --silent release:dependency:policy -- --json",
+  "      - run: npm run --silent release:source:check -- --json",
+  "      - run: npm run build",
+  "      - run: npx playwright install --with-deps chromium",
+  "      - run: npm run test:e2e",
+  "      - run: echo \"SITEFLOW_TARGET_ENV_FILE=$RUNNER_TEMP/siteflow-release-secrets/target.env\" >> \"$GITHUB_ENV\"",
+  "      - env:",
+  "          SITEFLOW_API_TOKEN: ${{ secrets.SITEFLOW_API_TOKEN }}",
+  "        run: npm run siteflow -- inspect ${{ inputs.candidate_deployment_id }} --server ${{ inputs.siteflow_api_url }} --json > private/deployment-detail.json",
+  "      - run: npm run --silent release:artifacts:check -- --json --manifest evidence/release-artifact-manifest.json --deployment-detail private/deployment-detail.json --write-deployment-artifact-manifest evidence/deployment-artifact-manifest.json --commit-ref abc123 --repo acme/siteflow --branch main --target-environment production",
+  "      - env:",
+  "          SITEFLOW_RELEASE_ENV_FILE_B64: ${{ secrets.SITEFLOW_RELEASE_ENV_FILE_B64 }}",
+  "        run: printf '%s' \"$SITEFLOW_RELEASE_ENV_FILE_B64\" | base64 --decode > \"$SITEFLOW_TARGET_ENV_FILE\"",
+  "      - run: npm run siteflow -- release-gate --promotion --env-file \"$SITEFLOW_TARGET_ENV_FILE\" --commit-ref abc123 --require-commit-status --json",
+  "      - run: npm run --silent release:evidence:rehearsal-pack -- --commit-ref abc123 --repo acme/siteflow --branch main --target-env-file \"$SITEFLOW_TARGET_ENV_FILE\" --public-base-url https://siteflow.example.com --operator-name operator --release-ticket REL-1",
+  "      - env:",
+  "          GITHUB_TOKEN: ${{ secrets.SITEFLOW_RELEASE_GITHUB_TOKEN || github.token }}",
+  "          GH_TOKEN: ${{ secrets.SITEFLOW_RELEASE_GITHUB_TOKEN || github.token }}",
+  "        run: npm run --silent release:evidence:target-run -- --pack evidence/release-evidence-rehearsal-pack.json --confirm-target-environment production --run-record evidence/release-evidence-target-run.json --gap-report-dir evidence/gap-reports --set-env direct-api-url=SITEFLOW_DIRECT_API_URL --set-env release-image-run-id=SITEFLOW_RELEASE_IMAGE_RUN_ID --set-env SITEFLOW_TRUST_PROXY=SITEFLOW_TRUST_PROXY --set-env api-instance-count=SITEFLOW_API_INSTANCE_COUNT --set-env api-process-count=SITEFLOW_API_PROCESS_COUNT --set-env ingress-count=SITEFLOW_INGRESS_COUNT --set-env api-rate-limit-scope=SITEFLOW_API_RATE_LIMIT_SCOPE --set-env api-rate-limit-enforcement-point=SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT --json",
+  "      - run: npm run --silent release:evidence:gaps -- --pack evidence/release-evidence-rehearsal-pack.json --set-env direct-api-url=SITEFLOW_DIRECT_API_URL --set-env release-image-run-id=SITEFLOW_RELEASE_IMAGE_RUN_ID --set-env SITEFLOW_TRUST_PROXY=SITEFLOW_TRUST_PROXY --set-env api-instance-count=SITEFLOW_API_INSTANCE_COUNT --set-env api-process-count=SITEFLOW_API_PROCESS_COUNT --set-env ingress-count=SITEFLOW_INGRESS_COUNT --set-env api-rate-limit-scope=SITEFLOW_API_RATE_LIMIT_SCOPE --set-env api-rate-limit-enforcement-point=SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT --json",
+  "      - run: rm -f \"$SITEFLOW_TARGET_ENV_FILE\"",
+  "      - uses: actions/upload-artifact@v4"
+].join("\n");
+
+const validProductionCompose = [
+  "services:",
+  "  postgres:",
+  "    image: ${SITEFLOW_POSTGRES_IMAGE:?SITEFLOW_POSTGRES_IMAGE must be pinned by digest for production}",
+  "    environment:",
+  "      POSTGRES_PASSWORD_FILE: /run/secrets/siteflow_postgres_password",
+  "    secrets:",
+  "      - siteflow_postgres_password",
+  "    healthcheck:",
+  "      test: pg_isready",
+  "  api:",
+  "    image: ${SITEFLOW_IMAGE:?SITEFLOW_IMAGE must be the digest-pinned release image for production}",
+  "    user: \"1000:1000\"",
+  "    init: true",
+  "    read_only: true",
+  "    cap_drop:",
+  "      - ALL",
+  "    security_opt:",
+  "      - no-new-privileges:true",
+  "    depends_on:",
+  "      postgres:",
+  "        condition: service_healthy",
+  "    environment:",
+  "      DATABASE_URL: postgres://siteflow@postgres:5432/siteflow",
+  "      SITEFLOW_APP_SECRET_FILE: /run/secrets/siteflow_app_secret",
+  "      SITEFLOW_API_TOKEN_FILE: /run/secrets/siteflow_api_token",
+  "      SITEFLOW_METRICS_TOKEN_FILE: /run/secrets/siteflow_metrics_token",
+  "      SITEFLOW_POSTGRES_PASSWORD_FILE: /run/secrets/siteflow_postgres_password",
+  "      SITEFLOW_BACKUP_AUTOMATION_RUN_RECORD: /var/lib/siteflow/evidence/backup-automation-run.json",
+  "      SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES: 536870912",
+  "      SITEFLOW_PREBUILT_MAX_FILES: 20000",
+  "    secrets:",
+  "      - siteflow_app_secret",
+  "      - siteflow_api_token",
+  "      - siteflow_metrics_token",
+  "      - siteflow_postgres_password",
+  "    healthcheck:",
+  "      test: fetch /readyz",
+  "  worker:",
+  "    image: ${SITEFLOW_IMAGE:?SITEFLOW_IMAGE must be the digest-pinned release image for production}",
+  "    user: \"${SITEFLOW_WORKER_USER:-0:0}\"",
+  "    group_add:",
+  "      - \"${SITEFLOW_DOCKER_SOCKET_GID:-0}\"",
+  "    init: true",
+  "    read_only: true",
+  "    cap_drop:",
+  "      - ALL",
+  "    security_opt:",
+  "      - no-new-privileges:true",
+  "    depends_on:",
+  "      postgres:",
+  "        condition: service_healthy",
+  "      api:",
+  "        condition: service_healthy",
+  "    environment:",
+  "      DATABASE_URL: postgres://siteflow@postgres:5432/siteflow",
+  "      SITEFLOW_APP_SECRET_FILE: /run/secrets/siteflow_app_secret",
+  "      SITEFLOW_POSTGRES_PASSWORD_FILE: /run/secrets/siteflow_postgres_password",
+  "      SITEFLOW_BUILD_RUNNER: docker",
+  "      SITEFLOW_BUILD_NETWORK: none",
+  "      SITEFLOW_BUILD_IMAGE: node:20-bookworm-slim@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "      SITEFLOW_BUILD_MAX_ARTIFACT_BYTES: 536870912",
+  "      SITEFLOW_BUILD_MAX_ARTIFACT_FILES: 20000",
+  "      SITEFLOW_BUILD_MIN_FREE_BYTES: 1073741824",
+  "    secrets:",
+  "      - siteflow_app_secret",
+  "      - siteflow_postgres_password",
+  "    volumes:",
+  "      - type: bind",
+  "        source: /var/run/docker.sock",
+  "        target: /var/run/docker.sock",
+  "secrets:",
+  "  siteflow_app_secret:",
+  "    file: /etc/siteflow/secrets/app-secret.secret",
+  "  siteflow_api_token:",
+  "    file: /etc/siteflow/secrets/api-token.secret",
+  "  siteflow_metrics_token:",
+  "    file: /etc/siteflow/secrets/metrics-token.secret",
+  "  siteflow_postgres_password:",
+  "    file: /etc/siteflow/secrets/postgres-password.secret"
+].join("\n");
+
+const validProductionDeploymentDoc = [
+  "# Production single-host Docker Compose",
+  "",
+  "`docker-compose.production.yml` is the auditable profile.",
+  "The worker mounts `/var/run/docker.sock` as an accepted trusted single-host risk.",
+  "SITEFLOW_IMAGE",
+  "SITEFLOW_POSTGRES_IMAGE",
+  "SITEFLOW_BUILD_IMAGE",
+  "SITEFLOW_BUILD_MIN_FREE_BYTES",
+  "SITEFLOW_BUILD_MAX_ARTIFACT_BYTES",
+  "SITEFLOW_BUILD_MAX_ARTIFACT_FILES",
+  "SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES",
+  "SITEFLOW_PREBUILT_MAX_FILES",
+  "SITEFLOW_POSTGRES_PASSWORD_FILE",
+  "docker compose -f docker-compose.production.yml config"
+].join("\n");
+
+async function writeReleaseGateCliFixtureFiles(root: string) {
+  await mkdir(path.join(root, ".github", "workflows"), { recursive: true });
+  await mkdir(path.join(root, "docs", "deployment"), { recursive: true });
+  await writeFile(path.join(root, ".github", "workflows", "ci.yml"), validReleaseGateCliWorkflow);
+  await writeFile(path.join(root, ".github", "workflows", "release-preflight.yml"), validReleasePreflightCliWorkflow);
+  await writeFile(path.join(root, "docker-compose.production.yml"), validProductionCompose);
+  await writeFile(path.join(root, "docs", "deployment", "production-single-host.md"), validProductionDeploymentDoc);
+  await writeFile(path.join(root, "docs", "production-readiness.md"), [
+    "Branch protection must require CI.",
+    "DATABASE_URL",
+    "SITEFLOW_API_PORT",
+    "SITEFLOW_ARTIFACT_ROOT",
+    "SITEFLOW_PUBLIC_SCHEME",
+    "SITEFLOW_API_TOKEN",
+    "SITEFLOW_APP_SECRET",
+    "SITEFLOW_SEALING_KEY",
+    "SITEFLOW_METRICS_TOKEN",
+    "SITEFLOW_ALLOW_UNAUTHENTICATED_METRICS",
+    "SITEFLOW_BUILD_RUNNER",
+    "SITEFLOW_BUILD_IMAGE",
+    "SITEFLOW_BUILD_IMAGE_ALLOWLIST",
+    "SITEFLOW_ALLOW_TAGGED_BUILD_IMAGE",
+    "SITEFLOW_TRUSTED_SOURCE_BUILDS",
+    "SITEFLOW_ALLOW_UNSANDBOXED_BUILDS",
+    "VITE_SITEFLOW_ALLOW_BROWSER_TOKEN_FALLBACK",
+    "SITEFLOW_BUILD_MAX_ARTIFACT_BYTES",
+    "SITEFLOW_BUILD_MAX_ARTIFACT_FILES",
+    "SITEFLOW_BUILD_MIN_FREE_BYTES",
+    "SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES",
+    "SITEFLOW_PREBUILT_MAX_FILES",
+    "SITEFLOW_BUILD_STEP_TIMEOUT_MS",
+    "SITEFLOW_GIT_TIMEOUT_MS",
+    "SITEFLOW_BUILD_NETWORK"
+  ].join("\n"));
+}
+
+async function writeVerifiableBackup(backupPath: string) {
+  await mkdir(path.join(backupPath, "database"), { recursive: true });
+  await mkdir(path.join(backupPath, "artifacts", "project-a"), { recursive: true });
+  await writeFile(path.join(backupPath, "database", "siteflow.sql"), "database dump\n", "utf8");
+  await writeFile(path.join(backupPath, "artifacts", "project-a", "index.html"), "<h1>Verified</h1>", "utf8");
+  await writeFile(
+    path.join(backupPath, "manifest.json"),
+    `${JSON.stringify({
+      version: "0.1.0-test",
+      createdAt: "2026-06-07T00:00:00.000Z",
+      database: {
+        dumpFile: "database/siteflow.sql",
+        format: "plain"
+      },
+      artifacts: {
+        sourcePath: "/var/lib/siteflow/artifacts",
+        path: "artifacts",
+        copied: true
+      }
+    })}\n`,
+    "utf8"
+  );
+}
+
+async function s3RecursiveListingForDirectory(rootPath: string) {
+  const files: Array<{ relativePath: string; size: number }> = [];
+
+  async function collect(currentPath: string) {
+    const entries = await readdir(currentPath, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const entryPath = path.join(currentPath, entry.name);
+
+      if (entry.isDirectory()) {
+        await collect(entryPath);
+      } else if (entry.isFile()) {
+        files.push({
+          relativePath: path.relative(rootPath, entryPath).replaceAll("\\", "/"),
+          size: (await stat(entryPath)).size
+        });
+      }
+    }
+  }
+
+  await collect(rootPath);
+
+  return files
+    .sort((left, right) => left.relativePath.localeCompare(right.relativePath))
+    .map((file) => `2026-06-07 01:00:00 ${file.size.toString().padStart(10, " ")} ${file.relativePath}`)
+    .join("\n");
+}
+
+async function directoryTreeIntegrity(rootPath: string) {
+  const files: Array<{ relativePath: string; bytes: Buffer }> = [];
+
+  async function collect(currentPath: string) {
+    const entries = await readdir(currentPath, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const entryPath = path.join(currentPath, entry.name);
+
+      if (entry.isDirectory()) {
+        await collect(entryPath);
+      } else if (entry.isFile()) {
+        files.push({
+          relativePath: path.relative(rootPath, entryPath).replaceAll("\\", "/"),
+          bytes: await readFile(entryPath)
+        });
+      }
+    }
+  }
+
+  await collect(rootPath);
+
+  const checksum = createHash("sha256");
+  let totalBytes = 0;
+
+  for (const file of files.sort((left, right) => left.relativePath.localeCompare(right.relativePath))) {
+    checksum.update(file.relativePath);
+    checksum.update("\0");
+    checksum.update(file.bytes);
+    totalBytes += file.bytes.byteLength;
+  }
+
+  return {
+    treeSha256: checksum.digest("hex"),
+    fileCount: files.length,
+    totalBytes
+  };
+}
 
 function projectSettingsResponse() {
   return {
@@ -98,6 +420,67 @@ function acceptedPromotionResponse() {
       }
     ]
   };
+}
+
+function releaseEvidenceDependencies() {
+  return {
+    now: () => new Date("2026-06-08T12:00:00.000Z"),
+    evaluate: (rawEvidence: unknown, options: { evidencePath: string }) => ({
+      name: "siteflow-release-evidence-bundle-check" as const,
+      status: (rawEvidence && typeof rawEvidence === "object" && "blocked" in rawEvidence ? "blocked" : "passed") as "passed" | "blocked",
+      checkedAt: "2026-06-08T12:00:00.000Z",
+      evidencePath: options.evidencePath,
+      thresholds: {
+        maxEvidenceAgeHours: 168,
+        allowHostBuildException: false
+      },
+      selectedEvidence: {
+        releaseCommitRef: "abc123def4567890",
+        repository: "acme/siteflow",
+        branch: "main",
+        releaseGateStatus: "pass",
+        dockerBuildRehearsalStatus: "passed",
+        postgresRehearsalStatus: "passed",
+        artifactEvidenceStatus: "passed",
+        releaseImageDigest: `sha256:${"f".repeat(64)}`,
+        backupEvidenceStatus: "passed",
+        observabilityEvidenceStatus: "passed",
+        operatorAccessEvidenceStatus: "passed",
+        nonSessionCredentialEvidenceStatus: "passed",
+        ingressEvidenceStatus: "passed",
+        upgradeRollbackDrillStatus: "passed"
+      },
+      checks: rawEvidence && typeof rawEvidence === "object" && "blocked" in rawEvidence
+        ? [{ name: "promotion_evidence", status: "fail" as const, message: "blocked" }]
+        : [{ name: "bundle_shape", status: "pass" as const, message: "passed" }],
+      exitCode: rawEvidence && typeof rawEvidence === "object" && "blocked" in rawEvidence ? 1 : 0
+    })
+  };
+}
+
+async function writeReleaseEvidence(root: string, overrides: Record<string, unknown> = {}) {
+  const evidencePath = path.join(root, "release-evidence.json");
+
+  await writeFile(
+    evidencePath,
+    `${JSON.stringify({
+      schemaVersion: "siteflow.releaseEvidence.v1",
+      name: "siteflow-release-evidence-bundle",
+      targetEnvironment: "production",
+      release: {
+        commitRef: "abc123def4567890",
+        repository: "acme/siteflow",
+        branch: "main",
+        targetEnvironment: "production",
+        releaseTicket: "REL-2026-0608",
+        operatorName: "release-operator"
+      },
+      ...overrides
+    }, null, 2)}\n`,
+    "utf8"
+  );
+
+  return evidencePath;
 }
 
 function deployHookListResponse() {
@@ -610,6 +993,281 @@ describe("siteflow CLI", () => {
 
     expect(code).toBe(0);
     expect(output.stdout).toContain("siteflow install");
+    expect(output.stdout).toContain("siteflow backup restore-drill");
+    expect(output.stdout).toContain("siteflow backup offload");
+    expect(output.stdout).toContain("siteflow backup fetch");
+    expect(output.stdout).toContain("siteflow backup prune");
+    expect(output.stdout).toContain("disposable-postgres-url");
+    expect(output.stdout).toContain("siteflow release-gate");
+    expect(output.stdout).toContain("siteflow rolling start <deploymentId> --percentage 10");
+    expect(output.stdout).toContain("[--release-evidence release-evidence.json]");
+  });
+
+  it("runs release gate with JSON output", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gate-cli-"));
+    const { io, output } = createIo();
+
+    try {
+      await writeReleaseGateCliFixtureFiles(root);
+
+      const code = await runSiteFlowCli([
+        "release-gate",
+        "--root",
+        root,
+        "--allow-dirty",
+        "--allow-manual-branch-protection",
+        "--json"
+      ], io, {
+        env: {},
+        releaseGate: {
+          now: () => new Date("2026-06-08T12:00:00.000Z"),
+          runner: async () => ({
+            exitCode: 0,
+            stdout: " M dist/index.html\n",
+            stderr: ""
+          })
+        }
+      });
+      const result = JSON.parse(output.stdout);
+
+      expect(code).toBe(0);
+      expect(result).toMatchObject({
+        status: "pass",
+        root,
+        checkedAt: "2026-06-08T12:00:00.000Z"
+      });
+      expect(result.checks).toContainEqual(expect.objectContaining({
+        id: "external.githubBranchProtection",
+        status: "manual_required"
+      }));
+      expect(result.promotionEvidence).toMatchObject({
+        gateStatus: "pass",
+        checkedAt: "2026-06-08T12:00:00.000Z",
+        promotion: false,
+        manualRequired: true,
+        manualRequiredCheckIds: ["external.githubBranchProtection"],
+        branchProtection: {
+          status: "manual_required",
+          branch: "main",
+          requiredStatusCheck: "Install, test, and build"
+        },
+        commitStatus: {
+          status: "skipped",
+          requiredStatusCheck: "Install, test, and build"
+        },
+        runtimeEnv: {
+          status: "skipped",
+          metricsTokenConfigured: null
+        },
+        dirtyWorktree: {
+          status: "pass",
+          dirty: true,
+          entries: [" M dist/index.html"]
+        }
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns promotion JSON as manual_required when GitHub evidence is unavailable", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gate-cli-manual-"));
+    const { io, output } = createIo();
+
+    try {
+      await writeReleaseGateCliFixtureFiles(root);
+
+      const code = await runSiteFlowCli([
+        "release-gate",
+        "--root",
+        root,
+        "--promotion",
+        "--allow-manual-branch-protection",
+        "--commit-ref",
+        "abc123def456",
+        "--json"
+      ], io, {
+        env: validReleaseGateProductionEnv,
+        releaseGate: {
+          runner: async () => ({
+            exitCode: 0,
+            stdout: "",
+            stderr: ""
+          })
+        }
+      });
+      const result = JSON.parse(output.stdout);
+
+      expect(code).toBe(1);
+      expect(result.status).toBe("manual_required");
+      expect(result.promotionEvidence).toMatchObject({
+        gateStatus: "manual_required",
+        promotion: true,
+        commitRef: "abc123def456",
+        manualRequired: true,
+        manualRequiredCheckIds: [
+          "external.githubBranchProtection",
+          "external.githubCommitStatus"
+        ],
+        branchProtection: {
+          status: "manual_required"
+        },
+        commitStatus: {
+          status: "manual_required",
+          commitRef: "abc123def456"
+        },
+        runtimeEnv: {
+          status: "pass",
+          metricsTokenConfigured: true,
+          sourceBuildPostureStatus: "pass",
+          buildRunner: "docker",
+          hostBuildException: false,
+          buildImage: "registry.example.com/siteflow/build@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          buildImageDigestPinned: true,
+          buildImagePolicyStatus: "pass",
+          buildImagePolicy: "digest"
+        },
+        dirtyWorktree: {
+          status: "pass",
+          dirty: false
+        }
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("passes release gate repository, branch, and commit evidence options", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gate-cli-evidence-"));
+    const { io, output } = createIo();
+    const requests: Array<{ url: string; authorization: string }> = [];
+
+    try {
+      await writeReleaseGateCliFixtureFiles(root);
+
+      const code = await runSiteFlowCli([
+        "release-gate",
+        "--root",
+        root,
+        "--repo",
+        "acme/siteflow",
+        "--branch",
+        "release",
+        "--commit-ref",
+        "abc123def456",
+        "--required-status-check",
+        "Required / siteflow",
+        "--require-commit-status",
+        "--promotion",
+        "--json"
+      ], io, {
+        env: {
+          ...validReleaseGateProductionEnv,
+          GITHUB_TOKEN: "ghs_test"
+        },
+        releaseGate: {
+          runner: async () => ({
+            exitCode: 0,
+            stdout: "",
+            stderr: ""
+          }),
+          fetch: async (input, init) => {
+            const url = input.toString();
+            requests.push({
+              url,
+              authorization: new Headers(init?.headers).get("authorization") ?? ""
+            });
+
+            if (url.includes("/required_status_checks")) {
+              return new Response(JSON.stringify({
+                contexts: ["Required / siteflow"],
+                checks: []
+              }), {
+                status: 200,
+                headers: { "content-type": "application/json" }
+              });
+            }
+
+            return new Response(JSON.stringify({
+              check_runs: [
+                {
+                  name: "Required / siteflow",
+                  status: "completed",
+                  conclusion: "success"
+                }
+              ]
+            }), {
+              status: 200,
+              headers: { "content-type": "application/json" }
+            });
+          }
+        }
+      });
+      const result = JSON.parse(output.stdout);
+
+      expect(code).toBe(0);
+      expect(result.status).toBe("pass");
+      expect(result.promotionEvidence).toMatchObject({
+        gateStatus: "pass",
+        promotion: true,
+        commitRef: "abc123def456",
+        repository: "acme/siteflow",
+        branch: "release",
+        requiredStatusCheck: "Required / siteflow",
+        branchProtection: {
+          status: "pass",
+          repository: "acme/siteflow",
+          branch: "release",
+          requiredStatusCheck: "Required / siteflow",
+          requiredStatusChecks: ["Required / siteflow"]
+        },
+        commitStatus: {
+          status: "pass",
+          repository: "acme/siteflow",
+          commitRef: "abc123def456",
+          requiredStatusCheck: "Required / siteflow",
+          checkRun: {
+            name: "Required / siteflow",
+            status: "completed",
+            conclusion: "success"
+          }
+        },
+        manualRequired: false,
+        manualRequiredCheckIds: [],
+        runtimeEnv: {
+          status: "pass",
+          metricsTokenConfigured: true,
+          sourceBuildPostureStatus: "pass",
+          buildRunner: "docker",
+          hostBuildException: false,
+          buildImage: "registry.example.com/siteflow/build@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          buildImageDigestPinned: true,
+          buildImagePolicyStatus: "pass",
+          buildImagePolicy: "digest"
+        },
+        dirtyWorktree: {
+          status: "pass",
+          dirty: false,
+          entries: []
+        }
+      });
+      expect(requests).toEqual([
+        {
+          url: "https://api.github.com/repos/acme/siteflow/branches/release/protection/required_status_checks",
+          authorization: "Bearer ghs_test"
+        },
+        {
+          url: "https://api.github.com/repos/acme/siteflow/commits/abc123def456/check-runs?check_name=Required+%2F+siteflow",
+          authorization: "Bearer ghs_test"
+        }
+      ]);
+      expect(result.checks).toContainEqual(expect.objectContaining({
+        id: "external.githubCommitStatus",
+        status: "pass"
+      }));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("runs doctor with JSON output", async () => {
@@ -630,7 +1288,21 @@ describe("siteflow CLI", () => {
 
   it("prints a single-host install dry-run plan", async () => {
     const { io, output } = createIo();
-    const code = await runSiteFlowCli(["install", "--topology", "single", "--domain", "siteflow.example.com", "--dry-run", "--json"], io, {
+    const code = await runSiteFlowCli([
+      "install",
+      "--topology",
+      "single",
+      "--domain",
+      "siteflow.example.com",
+      "--image",
+      installRuntimeImage,
+      "--postgres-image",
+      installPostgresImage,
+      "--build-image",
+      installBuildImage,
+      "--dry-run",
+      "--json"
+    ], io, {
       version: "0.1.0-test"
     });
     const plan = JSON.parse(output.stdout);
@@ -651,11 +1323,39 @@ describe("siteflow CLI", () => {
         }
       },
       runtimeEnv: {
-        SITEFLOW_BASE_DOMAIN: "siteflow.example.com"
+        SITEFLOW_BASE_DOMAIN: "siteflow.example.com",
+        SITEFLOW_WORKER_POLL_INTERVAL_MS: "5000",
+        SITEFLOW_IMAGE: installRuntimeImage,
+        SITEFLOW_POSTGRES_IMAGE: installPostgresImage,
+        SITEFLOW_BUILD_IMAGE: installBuildImage,
+        SITEFLOW_BUILD_MAX_ARTIFACT_BYTES: "536870912",
+        SITEFLOW_BUILD_MAX_ARTIFACT_FILES: "20000",
+        SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES: "536870912",
+        SITEFLOW_PREBUILT_MAX_FILES: "20000"
       }
     });
     expect(plan.renderedAssets.env.content).toContain("SITEFLOW_BASE_DOMAIN=siteflow.example.com");
+    expect(plan.renderedAssets.env.content).not.toContain("WEBHOOK_SECRET");
+    expect(plan.renderedAssets.compose.content).toContain("  worker:");
+    expect(plan.renderedAssets.compose.content).toContain("exec node dist-worker/worker/index.js");
+    expect(plan.renderedAssets.compose.content).toContain("condition: service_healthy");
+    expect(plan.renderedAssets.compose.content).toContain("fetch('http://127.0.0.1:8787/readyz')");
+    expect(plan.renderedAssets.compose.content).toContain('    user: "${SITEFLOW_WORKER_USER:-0:0}"');
+    expect(plan.renderedAssets.compose.content).toContain("    group_add:");
+    expect(plan.renderedAssets.compose.content).toContain("SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE");
+    expect(plan.renderedAssets.compose.content).toContain('DATABASE_URL: "postgres://siteflow@postgres:5432/siteflow"');
+    expect(plan.renderedAssets.compose.content).not.toContain("export SITEFLOW_");
+    expect(plan.renderedAssets.compose.content).not.toContain("$(cat /run/secrets/");
     expect(plan.renderedAssets.nginx.content).toContain("server_name *.siteflow.example.com;");
+    expect(plan.installState.secrets).toMatchObject({
+      githubWebhookSecretRef: "/etc/siteflow/secrets/github-webhook.secret",
+      gitlabWebhookSecretRef: "/etc/siteflow/secrets/gitlab-webhook.secret",
+      giteaWebhookSecretRef: "/etc/siteflow/secrets/gitea-webhook.secret",
+      genericWebhookSecretRef: "/etc/siteflow/secrets/generic-webhook.secret"
+    });
+    expect(plan.secrets.map((secret: { id: string }) => secret.id)).toEqual(
+      expect.arrayContaining(["github-webhook", "gitlab-webhook", "gitea-webhook", "generic-webhook"])
+    );
     expect(plan.steps.map((step: { id: string }) => step.id)).toContain("router");
   });
 
@@ -670,6 +1370,12 @@ describe("siteflow CLI", () => {
         "siteflow.w33d.xyz",
         "--base-domain",
         "w33d.xyz",
+        "--image",
+        installRuntimeImage,
+        "--postgres-image",
+        installPostgresImage,
+        "--build-image",
+        installBuildImage,
         "--dry-run",
         "--json"
       ],
@@ -688,6 +1394,7 @@ describe("siteflow CLI", () => {
     });
     expect(plan.installState.tls.domains).toEqual(["siteflow.w33d.xyz", "*.w33d.xyz"]);
     expect(plan.runtimeEnv.SITEFLOW_BASE_DOMAIN).toBe("w33d.xyz");
+    expect(plan.runtimeEnv.SITEFLOW_WORKER_POLL_INTERVAL_MS).toBe("5000");
     expect(plan.renderedAssets.nginx.content).toContain("server_name siteflow.w33d.xyz;");
     expect(plan.renderedAssets.nginx.content).toContain("server_name *.w33d.xyz;");
     expect(plan.renderedAssets.nginx.content).toContain("location ^~ /api/");
@@ -717,6 +1424,12 @@ describe("siteflow CLI", () => {
           "siteflow.w33d.xyz",
           "--base-domain",
           "w33d.xyz",
+          "--image",
+          installRuntimeImage,
+          "--postgres-image",
+          installPostgresImage,
+          "--build-image",
+          installBuildImage,
           "--yes",
           "--json"
         ],
@@ -764,9 +1477,613 @@ describe("siteflow CLI", () => {
         "nginx -s reload",
         "systemctl is-active siteflow.service"
       ]);
-      expect(healthRequests).toEqual(["http://127.0.0.1:8787/healthz"]);
-      expect(await readFile(path.join(root, "etc/siteflow/siteflow.env"), "utf8")).toContain("SITEFLOW_BASE_DOMAIN=w33d.xyz");
-      expect(await readFile(path.join(root, "opt/siteflow/compose.yaml"), "utf8")).toContain("ghcr.io/siteflow/siteflow:0.1.0-test");
+      expect(healthRequests).toEqual(["http://127.0.0.1:8787/readyz"]);
+      const envFile = await readFile(path.join(root, "etc/siteflow/siteflow.env"), "utf8");
+      const composeFile = await readFile(path.join(root, "opt/siteflow/compose.yaml"), "utf8");
+      expect(envFile).toContain("SITEFLOW_BASE_DOMAIN=w33d.xyz");
+      expect(envFile).toContain("SITEFLOW_TRUST_PROXY=loopback");
+      expect(composeFile).toContain(installRuntimeImage);
+      expect(composeFile).toContain(installPostgresImage);
+      expect(composeFile).toContain(`SITEFLOW_BUILD_IMAGE: "${installBuildImage}"`);
+      expect(composeFile).not.toContain("SITEFLOW_BUILD_IMAGE_ALLOWLIST");
+      expect(composeFile).toContain('SITEFLOW_TRUST_PROXY: "loopback"');
+      expect(composeFile).toContain("condition: service_healthy");
+      expect(composeFile).toContain("fetch('http://127.0.0.1:8787/readyz')");
+      expect(composeFile).toContain('    user: "${SITEFLOW_WORKER_USER:-0:0}"');
+      expect(composeFile).toContain("    group_add:");
+      expect(composeFile).toContain("  worker:");
+      expect(composeFile).toContain("SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE");
+      expect(composeFile).toContain("SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE");
+      expect(composeFile).toContain("SITEFLOW_GITEA_WEBHOOK_SECRET_FILE");
+      expect(composeFile).toContain("SITEFLOW_GENERIC_WEBHOOK_SECRET_FILE");
+      expect(composeFile).toContain('DATABASE_URL: "postgres://siteflow@postgres:5432/siteflow"');
+      expect(composeFile).not.toContain("export SITEFLOW_");
+      expect(composeFile).not.toContain("$(cat /run/secrets/");
+      expect(composeFile).toContain("/etc/siteflow/secrets/github-webhook.secret");
+      expect(composeFile).toContain("/etc/siteflow/secrets/gitlab-webhook.secret");
+      expect(composeFile).toContain("/etc/siteflow/secrets/gitea-webhook.secret");
+      expect(composeFile).toContain("/etc/siteflow/secrets/generic-webhook.secret");
+      const activeNginx = await readFile(path.join(root, "etc/nginx/sites-enabled/siteflow.conf"), "utf8");
+      expect(activeNginx).toContain("limit_req_zone $binary_remote_addr zone=siteflow_api:10m rate=120r/m;");
+      expect(activeNginx).toContain("limit_req_status 429;");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks restore without explicit confirmation", async () => {
+    const databaseUrl = "postgres://siteflow:supersecret@localhost:5432/siteflow";
+    const { io, output } = createIo();
+    let runnerCalled = false;
+    const code = await runSiteFlowCli(
+      [
+        "restore",
+        "--backup",
+        path.join(os.tmpdir(), "siteflow-backup"),
+        "--database-url",
+        databaseUrl,
+        "--artifact-root",
+        path.join(os.tmpdir(), "siteflow-artifacts"),
+        "--json"
+      ],
+      io,
+      {
+        backup: {
+          runner: async () => {
+            runnerCalled = true;
+
+            return {
+              exitCode: 0,
+              stdout: "ok",
+              stderr: ""
+            };
+          }
+        }
+      }
+    );
+    const result = JSON.parse(output.stdout);
+
+    expect(code).toBe(2);
+    expect(result).toMatchObject({
+      status: "blocked"
+    });
+    expect(result.message).toContain("requires --yes");
+    expect(runnerCalled).toBe(false);
+  });
+
+  it("blocks backup restore-drill without explicit confirmation", async () => {
+    const databaseUrl = "postgres://siteflow:supersecret@localhost:5432/siteflow_drill";
+    const { io, output } = createIo();
+    let runnerCalled = false;
+    const code = await runSiteFlowCli(
+      [
+        "backup",
+        "restore-drill",
+        "--backup",
+        path.join(os.tmpdir(), "siteflow-backup"),
+        "--database-url",
+        databaseUrl,
+        "--artifact-root",
+        path.join(os.tmpdir(), "siteflow-drill-artifacts"),
+        "--json"
+      ],
+      io,
+      {
+        backup: {
+          runner: async () => {
+            runnerCalled = true;
+
+            return {
+              exitCode: 0,
+              stdout: "ok",
+              stderr: ""
+            };
+          }
+        }
+      }
+    );
+    const result = JSON.parse(output.stdout);
+
+    expect(code).toBe(2);
+    expect(result).toMatchObject({
+      status: "blocked",
+      restoreDrill: true
+    });
+    expect(result.message).toContain("requires --yes");
+    expect(result.message).toContain("disposable database");
+    expect(result.message).toContain("Do not use production targets");
+    expect(runnerCalled).toBe(false);
+  });
+
+  it("blocks backup restore-drill when env DATABASE_URL matches the drill database", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-backup-cli-restore-drill-db-overlap-"));
+    const backupPath = path.join(root, "backup");
+    const databaseUrl = "postgres://siteflow:supersecret@localhost:5432/siteflow";
+    const { io, output } = createIo();
+    let runnerCalled = false;
+
+    try {
+      await writeVerifiableBackup(backupPath);
+
+      const code = await runSiteFlowCli(
+        [
+          "backup",
+          "restore-drill",
+          "--backup",
+          backupPath,
+          "--database-url",
+          databaseUrl,
+          "--artifact-root",
+          path.join(root, "drill-artifacts"),
+          "--yes",
+          "--json"
+        ],
+        io,
+        {
+          backup: {
+            runner: async () => {
+              runnerCalled = true;
+
+              return {
+                exitCode: 0,
+                stdout: "ok",
+                stderr: ""
+              };
+            }
+          },
+          env: {
+            DATABASE_URL: "postgresql://siteflow:prodsecret@LOCALHOST/siteflow?sslmode=require",
+            SITEFLOW_ARTIFACT_ROOT: path.join(root, "current-artifacts")
+          }
+        }
+      );
+      const result = JSON.parse(output.stdout);
+
+      expect(code).toBe(1);
+      expect(result).toMatchObject({
+        status: "failed",
+        restoreDrill: true
+      });
+      expect(result.message).toContain("Restore drill database URL must be isolated");
+      expect(result.message).not.toContain("prodsecret");
+      expect(runnerCalled).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks backup restore-drill when explicit current artifact root overlaps the target", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-backup-cli-restore-drill-artifact-overlap-"));
+    const backupPath = path.join(root, "backup");
+    const currentArtifactRoot = path.join(root, "current-artifacts");
+    const { io, output } = createIo();
+    let runnerCalled = false;
+
+    try {
+      await writeVerifiableBackup(backupPath);
+      await mkdir(currentArtifactRoot, { recursive: true });
+      await writeFile(path.join(currentArtifactRoot, "keep.txt"), "production artifact\n", "utf8");
+
+      const code = await runSiteFlowCli(
+        [
+          "backup",
+          "restore-drill",
+          "--backup",
+          backupPath,
+          "--database-url",
+          "postgres://siteflow:supersecret@localhost:5432/siteflow_drill",
+          "--artifact-root",
+          currentArtifactRoot,
+          "--current-artifact-root",
+          currentArtifactRoot,
+          "--yes",
+          "--json"
+        ],
+        io,
+        {
+          backup: {
+            runner: async () => {
+              runnerCalled = true;
+
+              return {
+                exitCode: 0,
+                stdout: "ok",
+                stderr: ""
+              };
+            }
+          },
+          env: {
+            DATABASE_URL: "postgres://siteflow:prodsecret@localhost:5432/siteflow"
+          }
+        }
+      );
+      const result = JSON.parse(output.stdout);
+
+      expect(code).toBe(1);
+      expect(result).toMatchObject({
+        status: "failed",
+        restoreDrill: true
+      });
+      expect(result.message).toContain("Restore drill artifact root must be isolated from the current artifact root");
+      expect(runnerCalled).toBe(false);
+      expect(await readFile(path.join(currentArtifactRoot, "keep.txt"), "utf8")).toBe("production artifact\n");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns redacted JSON when backup command execution fails", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-backup-cli-"));
+    const databaseUrl = "postgres://siteflow:supersecret@localhost:5432/siteflow";
+    const { io, output } = createIo();
+
+    try {
+      const code = await runSiteFlowCli(
+        [
+          "backup",
+          "--output",
+          path.join(root, "backup"),
+          "--database-url",
+          databaseUrl,
+          "--artifact-root",
+          path.join(root, "artifacts"),
+          "--json"
+        ],
+        io,
+        {
+          backup: {
+            runner: async () => ({
+              exitCode: 1,
+              stdout: "",
+              stderr: `pg_dump failed for ${databaseUrl} password=supersecret`
+            })
+          }
+        }
+      );
+      const result = JSON.parse(output.stdout);
+
+      expect(code).toBe(1);
+      expect(result).toMatchObject({
+        status: "failed"
+      });
+      expect(result.message).toContain("[redacted database url]");
+      expect(result.message).not.toContain(databaseUrl);
+      expect(result.message).not.toContain("supersecret");
+      expect(output.stderr).toBe("");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("verifies a backup with JSON output", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-backup-cli-verify-json-"));
+    const backupPath = path.join(root, "backup");
+    const { io, output } = createIo();
+
+    try {
+      await writeVerifiableBackup(backupPath);
+
+      const code = await runSiteFlowCli(["backup", "verify", "--backup", backupPath, "--json"], io);
+      const result = JSON.parse(output.stdout);
+
+      expect(code).toBe(0);
+      expect(result).toMatchObject({
+        status: "verified",
+        backupPath,
+        verificationType: "static",
+        restoreDrill: false,
+        artifacts: {
+          copied: true,
+          present: true
+        }
+      });
+      expect(result.note).toContain("no database restore was performed");
+      expect(output.stderr).toBe("");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("verifies a backup with text output", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-backup-cli-verify-text-"));
+    const backupPath = path.join(root, "backup");
+    const { io, output } = createIo();
+
+    try {
+      await writeVerifiableBackup(backupPath);
+
+      const code = await runSiteFlowCli(["backup", "verify", "--backup", backupPath], io);
+
+      expect(code).toBe(0);
+      expect(output.stdout).toContain("SiteFlow backup verified");
+      expect(output.stdout).toContain("Scope: Static verification only; no database restore was performed.");
+      expect(output.stderr).toBe("");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("offloads a backup with JSON output", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-backup-cli-offload-json-"));
+    const backupPath = path.join(root, "backup");
+    const offHostRoot = path.join(root, "offhost");
+    const { io, output } = createIo();
+
+    try {
+      await writeVerifiableBackup(backupPath);
+
+      const code = await runSiteFlowCli([
+        "backup",
+        "offload",
+        "--backup",
+        backupPath,
+        "--target",
+        pathToFileURL(offHostRoot).href,
+        "--json"
+      ], io, {
+        backup: {
+          now: () => new Date("2026-06-07T02:00:00.000Z")
+        }
+      });
+      const result = JSON.parse(output.stdout);
+
+      expect(code).toBe(0);
+      expect(result).toMatchObject({
+        status: "offloaded",
+        backupPath,
+        offloadedAt: "2026-06-07T02:00:00.000Z",
+        target: {
+          provider: "file",
+          checksumVerified: true
+        }
+      });
+      expect(result.target.location).toBe(pathToFileURL(path.join(offHostRoot, "backup")).href);
+      expect(await readFile(path.join(offHostRoot, "backup", "database", "siteflow.sql"), "utf8")).toBe("database dump\n");
+      expect(output.stderr).toBe("");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fetches a backup from S3 with JSON output", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-backup-cli-fetch-json-"));
+    const remoteBackupPath = path.join(root, "remote", "siteflow-20260607");
+    const outputRoot = path.join(root, "fetched");
+    const commands: Array<{ command: string; args: string[] }> = [];
+    const { io, output } = createIo();
+
+    try {
+      await writeVerifiableBackup(remoteBackupPath);
+      const expectedIntegrity = await directoryTreeIntegrity(remoteBackupPath);
+      const code = await runSiteFlowCli(
+        [
+          "backup",
+          "fetch",
+          "--source",
+          "s3://siteflow-prod-backups/backups/siteflow-20260607",
+          "--output",
+          outputRoot,
+          "--expected-tree-sha256",
+          expectedIntegrity.treeSha256,
+          "--expected-object-count",
+          String(expectedIntegrity.fileCount),
+          "--expected-total-bytes",
+          String(expectedIntegrity.totalBytes),
+          "--json"
+        ],
+        io,
+        {
+          backup: {
+            runner: async (command, args) => {
+              commands.push({ command, args });
+
+              if (command === "aws" && args[0] === "s3" && args[1] === "ls") {
+                return {
+                  exitCode: 0,
+                  stdout: await s3RecursiveListingForDirectory(remoteBackupPath),
+                  stderr: ""
+                };
+              }
+
+              if (command === "aws" && args[0] === "s3" && args[1] === "cp") {
+                await cp(remoteBackupPath, args[3], { recursive: true });
+
+                return { exitCode: 0, stdout: "", stderr: "" };
+              }
+
+              return { exitCode: 1, stdout: "", stderr: "unexpected command" };
+            },
+            now: () => new Date("2026-06-07T02:00:00.000Z")
+          }
+        }
+      );
+      const result = JSON.parse(output.stdout);
+
+      expect(code).toBe(0);
+      expect(commands).toHaveLength(2);
+      expect(result).toMatchObject({
+        status: "fetched",
+        backupPath: path.join(outputRoot, "siteflow-20260607"),
+        fetchedAt: "2026-06-07T02:00:00.000Z",
+        checksumVerified: true,
+        verifyResult: {
+          status: "verified",
+          version: "0.1.0-test"
+        }
+      });
+      expect(result.source.location).toBe("s3://siteflow-prod-backups/backups/siteflow-20260607");
+      expect(result.treeSha256).toBe(expectedIntegrity.treeSha256);
+      expect(await readFile(path.join(outputRoot, "siteflow-20260607", "database", "siteflow.sql"), "utf8")).toBe("database dump\n");
+      expect(output.stderr).toBe("");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("plans backup pruning with JSON output", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-backup-cli-prune-json-"));
+    const backupRoot = path.join(root, "backups");
+    const { io, output } = createIo();
+
+    try {
+      await writeVerifiableBackup(path.join(backupRoot, "siteflow-old-a"));
+      await writeVerifiableBackup(path.join(backupRoot, "siteflow-old-b"));
+      await writeFile(
+        path.join(backupRoot, "siteflow-old-a", "manifest.json"),
+        `${JSON.stringify({
+          version: "0.1.0-test",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          database: {
+            dumpFile: "database/siteflow.sql",
+            format: "plain"
+          },
+          artifacts: {
+            sourcePath: "/var/lib/siteflow/artifacts",
+            path: "artifacts",
+            copied: true
+          }
+        })}\n`,
+        "utf8"
+      );
+
+      const code = await runSiteFlowCli([
+        "backup",
+        "prune",
+        "--backup-root",
+        backupRoot,
+        "--retention-days",
+        "30",
+        "--minimum-backups",
+        "1",
+        "--dry-run",
+        "--json"
+      ], io, {
+        backup: {
+          now: () => new Date("2026-06-07T00:00:00.000Z")
+        }
+      });
+      const result = JSON.parse(output.stdout);
+
+      expect(code).toBe(0);
+      expect(result).toMatchObject({
+        status: "planned",
+        backupRoot,
+        retentionDays: 30,
+        minimumBackups: 1,
+        dryRun: true,
+        evaluatedBackups: 2
+      });
+      expect(result.candidates.map((backup: { backupPath: string }) => path.basename(backup.backupPath))).toEqual(["siteflow-old-a"]);
+      expect(result.deleted).toEqual([]);
+      expect(await readFile(path.join(backupRoot, "siteflow-old-a", "manifest.json"), "utf8")).toContain("2026-01-01T00:00:00.000Z");
+      expect(output.stderr).toBe("");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks backup pruning without dry-run or explicit confirmation", async () => {
+    const { io, output } = createIo();
+    const code = await runSiteFlowCli([
+      "backup",
+      "prune",
+      "--backup-root",
+      path.join(os.tmpdir(), "siteflow-backups"),
+      "--retention-days",
+      "30",
+      "--minimum-backups",
+      "8",
+      "--json"
+    ], io);
+    const result = JSON.parse(output.stdout);
+
+    expect(code).toBe(2);
+    expect(result).toMatchObject({
+      status: "blocked"
+    });
+    expect(result.message).toContain("requires --yes");
+    expect(output.stderr).toBe("");
+  });
+
+  it("runs backup restore-drill with JSON output", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-backup-cli-restore-drill-json-"));
+    const backupPath = path.join(root, "backup");
+    const artifactRoot = path.join(root, "drill-artifacts");
+    const databaseUrl = "postgres://siteflow:supersecret@localhost:5432/siteflow_drill";
+    const commands: Array<{ command: string; args: string[] }> = [];
+    let nowCallCount = 0;
+    const { io, output } = createIo();
+
+    try {
+      await writeVerifiableBackup(backupPath);
+
+      const code = await runSiteFlowCli(
+        [
+          "backup",
+          "restore-drill",
+          "--backup",
+          backupPath,
+          "--database-url",
+          databaseUrl,
+          "--artifact-root",
+          artifactRoot,
+          "--yes",
+          "--json"
+        ],
+        io,
+        {
+          backup: {
+            runner: async (command, args) => {
+              commands.push({ command, args });
+
+              return {
+                exitCode: 0,
+                stdout: "ok",
+                stderr: ""
+              };
+            },
+            now: () => new Date(nowCallCount++ === 0 ? "2026-06-07T00:00:00.000Z" : "2026-06-07T00:00:00.125Z")
+          },
+          env: {
+            DATABASE_URL: "postgres://siteflow:prodsecret@localhost:5432/siteflow",
+            SITEFLOW_ARTIFACT_ROOT: path.join(root, "current-artifacts")
+          }
+        }
+      );
+      const result = JSON.parse(output.stdout);
+
+      expect(code).toBe(0);
+      expect(result).toMatchObject({
+        status: "restore_drilled",
+        restoreDrill: true,
+        backupPath,
+        durationMs: 125,
+        database: {
+          target: "disposable_database",
+          databaseUrl: "[redacted database url]"
+        },
+        artifacts: {
+          target: "temporary_artifact_root",
+          targetPath: artifactRoot,
+          copied: true,
+          restoreMode: "replace_non_atomic"
+        }
+      });
+      expect(commands).toEqual([
+        {
+          command: "psql",
+          args: [
+            "--dbname",
+            databaseUrl,
+            "--set",
+            "ON_ERROR_STOP=1",
+            "--single-transaction",
+            "--file",
+            path.join(backupPath, "database", "siteflow.sql")
+          ]
+        }
+      ]);
+      expect(output.stderr).toBe("");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -950,6 +2267,50 @@ describe("siteflow CLI", () => {
         .toBe("<h1>Hello SiteFlow</h1>");
       expect(gunzipSync(Buffer.from(uploadedByPath.get("index.html.gz")?.contentBase64 ?? "", "base64")).toString("utf8"))
         .toBe("<h1>Hello SiteFlow</h1>");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks prebuilt uploads before HTTP when the package exceeds the configured budget", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "siteflow-prebuilt-budget-"));
+    let fetchCalls = 0;
+
+    try {
+      await writeFile(path.join(directory, "index.html"), "<h1>Hello SiteFlow</h1>");
+      const { io, output } = createIo();
+      const code = await runSiteFlowCli(
+        [
+          "deploy",
+          "--prebuilt",
+          directory,
+          "--server",
+          "https://siteflow.example.com",
+          "--project",
+          "docs",
+          "--base-domain",
+          "w33d.xyz",
+          "--json"
+        ],
+        io,
+        {
+          env: {
+            SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES: "4"
+          },
+          fetch: async () => {
+            fetchCalls += 1;
+            return new Response("{}", { status: 201, headers: { "content-type": "application/json" } });
+          }
+        }
+      );
+      const result = JSON.parse(output.stdout);
+
+      expect(code).toBe(1);
+      expect(fetchCalls).toBe(0);
+      expect(result).toMatchObject({
+        status: "failed"
+      });
+      expect(result.message).toContain("SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES");
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -1282,6 +2643,8 @@ describe("siteflow CLI", () => {
     const site = path.join(root, "dist");
 
     try {
+      const evidencePath = await writeReleaseEvidence(root);
+
       await mkdir(site, { recursive: true });
       await writeFile(path.join(site, "index.html"), "<h1>Production</h1>");
       await writeFile(
@@ -1312,6 +2675,8 @@ describe("siteflow CLI", () => {
           "--project",
           "docs",
           "--prod",
+          "--release-evidence",
+          evidencePath,
           "--config",
           configPath,
           "--json"
@@ -1323,6 +2688,7 @@ describe("siteflow CLI", () => {
             SITEFLOW_ACTOR_NAME: "Acme Dev",
             SITEFLOW_ACTOR_EMAIL: "dev@example.com"
           },
+          releaseEvidence: releaseEvidenceDependencies(),
           fetch: async (input, init) => {
             calls.push({
               url: input.toString(),
@@ -1373,7 +2739,20 @@ describe("siteflow CLI", () => {
         authorization: "Bearer saved-token",
         body: {
           projectSlug: "docs",
-          baseDomain: "w33d.xyz"
+          baseDomain: "w33d.xyz",
+          source: {
+            repository: "acme/siteflow",
+            branch: "main",
+            commitSha: "abc123def4567890"
+          },
+          releaseEvidence: {
+            evidencePath,
+            bundle: expect.objectContaining({
+              schemaVersion: "siteflow.releaseEvidence.v1",
+              name: "siteflow-release-evidence-bundle",
+              targetEnvironment: "production"
+            })
+          }
         }
       });
       expect(calls[1]).toMatchObject({
@@ -1391,7 +2770,15 @@ describe("siteflow CLI", () => {
             role: "developer"
           },
           idempotencyKey: "promote:dep_prebuilt:production",
-          dryRun: false
+          dryRun: false,
+          releaseEvidence: {
+            evidencePath,
+            bundle: expect.objectContaining({
+              schemaVersion: "siteflow.releaseEvidence.v1",
+              name: "siteflow-release-evidence-bundle",
+              targetEnvironment: "production"
+            })
+          }
         }
       });
       expect(result).toMatchObject({
@@ -1405,12 +2792,144 @@ describe("siteflow CLI", () => {
     }
   });
 
+  it("blocks production prebuilt promotion before upload when release evidence is missing", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-prod-deploy-blocked-"));
+    const configPath = path.join(root, "config.json");
+    const site = path.join(root, "dist");
+
+    try {
+      await mkdir(site, { recursive: true });
+      await writeFile(path.join(site, "index.html"), "<h1>Production</h1>");
+      await writeFile(
+        configPath,
+        `${JSON.stringify({
+          defaultServer: "https://siteflow.example.com",
+          servers: {
+            "https://siteflow.example.com": {
+              token: "saved-token",
+              baseDomain: "w33d.xyz"
+            }
+          }
+        })}\n`
+      );
+
+      const calls: string[] = [];
+      const { io, output } = createIo();
+      const code = await runSiteFlowCli(
+        [
+          "deploy",
+          "--prebuilt",
+          site,
+          "--project",
+          "docs",
+          "--prod",
+          "--config",
+          configPath,
+          "--json"
+        ],
+        io,
+        {
+          fetch: async (input) => {
+            calls.push(input.toString());
+            return new Response("{}", { status: 500 });
+          }
+        }
+      );
+      const result = JSON.parse(output.stdout);
+
+      expect(code).toBe(2);
+      expect(calls).toEqual([]);
+      expect(result).toMatchObject({
+        status: "blocked",
+        message: expect.stringContaining("--release-evidence")
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("promotes a deployment through the release API", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-promote-evidence-"));
     const seen = {
       url: "",
       authorization: "",
       body: {} as Record<string, unknown>
     };
+    const { io, output } = createIo();
+
+    try {
+      const evidencePath = await writeReleaseEvidence(root);
+      const code = await runSiteFlowCli(
+        [
+          "promote",
+          "dep_123",
+          "--project",
+          "project-acme-dashboard",
+          "--server",
+          "https://siteflow.example.com",
+          "--token",
+          "secret-token",
+          "--reason",
+          "ship",
+          "--release-evidence",
+          evidencePath,
+          "--json"
+        ],
+        io,
+        {
+          env: {
+            SITEFLOW_ACTOR_ID: "user_1",
+            SITEFLOW_ACTOR_NAME: "Acme Dev",
+            SITEFLOW_ACTOR_EMAIL: "dev@example.com"
+          },
+          releaseEvidence: releaseEvidenceDependencies(),
+          fetch: async (input, init) => {
+            seen.url = input.toString();
+            seen.authorization = new Headers(init?.headers).get("authorization") ?? "";
+            seen.body = JSON.parse(init?.body?.toString() ?? "{}") as Record<string, unknown>;
+            return new Response(JSON.stringify(acceptedPromotionResponse()), {
+              status: 202,
+              headers: { "content-type": "application/json" }
+            });
+          }
+        }
+      );
+
+      expect(code).toBe(0);
+      expect(seen.url).toBe("https://siteflow.example.com/api/projects/project-acme-dashboard/release/production/promote");
+      expect(seen.authorization).toBe("Bearer secret-token");
+      expect(seen.body).toMatchObject({
+        projectId: "project-acme-dashboard",
+        channel: "production",
+        targetDeploymentId: "dep_123",
+        actor: {
+          id: "user_1",
+          name: "Acme Dev",
+          email: "dev@example.com",
+          role: "developer"
+        },
+        reason: "ship",
+        idempotencyKey: "promote:dep_123:production",
+        dryRun: false,
+        releaseEvidence: {
+          evidencePath,
+          bundle: expect.objectContaining({
+            schemaVersion: "siteflow.releaseEvidence.v1",
+            name: "siteflow-release-evidence-bundle",
+            targetEnvironment: "production"
+          })
+        }
+      });
+      expect(JSON.parse(output.stdout)).toMatchObject({
+        status: "accepted"
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks production promotion when release evidence is missing", async () => {
+    const seen: string[] = [];
     const { io, output } = createIo();
     const code = await runSiteFlowCli(
       [
@@ -1422,57 +2941,143 @@ describe("siteflow CLI", () => {
         "https://siteflow.example.com",
         "--token",
         "secret-token",
-        "--reason",
-        "ship",
         "--json"
       ],
       io,
       {
-        env: {
-          SITEFLOW_ACTOR_ID: "user_1",
-          SITEFLOW_ACTOR_NAME: "Acme Dev",
-          SITEFLOW_ACTOR_EMAIL: "dev@example.com"
-        },
-        fetch: async (input, init) => {
-          seen.url = input.toString();
-          seen.authorization = new Headers(init?.headers).get("authorization") ?? "";
-          seen.body = JSON.parse(init?.body?.toString() ?? "{}") as Record<string, unknown>;
-          return new Response(JSON.stringify(acceptedPromotionResponse()), {
-            status: 202,
-            headers: { "content-type": "application/json" }
-          });
+        fetch: async (input) => {
+          seen.push(input.toString());
+          return new Response("{}", { status: 500 });
         }
       }
     );
+    const result = JSON.parse(output.stdout);
 
-    expect(code).toBe(0);
-    expect(seen.url).toBe("https://siteflow.example.com/api/projects/project-acme-dashboard/release/production/promote");
-    expect(seen.authorization).toBe("Bearer secret-token");
-    expect(seen.body).toMatchObject({
-      projectId: "project-acme-dashboard",
-      channel: "production",
-      targetDeploymentId: "dep_123",
-      actor: {
-        id: "user_1",
-        name: "Acme Dev",
-        email: "dev@example.com",
-        role: "developer"
-      },
-      reason: "ship",
-      idempotencyKey: "promote:dep_123:production",
-      dryRun: false
+    expect(code).toBe(2);
+    expect(seen).toEqual([]);
+    expect(result).toMatchObject({
+      status: "blocked",
+      message: expect.stringContaining("--release-evidence")
     });
-    expect(JSON.parse(output.stdout)).toMatchObject({
-      status: "accepted"
+  });
+
+  it("blocks production promotion dry-run when release evidence is missing", async () => {
+    const seen: string[] = [];
+    const { io, output } = createIo();
+    const code = await runSiteFlowCli(
+      [
+        "promote",
+        "dep_123",
+        "--project",
+        "project-acme-dashboard",
+        "--server",
+        "https://siteflow.example.com",
+        "--token",
+        "secret-token",
+        "--dry-run",
+        "--json"
+      ],
+      io,
+      {
+        fetch: async (input) => {
+          seen.push(input.toString());
+          return new Response("{}", { status: 500 });
+        }
+      }
+    );
+    const result = JSON.parse(output.stdout);
+
+    expect(code).toBe(2);
+    expect(seen).toEqual([]);
+    expect(result).toMatchObject({
+      status: "blocked",
+      message: expect.stringContaining("--release-evidence")
     });
   });
 
   it("rolls a release channel back to a known deployment", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-rollback-evidence-"));
     const seen = {
       url: "",
       authorization: "",
       body: {} as Record<string, unknown>
     };
+    const { io, output } = createIo();
+
+    try {
+      const evidencePath = await writeReleaseEvidence(root);
+      const code = await runSiteFlowCli(
+        [
+          "rollback",
+          "dep_123",
+          "--project",
+          "project-acme-dashboard",
+          "--server",
+          "https://siteflow.example.com",
+          "--token",
+          "secret-token",
+          "--current-deployment",
+          "dep_current",
+          "--release-evidence",
+          evidencePath,
+          "--json"
+        ],
+        io,
+        {
+          env: {
+            SITEFLOW_ACTOR_ID: "user_1",
+            SITEFLOW_ACTOR_NAME: "Acme Dev"
+          },
+          releaseEvidence: releaseEvidenceDependencies(),
+          fetch: async (input, init) => {
+            seen.url = input.toString();
+            seen.authorization = new Headers(init?.headers).get("authorization") ?? "";
+            seen.body = JSON.parse(init?.body?.toString() ?? "{}") as Record<string, unknown>;
+            return new Response(
+              JSON.stringify({
+                ...acceptedPromotionResponse(),
+                message: "Rollback route applied."
+              }),
+              { status: 202, headers: { "content-type": "application/json" } }
+            );
+          }
+        }
+      );
+
+      expect(code).toBe(0);
+      expect(seen.url).toBe("https://siteflow.example.com/api/projects/project-acme-dashboard/rollback/production/rollback");
+      expect(seen.authorization).toBe("Bearer secret-token");
+      expect(seen.body).toMatchObject({
+        projectId: "project-acme-dashboard",
+        channel: "production",
+        targetDeploymentId: "dep_123",
+        currentDeploymentId: "dep_current",
+        actor: {
+          id: "user_1",
+          name: "Acme Dev",
+          role: "developer"
+        },
+        idempotencyKey: "rollback:dep_123:production",
+        dryRun: false,
+        releaseEvidence: {
+          evidencePath,
+          bundle: expect.objectContaining({
+            schemaVersion: "siteflow.releaseEvidence.v1",
+            name: "siteflow-release-evidence-bundle",
+            targetEnvironment: "production"
+          })
+        }
+      });
+      expect(JSON.parse(output.stdout)).toMatchObject({
+        status: "accepted"
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks production rollback when release evidence is missing", async () => {
+    const seen: string[] = [];
     const { io, output } = createIo();
     const code = await runSiteFlowCli(
       [
@@ -1484,49 +3089,23 @@ describe("siteflow CLI", () => {
         "https://siteflow.example.com",
         "--token",
         "secret-token",
-        "--current-deployment",
-        "dep_current",
         "--json"
       ],
       io,
       {
-        env: {
-          SITEFLOW_ACTOR_ID: "user_1",
-          SITEFLOW_ACTOR_NAME: "Acme Dev"
-        },
-        fetch: async (input, init) => {
-          seen.url = input.toString();
-          seen.authorization = new Headers(init?.headers).get("authorization") ?? "";
-          seen.body = JSON.parse(init?.body?.toString() ?? "{}") as Record<string, unknown>;
-          return new Response(
-            JSON.stringify({
-              ...acceptedPromotionResponse(),
-              message: "Rollback route applied."
-            }),
-            { status: 202, headers: { "content-type": "application/json" } }
-          );
+        fetch: async (input) => {
+          seen.push(input.toString());
+          return new Response("{}", { status: 500 });
         }
       }
     );
+    const result = JSON.parse(output.stdout);
 
-    expect(code).toBe(0);
-    expect(seen.url).toBe("https://siteflow.example.com/api/projects/project-acme-dashboard/rollback/production/rollback");
-    expect(seen.authorization).toBe("Bearer secret-token");
-    expect(seen.body).toMatchObject({
-      projectId: "project-acme-dashboard",
-      channel: "production",
-      targetDeploymentId: "dep_123",
-      currentDeploymentId: "dep_current",
-      actor: {
-        id: "user_1",
-        name: "Acme Dev",
-        role: "developer"
-      },
-      idempotencyKey: "rollback:dep_123:production",
-      dryRun: false
-    });
-    expect(JSON.parse(output.stdout)).toMatchObject({
-      status: "accepted"
+    expect(code).toBe(2);
+    expect(seen).toEqual([]);
+    expect(result).toMatchObject({
+      status: "blocked",
+      message: expect.stringContaining("--release-evidence")
     });
   });
 
@@ -1724,11 +3303,89 @@ describe("siteflow CLI", () => {
   });
 
   it("starts a rolling release through the management API", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-rolling-evidence-"));
     const seen = {
       url: "",
       authorization: "",
       body: {} as Record<string, unknown>
     };
+    const { io, output } = createIo();
+
+    try {
+      const evidencePath = await writeReleaseEvidence(root);
+      const code = await runSiteFlowCli(
+        [
+          "rolling",
+          "start",
+          "dep-canary",
+          "--project",
+          "project-acme-dashboard",
+          "--server",
+          "https://siteflow.example.com",
+          "--token",
+          "secret-token",
+          "--percentage",
+          "10",
+          "--release-evidence",
+          evidencePath,
+          "--json"
+        ],
+        io,
+        {
+          env: {
+            SITEFLOW_ACTOR_ID: "user_1",
+            SITEFLOW_ACTOR_NAME: "Acme Dev"
+          },
+          releaseEvidence: releaseEvidenceDependencies(),
+          fetch: async (input, init) => {
+            seen.url = input.toString();
+            seen.authorization = new Headers(init?.headers).get("authorization") ?? "";
+            seen.body = JSON.parse(init?.body?.toString() ?? "{}") as Record<string, unknown>;
+            return new Response(JSON.stringify(rollingCommandResponse(10)), {
+              status: 202,
+              headers: { "content-type": "application/json" }
+            });
+          }
+        }
+      );
+
+      expect(code).toBe(0);
+      expect(seen.url).toBe("https://siteflow.example.com/api/projects/project-acme-dashboard/rolling/production/start");
+      expect(seen.authorization).toBe("Bearer secret-token");
+      expect(seen.body).toMatchObject({
+        projectId: "project-acme-dashboard",
+        channel: "production",
+        candidateDeploymentId: "dep-canary",
+        percentage: 10,
+        idempotencyKey: "rolling:start:dep-canary:production",
+        actor: {
+          id: "user_1",
+          name: "Acme Dev",
+          role: "developer"
+        },
+        releaseEvidence: {
+          evidencePath,
+          bundle: expect.objectContaining({
+            schemaVersion: "siteflow.releaseEvidence.v1",
+            name: "siteflow-release-evidence-bundle",
+            targetEnvironment: "production"
+          })
+        }
+      });
+      expect(JSON.parse(output.stdout)).toMatchObject({
+        status: "accepted",
+        rollout: {
+          id: "rollout_preview",
+          percentage: 10
+        }
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks production rolling release when release evidence is missing", async () => {
+    const seen: string[] = [];
     const { io, output } = createIo();
     const code = await runSiteFlowCli(
       [
@@ -1747,67 +3404,129 @@ describe("siteflow CLI", () => {
       ],
       io,
       {
-        env: {
-          SITEFLOW_ACTOR_ID: "user_1",
-          SITEFLOW_ACTOR_NAME: "Acme Dev"
-        },
-        fetch: async (input, init) => {
-          seen.url = input.toString();
-          seen.authorization = new Headers(init?.headers).get("authorization") ?? "";
-          seen.body = JSON.parse(init?.body?.toString() ?? "{}") as Record<string, unknown>;
-          return new Response(JSON.stringify(rollingCommandResponse(10)), {
-            status: 202,
-            headers: { "content-type": "application/json" }
-          });
+        fetch: async (input) => {
+          seen.push(input.toString());
+          return new Response("{}", { status: 500 });
         }
       }
     );
+    const result = JSON.parse(output.stdout);
 
-    expect(code).toBe(0);
-    expect(seen.url).toBe("https://siteflow.example.com/api/projects/project-acme-dashboard/rolling/production/start");
-    expect(seen.authorization).toBe("Bearer secret-token");
-    expect(seen.body).toMatchObject({
-      projectId: "project-acme-dashboard",
-      channel: "production",
-      candidateDeploymentId: "dep-canary",
-      percentage: 10,
-      idempotencyKey: "rolling:start:dep-canary:production",
-      actor: {
-        id: "user_1",
-        name: "Acme Dev",
-        role: "developer"
-      }
-    });
-    expect(JSON.parse(output.stdout)).toMatchObject({
-      status: "accepted",
-      rollout: {
-        id: "rollout_preview",
-        percentage: 10
-      }
+    expect(code).toBe(2);
+    expect(seen).toEqual([]);
+    expect(result).toMatchObject({
+      status: "blocked",
+      message: expect.stringContaining("--release-evidence")
     });
   });
 
   it("advances, completes, and aborts rolling releases", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-rolling-evidence-"));
     const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
     const { io } = createIo();
-    const fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
-      requests.push({
-        url: input.toString(),
-        body: JSON.parse(init?.body?.toString() ?? "{}") as Record<string, unknown>
-      });
-      const action = input.toString().split("/").pop();
-      const response = action === "complete"
-        ? rollingCommandResponse(100, "completed")
-        : action === "abort"
-          ? rollingCommandResponse(25, "aborted")
-          : rollingCommandResponse(50);
 
-      return new Response(JSON.stringify(response), {
-        status: 202,
-        headers: { "content-type": "application/json" }
+    try {
+      const evidencePath = await writeReleaseEvidence(root);
+      const fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        requests.push({
+          url: input.toString(),
+          body: JSON.parse(init?.body?.toString() ?? "{}") as Record<string, unknown>
+        });
+        const action = input.toString().split("/").pop();
+        const response = action === "complete"
+          ? rollingCommandResponse(100, "completed")
+          : action === "abort"
+            ? rollingCommandResponse(25, "aborted")
+            : rollingCommandResponse(50);
+
+        return new Response(JSON.stringify(response), {
+          status: 202,
+          headers: { "content-type": "application/json" }
+        });
+      };
+      const common = [
+        "--project",
+        "project-acme-dashboard",
+        "--server",
+        "https://siteflow.example.com",
+        "--token",
+        "secret-token",
+        "--json"
+      ];
+      const productionEvidence = ["--release-evidence", evidencePath];
+      const cliDependencies = {
+        env: {
+          SITEFLOW_ACTOR_ID: "user_1",
+          SITEFLOW_ACTOR_NAME: "Acme Dev"
+        },
+        releaseEvidence: releaseEvidenceDependencies(),
+        fetch
+      };
+      const advanceCode = await runSiteFlowCli(["rolling", "advance", "--percentage", "50", ...productionEvidence, ...common], io, cliDependencies);
+      const completeCode = await runSiteFlowCli(["rolling", "complete", ...productionEvidence, ...common], io, cliDependencies);
+      const abortCode = await runSiteFlowCli(["rolling", "abort", "--reason", "stop canary", ...common], io, {
+        env: {
+          SITEFLOW_ACTOR_ID: "user_1",
+          SITEFLOW_ACTOR_NAME: "Acme Dev"
+        },
+        fetch
       });
-    };
-    const common = [
+
+      expect([advanceCode, completeCode, abortCode]).toEqual([0, 0, 0]);
+      expect(requests).toEqual([
+        {
+          url: "https://siteflow.example.com/api/projects/project-acme-dashboard/rolling/production/advance",
+          body: expect.objectContaining({
+            percentage: 50,
+            idempotencyKey: "rolling:advance:active:production",
+            releaseEvidence: expect.objectContaining({
+              evidencePath,
+              bundle: expect.objectContaining({
+                schemaVersion: "siteflow.releaseEvidence.v1",
+                targetEnvironment: "production"
+              })
+            })
+          })
+        },
+        {
+          url: "https://siteflow.example.com/api/projects/project-acme-dashboard/rolling/production/complete",
+          body: expect.objectContaining({
+            idempotencyKey: "rolling:complete:active:production",
+            releaseEvidence: expect.objectContaining({
+              evidencePath,
+              bundle: expect.objectContaining({
+                schemaVersion: "siteflow.releaseEvidence.v1",
+                targetEnvironment: "production"
+              })
+            })
+          })
+        },
+        {
+          url: "https://siteflow.example.com/api/projects/project-acme-dashboard/rolling/production/abort",
+          body: expect.objectContaining({
+            reason: "stop canary",
+            idempotencyKey: "rolling:abort:active:production",
+            releaseEvidenceException: {
+              type: "production_rolling_abort_stop_rollout",
+              targetEnvironment: "production",
+              acceptedWithoutReleaseEvidence: true,
+              reason: "stop canary"
+            }
+          })
+        }
+      ]);
+      expect(requests[2].body).not.toHaveProperty("releaseEvidence");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks production rolling abort without an explicit audit reason", async () => {
+    const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const { io, output } = createIo();
+    const code = await runSiteFlowCli([
+      "rolling",
+      "abort",
       "--project",
       "project-acme-dashboard",
       "--server",
@@ -1815,52 +3534,26 @@ describe("siteflow CLI", () => {
       "--token",
       "secret-token",
       "--json"
-    ];
-    const advanceCode = await runSiteFlowCli(["rolling", "advance", "--percentage", "50", ...common], io, {
-      env: {
-        SITEFLOW_ACTOR_ID: "user_1",
-        SITEFLOW_ACTOR_NAME: "Acme Dev"
-      },
-      fetch
-    });
-    const completeCode = await runSiteFlowCli(["rolling", "complete", ...common], io, {
-      env: {
-        SITEFLOW_ACTOR_ID: "user_1",
-        SITEFLOW_ACTOR_NAME: "Acme Dev"
-      },
-      fetch
-    });
-    const abortCode = await runSiteFlowCli(["rolling", "abort", "--reason", "stop canary", ...common], io, {
-      env: {
-        SITEFLOW_ACTOR_ID: "user_1",
-        SITEFLOW_ACTOR_NAME: "Acme Dev"
-      },
-      fetch
-    });
-
-    expect([advanceCode, completeCode, abortCode]).toEqual([0, 0, 0]);
-    expect(requests).toEqual([
-      {
-        url: "https://siteflow.example.com/api/projects/project-acme-dashboard/rolling/production/advance",
-        body: expect.objectContaining({
-          percentage: 50,
-          idempotencyKey: "rolling:advance:active:production"
-        })
-      },
-      {
-        url: "https://siteflow.example.com/api/projects/project-acme-dashboard/rolling/production/complete",
-        body: expect.objectContaining({
-          idempotencyKey: "rolling:complete:active:production"
-        })
-      },
-      {
-        url: "https://siteflow.example.com/api/projects/project-acme-dashboard/rolling/production/abort",
-        body: expect.objectContaining({
-          reason: "stop canary",
-          idempotencyKey: "rolling:abort:active:production"
-        })
+    ], io, {
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        requests.push({
+          url: input.toString(),
+          body: JSON.parse(init?.body?.toString() ?? "{}") as Record<string, unknown>
+        });
+        return new Response(JSON.stringify(rollingCommandResponse(25, "aborted")), {
+          status: 202,
+          headers: { "content-type": "application/json" }
+        });
       }
-    ]);
+    });
+    const result = JSON.parse(output.stdout);
+
+    expect(code).toBe(2);
+    expect(requests).toEqual([]);
+    expect(result).toMatchObject({
+      status: "blocked",
+      message: expect.stringContaining("--reason")
+    });
   });
 
   it("creates and lists cron jobs through the management API", async () => {
@@ -2986,7 +4679,18 @@ describe("siteflow CLI", () => {
                 },
                 routeRevision: {
                   id: "route_123",
-                  status: "applied"
+                  status: "applied",
+                  releaseEvidence: {
+                    evidencePath: "evidence/release-evidence.json",
+                    checkedAt: "2026-06-08T12:00:00.000Z",
+                    status: "passed",
+                    commitRef: "abc123def4567890",
+                    repository: "acme/siteflow",
+                    branch: "main",
+                    targetEnvironment: "production",
+                    releaseTicket: "REL-2026-0608",
+                    operatorName: "release-operator"
+                  }
                 }
               }
             }),
@@ -3002,5 +4706,6 @@ describe("siteflow CLI", () => {
     expect(output.stdout).toContain("Deployment dep_123");
     expect(output.stdout).toContain("Source:     main@4f3a9c2d");
     expect(output.stdout).toContain("Route:      route_123 / applied");
+    expect(output.stdout).toContain("Evidence:   passed / acme/siteflow@main@abc123de / evidence/release-evidence.json");
   });
 });

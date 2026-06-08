@@ -8,6 +8,7 @@ import type { CommandResultReadModel, ReleaseConsoleReadModel } from "@domain/re
 import { createSiteFlowClient, getDefaultSiteFlowClientMode, type SiteFlowClient } from "@lib/api";
 import { AuditReasonForm } from "./components/AuditReasonForm";
 import { CandidatePanel } from "./components/CandidatePanel";
+import { parseReleaseEvidence, ReleaseEvidenceForm, releaseEvidenceFailure, releaseEvidenceRequest } from "./components/ReleaseEvidenceForm";
 import { ReleaseHeader } from "./components/ReleaseHeader";
 import { RoutePreview } from "./components/RoutePreview";
 import { evaluateSafetyGate, normalizeSafetyChecks, SafetyChecks } from "./components/SafetyChecks";
@@ -54,7 +55,10 @@ export function ReleaseConsolePage({ client, projectId, channel, initialReason =
   const resolvedClient = useMemo(() => client ?? createSiteFlowClient(), [client]);
   const [loadState, setLoadState] = useState<LoadState>({ status: "loading" });
   const [reason, setReason] = useState(initialReason);
+  const [releaseEvidencePathValue, setReleaseEvidencePathValue] = useState("");
+  const [releaseEvidenceText, setReleaseEvidenceText] = useState("");
   const [commandState, setCommandState] = useState<CommandState>({ status: "idle" });
+  const parsedReleaseEvidence = useMemo(() => parseReleaseEvidence(releaseEvidenceText), [releaseEvidenceText]);
 
   useEffect(() => {
     let cancelled = false;
@@ -106,6 +110,8 @@ export function ReleaseConsolePage({ client, projectId, channel, initialReason =
   const idempotencyKey = `promote-${data.project.id}-${data.channel}-${data.candidateDeployment?.id ?? "pending"}`;
   const safetyChecks = normalizeSafetyChecks(data.safetyChecks, data.routePreview?.checks);
   const staleCandidate = safetyChecks.find((check) => check.id === "check-candidate-freshness" && check.status !== "pass");
+  const requiresReleaseEvidence = data.channel === "production";
+  const releaseEvidence = requiresReleaseEvidence ? releaseEvidenceRequest(releaseEvidencePathValue, parsedReleaseEvidence) : undefined;
   const gate = evaluateSafetyGate({
     checks: safetyChecks,
     auditReason: reason,
@@ -124,7 +130,16 @@ export function ReleaseConsolePage({ client, projectId, channel, initialReason =
         label: "Route preview",
         passed: Boolean(data.routePreview),
         failure: "Route preview must be generated before promotion."
-      }
+      },
+      ...(requiresReleaseEvidence
+        ? [
+            {
+              label: "Release evidence",
+              passed: Boolean(releaseEvidence),
+              failure: releaseEvidenceFailure(releaseEvidencePathValue, parsedReleaseEvidence)
+            }
+          ]
+        : [])
     ]
   });
   const routeConsequence = data.routePreview
@@ -154,7 +169,8 @@ export function ReleaseConsolePage({ client, projectId, channel, initialReason =
         targetDeploymentId: data.candidateDeployment.id,
         actor,
         reason: reason.trim(),
-        idempotencyKey
+        idempotencyKey,
+        ...(releaseEvidence ? { releaseEvidence } : {})
       });
 
       setCommandState(
@@ -162,6 +178,9 @@ export function ReleaseConsolePage({ client, projectId, channel, initialReason =
           ? { status: "success", message: commandMessage(result), operationId: result.operationId }
           : { status: "validationError", message: result.message }
       );
+      if (result.status === "accepted") {
+        setReleaseEvidenceText("");
+      }
     } catch (error: unknown) {
       setCommandState({ status: "apiError", message: toErrorMessage(error) });
     }
@@ -201,6 +220,14 @@ export function ReleaseConsolePage({ client, projectId, channel, initialReason =
             currentDeploymentId={data.currentDeployment?.id}
             targetDeploymentId={data.candidateDeployment?.id}
             routeConsequence={routeConsequence}
+          />
+          <ReleaseEvidenceForm
+            required={requiresReleaseEvidence}
+            evidencePath={releaseEvidencePathValue}
+            evidenceText={releaseEvidenceText}
+            parsedEvidence={parsedReleaseEvidence}
+            onEvidencePathChange={setReleaseEvidencePathValue}
+            onEvidenceTextChange={setReleaseEvidenceText}
           />
           <StickyActionBar
             actionLabel={actionLabel}

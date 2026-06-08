@@ -3,6 +3,8 @@ export type SiteFlowStorageMode = "local" | "s3";
 export type SiteFlowDatabaseMode = "bundled" | "external";
 export type SiteFlowRouterMode = "managed-nginx" | "external" | "none";
 export type SiteFlowTlsMode = "letsencrypt" | "provided" | "none";
+export type SiteFlowBuildRunner = "host" | "docker";
+export type SiteFlowBuildNetwork = "none" | "bridge";
 
 export interface InstallPaths {
   installDir: string;
@@ -48,11 +50,23 @@ export interface InstallState {
     unitPath?: string;
     composeFile: string;
   };
+  worker: {
+    buildRunner: SiteFlowBuildRunner;
+    buildImage: string;
+    buildImageAllowlist: string[];
+    buildNetwork: SiteFlowBuildNetwork;
+    pollIntervalMs: number;
+  };
   secrets: {
     apiTokenRef: string;
+    metricsTokenRef: string;
     postgresPasswordRef: string;
     appSecretRef: string;
     workerTokenRef: string;
+    githubWebhookSecretRef?: string;
+    gitlabWebhookSecretRef?: string;
+    giteaWebhookSecretRef?: string;
+    genericWebhookSecretRef?: string;
   };
   checksums: Record<string, string>;
   lastOperation?: {
@@ -78,6 +92,9 @@ export interface CreateInstallStateInput {
   baseDomain?: string;
   paths?: Partial<InstallPaths>;
   installedAt?: string;
+  workerPollIntervalMs?: number;
+  buildImage?: string;
+  buildImageAllowlist?: string[];
 }
 
 function uniqueValues(values: Array<string | undefined>) {
@@ -125,11 +142,23 @@ export function createInitialInstallState(input: CreateInstallStateInput): Insta
       unitPath: "/etc/systemd/system/siteflow.service",
       composeFile: `${paths.installDir}/compose.yaml`
     },
+    worker: {
+      buildRunner: "docker",
+      buildImage: input.buildImage ?? "node:20-bookworm-slim",
+      buildImageAllowlist: input.buildImageAllowlist ?? [input.buildImage ?? "node:20-bookworm-slim"],
+      buildNetwork: "none",
+      pollIntervalMs: input.workerPollIntervalMs ?? 5000
+    },
     secrets: {
       apiTokenRef: `${paths.configDir}/secrets/api-token.secret`,
+      metricsTokenRef: `${paths.configDir}/secrets/metrics-token.secret`,
       postgresPasswordRef: `${paths.configDir}/secrets/postgres-password.secret`,
       appSecretRef: `${paths.configDir}/secrets/app-secret.secret`,
-      workerTokenRef: `${paths.configDir}/secrets/worker-token.secret`
+      workerTokenRef: `${paths.configDir}/secrets/worker-token.secret`,
+      githubWebhookSecretRef: `${paths.configDir}/secrets/github-webhook.secret`,
+      gitlabWebhookSecretRef: `${paths.configDir}/secrets/gitlab-webhook.secret`,
+      giteaWebhookSecretRef: `${paths.configDir}/secrets/gitea-webhook.secret`,
+      genericWebhookSecretRef: `${paths.configDir}/secrets/generic-webhook.secret`
     },
     checksums: {},
     lastOperation: {

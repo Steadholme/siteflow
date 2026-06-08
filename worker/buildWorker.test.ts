@@ -1,9 +1,9 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { brotliDecompressSync, gunzipSync } from "node:zlib";
-import type { BuildJobResult, BuildQueue, QueuedBuildJob } from "./buildWorker";
-import { runBuildWorkerOnce } from "./buildWorker";
+import type { BuildJobResult, BuildQueue, QueuedBuildJob, SourceResolver } from "./buildWorker";
+import { assertBuildStoragePreflight, executeBuildJob, runBuildWorkerOnce } from "./buildWorker";
 import { detectBuildSettings } from "./frameworkDetector";
 import { LocalSourceResolver } from "./localSourceResolver";
 
@@ -52,6 +52,7 @@ function queuedJob(sourceDirectory: string): QueuedBuildJob {
 
 class MemoryBuildQueue implements BuildQueue {
   readonly logs: string[] = [];
+  heartbeatCount = 0;
   completed?: BuildJobResult;
   failed?: string;
 
@@ -65,6 +66,10 @@ class MemoryBuildQueue implements BuildQueue {
 
   async appendLog(_jobId: string, line: string): Promise<void> {
     this.logs.push(line);
+  }
+
+  async heartbeatJob(): Promise<void> {
+    this.heartbeatCount += 1;
   }
 
   async completeJob(_job: QueuedBuildJob, result: BuildJobResult): Promise<void> {
@@ -145,12 +150,170 @@ async function createEnvAwareSourceProject(root: string) {
       "console.log(`secret=${process.env.SITEFLOW_BUILD_SECRET}`);",
       "console.log(`config=${process.env.SITEFLOW_CONFIG_SECRET}`);",
       "console.log(`ignored=${process.env.IGNORED_OBJECT}`);",
-      "await writeFile('dist/index.html', `<h1>${process.env.SITEFLOW_PUBLIC_FLAG}</h1><p>${process.env.SITEFLOW_CONFIG_SECRET}</p>`);"
+      "await writeFile('dist/index.html', `<h1>${process.env.SITEFLOW_PUBLIC_FLAG}</h1>`);"
+    ].join("\n")
+  );
+}
+
+async function createSlowSourceProject(root: string) {
+  await mkdir(root, { recursive: true });
+  await writeFile(
+    path.join(root, "package.json"),
+    JSON.stringify({
+      type: "module",
+      scripts: {
+        build: "node build.mjs"
+      }
+    })
+  );
+  await writeFile(
+    path.join(root, "build.mjs"),
+    [
+      "import { mkdir, writeFile } from 'node:fs/promises';",
+      "await new Promise((resolve) => setTimeout(resolve, 50));",
+      "await mkdir('dist', { recursive: true });",
+      "await writeFile('dist/index.html', '<h1>Slow Preview</h1>');"
+    ].join("\n")
+  );
+}
+
+async function createCommandProbeSourceProject(root: string) {
+  await mkdir(root, { recursive: true });
+  await writeFile(
+    path.join(root, "package.json"),
+    JSON.stringify({
+      type: "module",
+      scripts: {
+        test: "node install-probe.mjs",
+        build: "node build.mjs"
+      }
+    })
+  );
+  await writeFile(
+    path.join(root, "install-probe.mjs"),
+    [
+      "import { writeFile } from 'node:fs/promises';",
+      "await writeFile('install-ran.txt', 'yes');"
+    ].join("\n")
+  );
+  await writeFile(
+    path.join(root, "build.mjs"),
+    [
+      "import { mkdir, writeFile } from 'node:fs/promises';",
+      "await mkdir('dist', { recursive: true });",
+      "await writeFile('dist/index.html', '<h1>Trusted Preview</h1>');"
     ].join("\n")
   );
 }
 
 describe("SiteFlow build worker", () => {
+  it("checks build storage capacity before source checkout", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-storage-preflight-"));
+    const workspaceRoot = path.join(root, "workspace");
+    const artifactRoot = path.join(root, "artifacts");
+    let checkoutCalled = false;
+    const sourceResolver: SourceResolver = {
+      checkout: async () => {
+        checkoutCalled = true;
+        throw new Error("checkout should not run");
+      }
+    };
+
+    try {
+      await expect(assertBuildStoragePreflight({
+        workspaceRoot,
+        artifactRoot,
+        minFreeBytes: 1
+      })).resolves.toBeUndefined();
+      await expect(executeBuildJob(queuedJob(path.join(root, "source")), {
+        sourceResolver,
+        workspaceRoot,
+        artifactRoot,
+        baseDomain: "w33d.xyz",
+        allowUnsandboxedSourceBuilds: true,
+        minBuildFreeBytes: Number.MAX_SAFE_INTEGER
+      })).rejects.toThrow("SITEFLOW_BUILD_MIN_FREE_BYTES preflight failed");
+      expect(checkoutCalled).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects networked Docker builds with sensitive build environment variables without leaking values", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-network-secret-"));
+    const sourceDirectory = path.join(root, "source");
+    const workspaceRoot = path.join(root, "workspace");
+    const artifactRoot = path.join(root, "artifacts");
+
+    try {
+      await createTinySourceProject(sourceDirectory);
+      const job = {
+        ...queuedJob(sourceDirectory),
+        environmentVariables: {
+          SITEFLOW_CONFIG_SECRET: "network-secret-value-20260608"
+        }
+      };
+
+      await expect(executeBuildJob(job, {
+        sourceResolver: new LocalSourceResolver(),
+        workspaceRoot,
+        artifactRoot,
+        baseDomain: "w33d.xyz",
+        buildRunner: "docker",
+        dockerBuild: {
+          network: "bridge"
+        }
+      })).rejects.toThrow("Networked Docker builds cannot receive sensitive build environment variables: SITEFLOW_CONFIG_SECRET");
+      await expect(executeBuildJob(job, {
+        sourceResolver: new LocalSourceResolver(),
+        workspaceRoot,
+        artifactRoot,
+        baseDomain: "w33d.xyz",
+        buildRunner: "docker",
+        dockerBuild: {
+          network: "bridge"
+        }
+      })).rejects.not.toThrow("network-secret-value-20260608");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("allows networked Docker builds to proceed when build environment variables are public", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-network-public-"));
+    const sourceDirectory = path.join(root, "source");
+    const workspaceRoot = path.join(root, "workspace");
+    const artifactRoot = path.join(root, "artifacts");
+
+    try {
+      await createTinySourceProject(sourceDirectory);
+      await writeFile(path.join(sourceDirectory, "vercel.json"), JSON.stringify({
+        git: {
+          deploymentEnabled: false
+        }
+      }));
+      const job = {
+        ...queuedJob(sourceDirectory),
+        environmentVariables: {
+          NEXT_PUBLIC_FLAG: "public-value"
+        }
+      };
+
+      await expect(executeBuildJob(job, {
+        sourceResolver: new LocalSourceResolver(),
+        workspaceRoot,
+        artifactRoot,
+        baseDomain: "w33d.xyz",
+        buildRunner: "docker",
+        dockerBuild: {
+          network: "bridge"
+        }
+      })).rejects.toThrow("Build skipped by git.deploymentEnabled");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("claims a queued source build, redacts logs, and publishes an immutable preview artifact", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-test-"));
     const sourceDirectory = path.join(root, "source");
@@ -200,6 +363,392 @@ describe("SiteFlow build worker", () => {
     }
   });
 
+  it("rejects a symlinked output root that resolves outside the project root", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-output-realpath-"));
+    const sourceDirectory = path.join(root, "source");
+    const outsideOutputRoot = path.join(root, "outside-output");
+    const workspaceRoot = path.join(root, "workspace");
+    const artifactRoot = path.join(root, "artifacts");
+    const outputDirectory = "linked-output/dist";
+    const job = {
+      ...queuedJob("unused"),
+      buildSettings: {
+        ...queuedJob("unused").buildSettings,
+        installCommand: "",
+        buildCommand: "",
+        outputDirectory
+      }
+    };
+    const sourceResolver: SourceResolver = {
+      checkout: async () => ({
+        sourceDirectory
+      })
+    };
+    const queue = new MemoryBuildQueue(job);
+
+    try {
+      await mkdir(path.join(outsideOutputRoot, "dist"), { recursive: true });
+      await writeFile(path.join(outsideOutputRoot, "dist", "index.html"), "<h1>Outside Output</h1>");
+      await mkdir(sourceDirectory, { recursive: true });
+
+      try {
+        await symlink(outsideOutputRoot, path.join(sourceDirectory, "linked-output"), "dir");
+      } catch (error) {
+        if (error && typeof error === "object" && "code" in error && ["EPERM", "EINVAL"].includes(String(error.code))) {
+          return;
+        }
+
+        throw error;
+      }
+
+      await expect(runBuildWorkerOnce({
+        workerId: "worker-test",
+        queue,
+        sourceResolver,
+        workspaceRoot,
+        artifactRoot,
+        baseDomain: "w33d.xyz",
+        publicScheme: "https"
+      })).rejects.toThrow(`Build output directory resolves outside the project root: ${outputDirectory}.`);
+      expect(queue.completed).toBeUndefined();
+      expect(queue.failed).toBe(`Build output directory resolves outside the project root: ${outputDirectory}.`);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes from a regular nested output root after realpath validation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-output-normal-"));
+    const sourceDirectory = path.join(root, "source");
+    const workspaceRoot = path.join(root, "workspace");
+    const artifactRoot = path.join(root, "artifacts");
+    const job = {
+      ...queuedJob("unused"),
+      buildSettings: {
+        ...queuedJob("unused").buildSettings,
+        installCommand: "",
+        buildCommand: "",
+        outputDirectory: "nested/dist"
+      }
+    };
+    const sourceResolver: SourceResolver = {
+      checkout: async () => ({
+        sourceDirectory
+      })
+    };
+
+    try {
+      await mkdir(path.join(sourceDirectory, "nested", "dist"), { recursive: true });
+      await writeFile(path.join(sourceDirectory, "nested", "dist", "index.html"), "<h1>Nested Output</h1>");
+
+      const queue = new MemoryBuildQueue(job);
+      const result = await runBuildWorkerOnce({
+        workerId: "worker-test",
+        queue,
+        sourceResolver,
+        workspaceRoot,
+        artifactRoot,
+        baseDomain: "w33d.xyz",
+        publicScheme: "https"
+      });
+
+      expect(result?.artifact.manifest.entrypoint).toBe("index.html");
+      expect(await readFile(path.join(result?.artifact.artifactRoot ?? "", "index.html"), "utf8")).toContain("Nested Output");
+      expect(queue.failed).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("removes an internally-created temp workspace after executing a build", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-temp-cleanup-"));
+    const artifactRoot = path.join(root, "artifacts");
+    const job = {
+      ...queuedJob("unused"),
+      buildSettings: {
+        ...queuedJob("unused").buildSettings,
+        installCommand: "",
+        buildCommand: "",
+        outputDirectory: "dist"
+      }
+    };
+    let tempWorkspaceRoot = "";
+    let cleanupCalled = false;
+    const sourceResolver: SourceResolver = {
+      checkout: async (checkoutJob, workspaceRoot) => {
+        tempWorkspaceRoot = workspaceRoot;
+        const sourceDirectory = path.join(workspaceRoot, checkoutJob.id, "source");
+
+        await mkdir(path.join(sourceDirectory, "dist"), { recursive: true });
+        await writeFile(path.join(sourceDirectory, "dist", "index.html"), "<h1>Temp Workspace</h1>");
+
+        return {
+          sourceDirectory,
+          cleanup: async () => {
+            cleanupCalled = true;
+          }
+        };
+      }
+    };
+
+    try {
+      const result = await executeBuildJob(job, {
+        sourceResolver,
+        artifactRoot,
+        baseDomain: "w33d.xyz",
+        publicScheme: "https"
+      });
+
+      expect(result.artifact.manifest.entrypoint).toBe("index.html");
+      expect(cleanupCalled).toBe(true);
+      expect(tempWorkspaceRoot).toContain("siteflow-worker-");
+      await expect(stat(tempWorkspaceRoot)).rejects.toMatchObject({
+        code: "ENOENT"
+      });
+    } finally {
+      if (tempWorkspaceRoot) {
+        await rm(tempWorkspaceRoot, { recursive: true, force: true });
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("removes an internally-created temp workspace when checkout fails", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-temp-checkout-fail-"));
+    let tempWorkspaceRoot = "";
+    const sourceResolver: SourceResolver = {
+      checkout: async (_checkoutJob, workspaceRoot) => {
+        tempWorkspaceRoot = workspaceRoot;
+        await mkdir(path.join(workspaceRoot, "partial"), { recursive: true });
+        throw new Error("checkout failed");
+      }
+    };
+
+    try {
+      await expect(executeBuildJob(queuedJob("unused"), {
+        sourceResolver,
+        artifactRoot: path.join(root, "artifacts"),
+        baseDomain: "w33d.xyz"
+      })).rejects.toThrow("checkout failed");
+      expect(tempWorkspaceRoot).toContain("siteflow-worker-");
+      await expect(stat(tempWorkspaceRoot)).rejects.toMatchObject({
+        code: "ENOENT"
+      });
+    } finally {
+      if (tempWorkspaceRoot) {
+        await rm(tempWorkspaceRoot, { recursive: true, force: true });
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a caller-provided workspace root after executing a build", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-provided-workspace-"));
+    const workspaceRoot = path.join(root, "workspace");
+    const artifactRoot = path.join(root, "artifacts");
+    const markerPath = path.join(workspaceRoot, "caller-marker.txt");
+    const job = {
+      ...queuedJob("unused"),
+      buildSettings: {
+        ...queuedJob("unused").buildSettings,
+        installCommand: "",
+        buildCommand: "",
+        outputDirectory: "dist"
+      }
+    };
+    const sourceResolver: SourceResolver = {
+      checkout: async (checkoutJob, providedWorkspaceRoot) => {
+        const jobRoot = path.join(providedWorkspaceRoot, checkoutJob.id);
+        const sourceDirectory = path.join(jobRoot, "source");
+
+        await mkdir(path.join(sourceDirectory, "dist"), { recursive: true });
+        await writeFile(path.join(sourceDirectory, "dist", "index.html"), "<h1>Provided Workspace</h1>");
+
+        return {
+          sourceDirectory,
+          cleanup: async () => {
+            await rm(jobRoot, { recursive: true, force: true });
+          }
+        };
+      }
+    };
+
+    try {
+      await mkdir(workspaceRoot, { recursive: true });
+      await writeFile(markerPath, "keep", "utf8");
+
+      const result = await executeBuildJob(job, {
+        sourceResolver,
+        workspaceRoot,
+        artifactRoot,
+        baseDomain: "w33d.xyz",
+        publicScheme: "https"
+      });
+
+      expect(result.artifact.manifest.entrypoint).toBe("index.html");
+      expect(await readFile(markerPath, "utf8")).toBe("keep");
+      expect((await stat(workspaceRoot)).isDirectory()).toBe(true);
+      await expect(stat(path.join(workspaceRoot, job.id))).rejects.toMatchObject({
+        code: "ENOENT"
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("renews the build job heartbeat while a job is running", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-heartbeat-"));
+    const sourceDirectory = path.join(root, "source");
+    const workspaceRoot = path.join(root, "workspace");
+    const artifactRoot = path.join(root, "artifacts");
+
+    try {
+      await createSlowSourceProject(sourceDirectory);
+      const queue = new MemoryBuildQueue(queuedJob(sourceDirectory));
+      const result = await runBuildWorkerOnce({
+        workerId: "worker-test",
+        queue,
+        sourceResolver: new LocalSourceResolver(),
+        workspaceRoot,
+        artifactRoot,
+        baseDomain: "w33d.xyz",
+        publicScheme: "https",
+        jobHeartbeatIntervalMs: 5
+      });
+
+      expect(result?.artifact.manifest.entrypoint).toBe("index.html");
+      expect(queue.heartbeatCount).toBeGreaterThan(0);
+      expect(queue.failed).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects production unsafe source builds before running install or build commands", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-unsafe-guard-"));
+    const sourceDirectory = path.join(root, "source");
+    const workspaceRoot = path.join(root, "workspace");
+    const artifactRoot = path.join(root, "artifacts");
+
+    try {
+      await createCommandProbeSourceProject(sourceDirectory);
+      const job = {
+        ...queuedJob(sourceDirectory),
+        buildSettings: {
+          ...queuedJob(sourceDirectory).buildSettings,
+          installCommand: "npm test",
+          buildCommand: "npm run build"
+        }
+      };
+      const queue = new MemoryBuildQueue(job);
+      const result = await runBuildWorkerOnce({
+        workerId: "worker-test",
+        queue,
+        sourceResolver: new LocalSourceResolver(),
+        workspaceRoot,
+        artifactRoot,
+        baseDomain: "w33d.xyz",
+        publicScheme: "https",
+        allowUnsandboxedSourceBuilds: false,
+        buildRunner: "host"
+      });
+      const logs = queue.logs.join("\n");
+
+      expect(result).toBeUndefined();
+      expect(queue.completed).toBeUndefined();
+      expect(queue.failed).toContain("skipped:Production source build rejected");
+      expect(logs).toContain("Production source build rejected");
+      expect(logs).not.toContain("$ npm test");
+      expect(logs).not.toContain("$ npm run build");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("allows production source builds when the docker runner is configured", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-docker-guard-"));
+    const sourceDirectory = path.join(root, "source");
+    const workspaceRoot = path.join(root, "workspace");
+    const artifactRoot = path.join(root, "artifacts");
+
+    try {
+      await mkdir(path.join(sourceDirectory, "dist"), { recursive: true });
+      await writeFile(path.join(sourceDirectory, "package.json"), JSON.stringify({ type: "module" }));
+      await writeFile(path.join(sourceDirectory, "dist", "index.html"), "<h1>Docker Guard Preview</h1>");
+      const job = {
+        ...queuedJob(sourceDirectory),
+        buildSettings: {
+          ...queuedJob(sourceDirectory).buildSettings,
+          installCommand: "",
+          buildCommand: "",
+          outputDirectory: "dist"
+        }
+      };
+      const queue = new MemoryBuildQueue(job);
+      const result = await runBuildWorkerOnce({
+        workerId: "worker-test",
+        queue,
+        sourceResolver: new LocalSourceResolver(),
+        workspaceRoot,
+        artifactRoot,
+        baseDomain: "w33d.xyz",
+        publicScheme: "https",
+        allowUnsandboxedSourceBuilds: false,
+        buildRunner: "docker"
+      });
+      const logs = queue.logs.join("\n");
+
+      expect(result?.artifact.manifest.entrypoint).toBe("index.html");
+      expect(await readFile(path.join(result?.artifact.artifactRoot ?? "", "index.html"), "utf8")).toContain("Docker Guard Preview");
+      expect(queue.completed?.deploymentId).toBe(result?.deploymentId);
+      expect(queue.failed).toBeUndefined();
+      expect(logs).not.toContain("Production source build rejected");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("runs the existing source build path when unsandboxed source builds are explicitly trusted", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-trusted-build-"));
+    const sourceDirectory = path.join(root, "source");
+    const workspaceRoot = path.join(root, "workspace");
+    const artifactRoot = path.join(root, "artifacts");
+
+    try {
+      await createCommandProbeSourceProject(sourceDirectory);
+      const job = {
+        ...queuedJob(sourceDirectory),
+        buildSettings: {
+          ...queuedJob(sourceDirectory).buildSettings,
+          installCommand: "npm test",
+          buildCommand: "npm run build"
+        }
+      };
+      const queue = new MemoryBuildQueue(job);
+      const result = await runBuildWorkerOnce({
+        workerId: "worker-test",
+        queue,
+        sourceResolver: new LocalSourceResolver(),
+        workspaceRoot,
+        artifactRoot,
+        baseDomain: "w33d.xyz",
+        publicScheme: "https",
+        allowUnsandboxedSourceBuilds: true,
+        buildRunner: "host"
+      });
+      const logs = queue.logs.join("\n");
+
+      expect(result?.artifact.manifest.entrypoint).toBe("index.html");
+      expect(await readFile(path.join(result?.artifact.artifactRoot ?? "", "index.html"), "utf8")).toContain("Trusted Preview");
+      expect(queue.completed?.deploymentId).toBe(result?.deploymentId);
+      expect(queue.failed).toBeUndefined();
+      expect(logs).toContain("$ npm test");
+      expect(logs).toContain("$ npm run build");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 10000);
+
   it("detects Node.js functions and publishes them with the artifact manifest", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-functions-"));
     const sourceDirectory = path.join(root, "source");
@@ -235,6 +784,7 @@ describe("SiteFlow build worker", () => {
           path: "/api/revalidate",
           sourcePath: ".siteflow/functions/api/revalidate.js",
           runtime: "nodejs20.x",
+          runtimeIsolation: "same_process",
           handler: "default"
         }
       ]);
@@ -243,6 +793,48 @@ describe("SiteFlow build worker", () => {
         .toContain("export default async function handler");
       expect(await readFile(path.join(result?.artifact.artifactRoot ?? "", ".siteflow", "functions", "package.json"), "utf8"))
         .toContain('"type":"module"');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects symlinked api directories before publishing function artifacts", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-function-api-symlink-"));
+    const sourceDirectory = path.join(root, "source");
+    const outsideApiDirectory = path.join(root, "outside-api");
+    const workspaceRoot = path.join(root, "workspace");
+    const artifactRoot = path.join(root, "artifacts");
+
+    try {
+      await createTinySourceProject(sourceDirectory);
+      await mkdir(outsideApiDirectory, { recursive: true });
+      await writeFile(
+        path.join(outsideApiDirectory, "leak.js"),
+        "export default async function handler() { return { status: 200 }; }"
+      );
+
+      try {
+        await symlink(outsideApiDirectory, path.join(sourceDirectory, "api"), "dir");
+      } catch (error) {
+        if (error && typeof error === "object" && "code" in error && ["EPERM", "EINVAL"].includes(String(error.code))) {
+          return;
+        }
+
+        throw error;
+      }
+
+      const queue = new MemoryBuildQueue(queuedJob(sourceDirectory));
+
+      await expect(runBuildWorkerOnce({
+        workerId: "worker-test",
+        queue,
+        sourceResolver: new LocalSourceResolver(),
+        workspaceRoot,
+        artifactRoot,
+        baseDomain: "w33d.xyz",
+        publicScheme: "https"
+      })).rejects.toThrow("Function api directory must not be a symlink: api.");
+      expect(queue.failed).toContain("Function api directory must not be a symlink: api.");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -295,6 +887,7 @@ describe("SiteFlow build worker", () => {
           path: "/api/revalidate",
           sourcePath: ".siteflow/functions/api/revalidate.js",
           runtime: "nodejs20.x",
+          runtimeIsolation: "same_process",
           handler: "default",
           timeoutMs: 3000,
           concurrency: 7
@@ -363,6 +956,7 @@ describe("SiteFlow build worker", () => {
           path: "/api/default",
           sourcePath: ".siteflow/functions/api/default.js",
           runtime: "nodejs20.x",
+          runtimeIsolation: "same_process",
           handler: "default",
           regions: ["iad1"],
           failoverRegions: ["dub1"]
@@ -371,6 +965,7 @@ describe("SiteFlow build worker", () => {
           path: "/api/edge",
           sourcePath: ".siteflow/functions/api/edge.js",
           runtime: "nodejs20.x",
+          runtimeIsolation: "same_process",
           handler: "default",
           regions: ["sfo1"],
           failoverRegions: ["iad1"]
@@ -441,6 +1036,112 @@ describe("SiteFlow build worker", () => {
     }
   });
 
+  it("rejects vercel.json function includeFiles that resolve through symlinks", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-function-include-symlink-"));
+    const sourceDirectory = path.join(root, "source");
+    const workspaceRoot = path.join(root, "workspace");
+    const artifactRoot = path.join(root, "artifacts");
+    const outsideSecret = path.join(root, "outside-secret.json");
+
+    try {
+      await createTinySourceProject(sourceDirectory);
+      await mkdir(path.join(sourceDirectory, "api"), { recursive: true });
+      await mkdir(path.join(sourceDirectory, "data"), { recursive: true });
+      await writeFile(
+        path.join(sourceDirectory, "api", "lookup.js"),
+        [
+          "export default async function handler() {",
+          "  return { status: 200, body: { ok: true } };",
+          "}"
+        ].join("\n")
+      );
+      await writeFile(outsideSecret, JSON.stringify({ token: "outside" }));
+
+      try {
+        await symlink(outsideSecret, path.join(sourceDirectory, "data", "linked.json"), "file");
+      } catch (error) {
+        if (error && typeof error === "object" && "code" in error && ["EPERM", "EINVAL"].includes(String(error.code))) {
+          return;
+        }
+
+        throw error;
+      }
+
+      await writeFile(
+        path.join(sourceDirectory, "vercel.json"),
+        JSON.stringify({
+          functions: {
+            "api/lookup.js": {
+              includeFiles: ["data/**/*.json"]
+            }
+          }
+        })
+      );
+
+      const queue = new MemoryBuildQueue(queuedJob(sourceDirectory));
+
+      await expect(runBuildWorkerOnce({
+        workerId: "worker-test",
+        queue,
+        sourceResolver: new LocalSourceResolver(),
+        workspaceRoot,
+        artifactRoot,
+        baseDomain: "w33d.xyz",
+        publicScheme: "https"
+      })).rejects.toThrow("Function includeFiles entry must not be a symlink: data/linked.json.");
+      expect(queue.failed).toContain("Function includeFiles entry must not be a symlink: data/linked.json.");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects vercel.json function includeFiles that match secret-like paths", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-function-include-secret-"));
+    const sourceDirectory = path.join(root, "source");
+    const workspaceRoot = path.join(root, "workspace");
+    const artifactRoot = path.join(root, "artifacts");
+
+    try {
+      await createTinySourceProject(sourceDirectory);
+      await mkdir(path.join(sourceDirectory, "api"), { recursive: true });
+      await mkdir(path.join(sourceDirectory, "data"), { recursive: true });
+      await writeFile(
+        path.join(sourceDirectory, "api", "lookup.js"),
+        [
+          "export default async function handler() {",
+          "  return { status: 200, body: { ok: true } };",
+          "}"
+        ].join("\n")
+      );
+      await writeFile(path.join(sourceDirectory, "data", ".env"), "DATABASE_URL=postgres://secret");
+      await writeFile(
+        path.join(sourceDirectory, "vercel.json"),
+        JSON.stringify({
+          functions: {
+            "api/lookup.js": {
+              includeFiles: ["data/**"]
+            }
+          }
+        })
+      );
+
+      const queue = new MemoryBuildQueue(queuedJob(sourceDirectory));
+
+      await expect(runBuildWorkerOnce({
+        workerId: "worker-test",
+        queue,
+        sourceResolver: new LocalSourceResolver(),
+        workspaceRoot,
+        artifactRoot,
+        baseDomain: "w33d.xyz",
+        publicScheme: "https"
+      })).rejects.toThrow("Function includeFiles entry is blocked because it looks like a .env file: data/.env.");
+      expect(queue.failed).toContain("Function includeFiles entry is blocked because it looks like a .env file: data/.env.");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("excludes vercel.json function excludeFiles from included function bundles", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-function-excludes-"));
     const sourceDirectory = path.join(root, "source");
@@ -460,14 +1161,15 @@ describe("SiteFlow build worker", () => {
         ].join("\n")
       );
       await writeFile(path.join(sourceDirectory, "data", "public.json"), JSON.stringify({ visibility: "public" }));
+      await writeFile(path.join(sourceDirectory, "data", ".env"), "DATABASE_URL=postgres://excluded");
       await writeFile(path.join(sourceDirectory, "data", "private", "secret.json"), JSON.stringify({ visibility: "private" }));
       await writeFile(
         path.join(sourceDirectory, "vercel.json"),
         JSON.stringify({
           functions: {
             "api/lookup.js": {
-              includeFiles: ["data/**/*.json"],
-              excludeFiles: ["data/private/**"]
+              includeFiles: ["data/**"],
+              excludeFiles: ["data/.env", "data/private/**"]
             }
           }
         })
@@ -486,6 +1188,8 @@ describe("SiteFlow build worker", () => {
 
       expect(await readFile(path.join(result?.artifact.artifactRoot ?? "", ".siteflow", "functions", "data", "public.json"), "utf8"))
         .toContain("public");
+      await expect(readFile(path.join(result?.artifact.artifactRoot ?? "", ".siteflow", "functions", "data", ".env"), "utf8"))
+        .rejects.toThrow();
       await expect(readFile(path.join(result?.artifact.artifactRoot ?? "", ".siteflow", "functions", "data", "private", "secret.json"), "utf8"))
         .rejects.toThrow();
     } finally {
@@ -803,8 +1507,56 @@ describe("SiteFlow build worker", () => {
       const indexHtml = await readFile(path.join(result?.artifact.artifactRoot ?? "", "index.html"), "utf8");
 
       expect(indexHtml).toContain("Injected Preview");
-      expect(indexHtml).toContain(configSecret);
+      expect(indexHtml).not.toContain(configSecret);
       expect(indexHtml).not.toContain("From vercel.json");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails builds when sensitive build environment values are written to public artifacts", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-env-leak-"));
+    const sourceDirectory = path.join(root, "source");
+    const workspaceRoot = path.join(root, "workspace");
+    const artifactRoot = path.join(root, "artifacts");
+    const secret = "config-secret-20260527";
+
+    try {
+      await createEnvAwareSourceProject(sourceDirectory);
+      await writeFile(
+        path.join(sourceDirectory, "build.mjs"),
+        [
+          "import { mkdir, writeFile } from 'node:fs/promises';",
+          "await mkdir('dist', { recursive: true });",
+          "console.log(`config=${process.env.SITEFLOW_CONFIG_SECRET}`);",
+          "await writeFile('dist/index.html', `<p>${process.env.SITEFLOW_CONFIG_SECRET}</p>`);"
+        ].join("\n")
+      );
+      await writeFile(
+        path.join(sourceDirectory, "vercel.json"),
+        JSON.stringify({
+          build: {
+            env: {
+              SITEFLOW_CONFIG_SECRET: secret
+            }
+          }
+        })
+      );
+      const queue = new MemoryBuildQueue(queuedJob(sourceDirectory));
+
+      await expect(runBuildWorkerOnce({
+        workerId: "worker-test",
+        queue,
+        sourceResolver: new LocalSourceResolver(),
+        workspaceRoot,
+        artifactRoot,
+        baseDomain: "w33d.xyz",
+        publicScheme: "https"
+      })).rejects.toThrow("Build artifact contains blocked secret value for SITEFLOW_CONFIG_SECRET in index.html.");
+
+      expect(queue.failed).toContain("Build artifact contains blocked secret value for SITEFLOW_CONFIG_SECRET in index.html.");
+      expect(queue.failed).not.toContain(secret);
+      expect(queue.logs.join("\n")).not.toContain(secret);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -971,6 +1723,69 @@ describe("SiteFlow build worker", () => {
       expect(queue.completed?.deploymentId).toBe(result?.deploymentId);
       expect(queue.failed).toBeUndefined();
       expect(queue.logs.join("\n")).toContain("ignoreCommand exited with code 1; continuing build.");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails the build when the published artifact exceeds the byte budget", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-artifact-bytes-"));
+    const sourceDirectory = path.join(root, "source");
+    const workspaceRoot = path.join(root, "workspace");
+    const artifactRoot = path.join(root, "artifacts");
+
+    try {
+      await createTinySourceProject(sourceDirectory);
+      const queue = new MemoryBuildQueue(queuedJob(sourceDirectory));
+
+      await expect(
+        runBuildWorkerOnce({
+          workerId: "worker-test",
+          queue,
+          sourceResolver: new LocalSourceResolver(),
+          workspaceRoot,
+          artifactRoot,
+          baseDomain: "w33d.xyz",
+          publicScheme: "https",
+          maxArtifactBytes: 10
+        })
+      ).rejects.toThrow("SITEFLOW_BUILD_MAX_ARTIFACT_BYTES");
+
+      expect(queue.completed).toBeUndefined();
+      expect(queue.failed).toContain("SITEFLOW_BUILD_MAX_ARTIFACT_BYTES");
+      expect(queue.logs.join("\n")).toContain("SITEFLOW_BUILD_MAX_ARTIFACT_BYTES");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails the build when precompressed artifacts exceed the final file budget", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-artifact-files-"));
+    const sourceDirectory = path.join(root, "source");
+    const workspaceRoot = path.join(root, "workspace");
+    const artifactRoot = path.join(root, "artifacts");
+
+    try {
+      await createTinySourceProject(sourceDirectory);
+      const queue = new MemoryBuildQueue(queuedJob(sourceDirectory));
+
+      await expect(
+        runBuildWorkerOnce({
+          workerId: "worker-test",
+          queue,
+          sourceResolver: new LocalSourceResolver(),
+          workspaceRoot,
+          artifactRoot,
+          baseDomain: "w33d.xyz",
+          publicScheme: "https",
+          maxArtifactBytes: 1024 * 1024,
+          maxArtifactFiles: 1
+        })
+      ).rejects.toThrow("SITEFLOW_BUILD_MAX_ARTIFACT_FILES");
+
+      expect(queue.completed).toBeUndefined();
+      expect(queue.failed).toContain("SITEFLOW_BUILD_MAX_ARTIFACT_FILES");
+      expect(queue.logs.join("\n")).toContain("SITEFLOW_BUILD_MAX_ARTIFACT_FILES");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

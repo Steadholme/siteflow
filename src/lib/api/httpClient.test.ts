@@ -1,6 +1,15 @@
 import { siteflowFixtures } from "@lib/fixtures/siteflow.fixtures";
-import { SITEFLOW_SECRET_CANARY } from "@lib/redaction";
+import { REDACTION_PLACEHOLDER, SITEFLOW_SECRET_CANARY } from "@lib/redaction";
 import { HttpSiteFlowClient, SiteFlowHttpError } from "./httpClient";
+
+const releaseEvidenceRequest = {
+  evidencePath: "evidence/release-evidence.json",
+  bundle: {
+    schemaVersion: "siteflow.releaseEvidence.v1",
+    name: "siteflow-release-evidence-bundle",
+    targetEnvironment: "production"
+  }
+};
 
 function jsonResponse(body: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(body), {
@@ -27,6 +36,180 @@ describe("HttpSiteFlowClient", () => {
 
     expect(data.summary.totalProjects).toBe(1);
     expect(requests).toEqual(["https://siteflow.example.com/api/projects"]);
+  });
+
+  it("adds a Bearer authorization header when an auth token is configured", async () => {
+    const authorizationHeaders: Array<string | null> = [];
+    const client = new HttpSiteFlowClient({
+      baseUrl: "https://siteflow.example.com/",
+      authToken: " sf_live_operator_console_token ",
+      fetch: async (_input, init) => {
+        authorizationHeaders.push(new Headers(init?.headers).get("authorization"));
+        return jsonResponse(siteflowFixtures.healthy.projectList);
+      }
+    });
+
+    await client.listProjects();
+
+    expect(authorizationHeaders).toEqual(["Bearer sf_live_operator_console_token"]);
+  });
+
+  it("loads Bearer authorization from a token provider", async () => {
+    const authorizationHeaders: Array<string | null> = [];
+    const client = new HttpSiteFlowClient({
+      baseUrl: "https://siteflow.example.com/",
+      getAuthToken: async () => "sf_test_operator_console_token",
+      fetch: async (_input, init) => {
+        authorizationHeaders.push(new Headers(init?.headers).get("authorization"));
+        return jsonResponse(siteflowFixtures.healthy.projectList);
+      }
+    });
+
+    await client.listProjects();
+
+    expect(authorizationHeaders).toEqual(["Bearer sf_test_operator_console_token"]);
+  });
+
+  it("does not add an authorization header when no token is configured", async () => {
+    const authorizationHeaders: Array<string | null> = [];
+    const client = new HttpSiteFlowClient({
+      baseUrl: "https://siteflow.example.com/",
+      fetch: async (_input, init) => {
+        authorizationHeaders.push(new Headers(init?.headers).get("authorization"));
+        return jsonResponse(siteflowFixtures.healthy.projectList);
+      }
+    });
+
+    await client.listProjects();
+
+    expect(authorizationHeaders).toEqual([null]);
+  });
+
+  it("adds a same-origin CSRF header for cookie-backed mutation requests", async () => {
+    const requests: Array<{ authorization: string | null; csrf: string | null; credentials?: RequestCredentials }> = [];
+    const client = new HttpSiteFlowClient({
+      baseUrl: "https://siteflow.example.com/",
+      fetch: async (_input, init) => {
+        const headers = new Headers(init?.headers);
+        requests.push({
+          authorization: headers.get("authorization"),
+          csrf: headers.get("x-siteflow-csrf"),
+          credentials: init?.credentials
+        });
+        return jsonResponse({ status: "created", project: siteflowFixtures.healthy.projectList.projects[0] });
+      }
+    });
+
+    await client.createProject({
+      name: "Docs",
+      slug: "docs"
+    });
+
+    expect(requests).toEqual([
+      {
+        authorization: null,
+        csrf: "same-origin",
+        credentials: "same-origin"
+      }
+    ]);
+  });
+
+  it("does not add CSRF headers to bearer or credentialless mutation requests", async () => {
+    const csrfHeaders: Array<string | null> = [];
+    const bearerClient = new HttpSiteFlowClient({
+      baseUrl: "https://siteflow.example.com/",
+      authToken: "sf_live_operator_console_token",
+      fetch: async (_input, init) => {
+        csrfHeaders.push(new Headers(init?.headers).get("x-siteflow-csrf"));
+        return jsonResponse({ status: "created", project: siteflowFixtures.healthy.projectList.projects[0] });
+      }
+    });
+    const publicClient = new HttpSiteFlowClient({
+      baseUrl: "https://siteflow.example.com/",
+      fetch: async (_input, init) => {
+        csrfHeaders.push(new Headers(init?.headers).get("x-siteflow-csrf"));
+        return jsonResponse({
+          status: "accepted",
+          event: {
+            id: "analytics_pageview_docs",
+            projectId: "project-acme-dashboard",
+            kind: "pageview",
+            path: "/docs",
+            receivedAt: "2026-05-26T00:00:01.000Z"
+          },
+          message: "Analytics event accepted."
+        });
+      }
+    });
+
+    await bearerClient.createProject({
+      name: "Docs",
+      slug: "docs"
+    });
+    await publicClient.ingestAnalyticsEvent({
+      projectId: "project-acme-dashboard",
+      kind: "pageview",
+      path: "/docs"
+    });
+
+    expect(csrfHeaders).toEqual([null, null]);
+  });
+
+  it("posts normalized git webhook commands to the selected provider path", async () => {
+    const requests: Array<{ url: string; delivery: string | null; body: unknown }> = [];
+    const client = new HttpSiteFlowClient({
+      baseUrl: "https://siteflow.example.com/",
+      fetch: async (input, init) => {
+        requests.push({
+          url: input.toString(),
+          delivery: new Headers(init?.headers).get("x-siteflow-delivery"),
+          body: JSON.parse(init?.body?.toString() ?? "{}")
+        });
+        return jsonResponse({
+          status: "accepted",
+          buildJobId: "build_gitlab_1",
+          message: "Git webhook accepted and build job queued."
+        });
+      }
+    });
+
+    await client.ingestGitWebhook({
+      provider: "gitlab",
+      deliveryId: "delivery-gitlab-1",
+      event: {
+        provider: "gitlab",
+        deliveryId: "delivery-gitlab-1",
+        kind: "push",
+        repository: {
+          provider: "gitlab",
+          owner: "acme",
+          name: "docs",
+          defaultBranch: "main"
+        },
+        branch: "main",
+        commitSha: "abc123def456",
+        commitMessage: "Ship",
+        commitAuthor: "Ada",
+        receivedAt: "2026-06-08T00:00:00.000Z",
+        actor: {
+          id: "gitlab:ada",
+          name: "ada",
+          role: "developer"
+        }
+      }
+    });
+
+    expect(requests).toEqual([
+      {
+        url: "https://siteflow.example.com/api/webhooks/git/gitlab",
+        delivery: "delivery-gitlab-1",
+        body: expect.objectContaining({
+          provider: "gitlab",
+          deliveryId: "delivery-gitlab-1",
+          kind: "push"
+        })
+      }
+    ]);
   });
 
   it("loads deployment inventory with an optional project filter", async () => {
@@ -69,7 +252,8 @@ describe("HttpSiteFlowClient", () => {
       targetDeploymentId: "dep-healthy",
       actor: { id: "actor-1", name: "Ops", role: "operator" },
       reason: "ship",
-      idempotencyKey: "idem-1"
+      idempotencyKey: "idem-1",
+      releaseEvidence: releaseEvidenceRequest
     });
     await client.rollbackDeployment({
       projectId: "project-acme-dashboard",
@@ -87,7 +271,8 @@ describe("HttpSiteFlowClient", () => {
         body: expect.objectContaining({
           projectId: "project-acme-dashboard",
           targetDeploymentId: "dep-healthy",
-          idempotencyKey: "idem-1"
+          idempotencyKey: "idem-1",
+          releaseEvidence: releaseEvidenceRequest
         })
       },
       {
@@ -142,7 +327,8 @@ describe("HttpSiteFlowClient", () => {
       percentage: 10,
       actor: { id: "actor-1", name: "Ops", role: "operator" },
       reason: "canary",
-      idempotencyKey: "rollout-start"
+      idempotencyKey: "rollout-start",
+      releaseEvidence: releaseEvidenceRequest
     });
     await client.advanceRollingRelease({
       projectId: "project-acme-dashboard",
@@ -150,14 +336,16 @@ describe("HttpSiteFlowClient", () => {
       percentage: 50,
       actor: { id: "actor-1", name: "Ops", role: "operator" },
       reason: "advance",
-      idempotencyKey: "rollout-advance"
+      idempotencyKey: "rollout-advance",
+      releaseEvidence: releaseEvidenceRequest
     });
     await client.completeRollingRelease({
       projectId: "project-acme-dashboard",
       channel: "production",
       actor: { id: "actor-1", name: "Ops", role: "operator" },
       reason: "complete",
-      idempotencyKey: "rollout-complete"
+      idempotencyKey: "rollout-complete",
+      releaseEvidence: releaseEvidenceRequest
     });
     await client.abortRollingRelease({
       projectId: "project-acme-dashboard",
@@ -179,7 +367,8 @@ describe("HttpSiteFlowClient", () => {
         body: expect.objectContaining({
           candidateDeploymentId: "dep-canary",
           percentage: 10,
-          idempotencyKey: "rollout-start"
+          idempotencyKey: "rollout-start",
+          releaseEvidence: releaseEvidenceRequest
         })
       },
       {
@@ -187,14 +376,16 @@ describe("HttpSiteFlowClient", () => {
         method: "POST",
         body: expect.objectContaining({
           percentage: 50,
-          idempotencyKey: "rollout-advance"
+          idempotencyKey: "rollout-advance",
+          releaseEvidence: releaseEvidenceRequest
         })
       },
       {
         url: "https://siteflow.example.com/api/projects/project-acme-dashboard/rolling/production/complete",
         method: "POST",
         body: expect.objectContaining({
-          idempotencyKey: "rollout-complete"
+          idempotencyKey: "rollout-complete",
+          releaseEvidence: releaseEvidenceRequest
         })
       },
       {
@@ -1262,6 +1453,40 @@ describe("HttpSiteFlowClient", () => {
       name: "SiteFlowHttpError",
       status: 404,
       message: "Project not found."
+    });
+  });
+
+  it("redacts secret values from HTTP error messages while preserving status and path", async () => {
+    const client = new HttpSiteFlowClient({
+      baseUrl: "https://siteflow.example.com",
+      fetch: async () => jsonResponse(
+        { message: `Unauthorized Bearer ${SITEFLOW_SECRET_CANARY}` },
+        { status: 401, statusText: "Unauthorized" }
+      )
+    });
+
+    await expect(client.getProject("secret-project")).rejects.toMatchObject({
+      name: "SiteFlowHttpError",
+      status: 401,
+      path: "/api/projects/secret-project",
+      isUnauthorized: true,
+      isForbidden: false,
+      message: `Unauthorized Bearer ${REDACTION_PLACEHOLDER}`
+    });
+  });
+
+  it("marks forbidden HTTP errors as identifiable", async () => {
+    const client = new HttpSiteFlowClient({
+      baseUrl: "https://siteflow.example.com",
+      fetch: async () => jsonResponse({ error: "Operator token is missing required scope." }, { status: 403, statusText: "Forbidden" })
+    });
+
+    await expect(client.listProjects()).rejects.toMatchObject({
+      name: "SiteFlowHttpError",
+      status: 403,
+      isUnauthorized: false,
+      isForbidden: true,
+      message: "Operator token is missing required scope."
     });
   });
 });

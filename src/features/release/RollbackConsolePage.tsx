@@ -8,6 +8,7 @@ import type { CommandResultReadModel, RollbackConsoleReadModel } from "@domain/r
 import { createSiteFlowClient, getDefaultSiteFlowClientMode, type SiteFlowClient } from "@lib/api";
 import { AuditReasonForm } from "./components/AuditReasonForm";
 import { DeploymentComparison } from "./components/DeploymentComparison";
+import { parseReleaseEvidence, ReleaseEvidenceForm, releaseEvidenceFailure, releaseEvidenceRequest } from "./components/ReleaseEvidenceForm";
 import { ReleaseHeader } from "./components/ReleaseHeader";
 import { RoutePreview } from "./components/RoutePreview";
 import { RollbackTimeline, isRollbackTargetSelectable } from "./components/RollbackTimeline";
@@ -56,7 +57,10 @@ export function RollbackConsolePage({ client, projectId, channel, initialReason 
   const [loadState, setLoadState] = useState<LoadState>({ status: "loading" });
   const [selectedTargetId, setSelectedTargetId] = useState<string | undefined>();
   const [reason, setReason] = useState(initialReason);
+  const [releaseEvidencePathValue, setReleaseEvidencePathValue] = useState("");
+  const [releaseEvidenceText, setReleaseEvidenceText] = useState("");
   const [commandState, setCommandState] = useState<CommandState>({ status: "idle" });
+  const parsedReleaseEvidence = useMemo(() => parseReleaseEvidence(releaseEvidenceText), [releaseEvidenceText]);
 
   useEffect(() => {
     let cancelled = false;
@@ -110,6 +114,8 @@ export function RollbackConsolePage({ client, projectId, channel, initialReason 
   const idempotencyKey = `rollback-${data.project.id}-${data.channel}-${selectedTarget?.deployment.id ?? "pending"}`;
   const targetSelectable = isRollbackTargetSelectable(selectedTarget);
   const selectedSafetyChecks = normalizeSafetyChecks(selectedTarget?.safetyChecks);
+  const requiresReleaseEvidence = data.channel === "production";
+  const releaseEvidence = requiresReleaseEvidence ? releaseEvidenceRequest(releaseEvidencePathValue, parsedReleaseEvidence) : undefined;
   const gate = evaluateSafetyGate({
     checks: selectedSafetyChecks,
     auditReason: reason,
@@ -128,7 +134,16 @@ export function RollbackConsolePage({ client, projectId, channel, initialReason 
         label: "Current target protection",
         passed: Boolean(data.currentDeployment && data.routePreview?.previousKnownGoodDeploymentId),
         failure: "Current target must remain protected before rollback."
-      }
+      },
+      ...(requiresReleaseEvidence
+        ? [
+            {
+              label: "Release evidence",
+              passed: Boolean(releaseEvidence),
+              failure: releaseEvidenceFailure(releaseEvidencePathValue, parsedReleaseEvidence, "rollback")
+            }
+          ]
+        : [])
     ]
   });
   const routeConsequence = data.routePreview
@@ -159,7 +174,8 @@ export function RollbackConsolePage({ client, projectId, channel, initialReason 
         targetDeploymentId: selectedTarget.deployment.id,
         actor,
         reason: reason.trim(),
-        idempotencyKey
+        idempotencyKey,
+        ...(releaseEvidence ? { releaseEvidence } : {})
       });
 
       setCommandState(
@@ -167,6 +183,9 @@ export function RollbackConsolePage({ client, projectId, channel, initialReason 
           ? { status: "success", message: commandMessage(result), operationId: result.operationId }
           : { status: "validationError", message: result.message }
       );
+      if (result.status === "accepted") {
+        setReleaseEvidenceText("");
+      }
     } catch (error: unknown) {
       setCommandState({ status: "apiError", message: toErrorMessage(error) });
     }
@@ -211,6 +230,14 @@ export function RollbackConsolePage({ client, projectId, channel, initialReason 
             currentDeploymentId={data.currentDeployment?.id}
             targetDeploymentId={selectedTarget?.deployment.id}
             routeConsequence={routeConsequence}
+          />
+          <ReleaseEvidenceForm
+            required={requiresReleaseEvidence}
+            evidencePath={releaseEvidencePathValue}
+            evidenceText={releaseEvidenceText}
+            parsedEvidence={parsedReleaseEvidence}
+            onEvidencePathChange={setReleaseEvidencePathValue}
+            onEvidenceTextChange={setReleaseEvidenceText}
           />
           <StickyActionBar
             actionLabel={actionLabel}
