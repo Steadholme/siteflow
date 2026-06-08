@@ -1,6 +1,0 @@
-id,title,description,analysis_focus,deps,context_from,wave,status,findings,error
-"1","Scope Analysis","Analyze Vercel parity scope against current SiteFlow codebase.","scope","","","1","completed","Prioritize project/environment foundation, Git webhook/source events, worker build loop, production promotion/domain semantics, deployment observability, CLI parity, deploy hooks, and rolling release later.",""
-"2","Risk Analysis","Assess technical and project risks for Vercel parity.","risk","","","1","completed","Highest risks are webhook security, secret redaction, build sandboxing, route drift, and premature rolling-release complexity. Mitigate with narrow MVPs, explicit state machines, and focused tests.",""
-"3","Dependency Analysis","Map feature ordering and critical path.","dependency","","","1","completed","Project/env model blocks Git deploys, CLI link, env pull, and deploy hooks. Git events block worker source builds. Production aliases block rollback and rolling release.",""
-"4","Roadmap Assembly","Synthesize tasks into phased execution plan.","","1;2;3","1;2;3","2","completed","Created VP-001 through VP-008 roadmap and issue-backed task list under .workflow/design/siteflow-vercel-parity.",""
-

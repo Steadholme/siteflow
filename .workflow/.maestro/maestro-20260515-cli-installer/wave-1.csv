@@ -1,2 +1,0 @@
-id,skill_call,topic
-"1","$maestro-plan --dir .workflow/design/siteflow-cli-installer ""Design CLI installer for self-hosted SiteFlow""","Design SiteFlow CLI server installer similar to Vercel self-hosted install experience."

@@ -1,6 +1,0 @@
-id,title,status,findings
-"1","Scope Analysis","completed","Prioritize project/environment foundation, Git webhook/source events, worker build loop, production promotion/domain semantics, deployment observability, CLI parity, deploy hooks, and rolling release later."
-"2","Risk Analysis","completed","Highest risks are webhook security, secret redaction, build sandboxing, route drift, and premature rolling-release complexity."
-"3","Dependency Analysis","completed","Project/env model blocks Git deploys, CLI link, env pull, and deploy hooks. Git events block worker source builds. Production aliases block rollback and rolling release."
-"4","Roadmap Assembly","completed","Created VP-001 through VP-008 roadmap and issue-backed task list."
-
