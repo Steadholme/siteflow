@@ -1306,6 +1306,10 @@ function bodyWithProductionRollingAbortException(channel: string, body: unknown,
 
 function bodyWithOptionalPrebuiltReleaseEvidence(body: unknown, options: SiteFlowServerOptions) {
   if (!isRecord(body) || body.releaseEvidence === undefined) {
+    if (isRecord(body) && body.source !== undefined) {
+      throw new SyntaxError("Prebuilt deploy source requires checked releaseEvidence metadata.");
+    }
+
     return body;
   }
 

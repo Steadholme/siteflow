@@ -96,6 +96,7 @@ export const requiredTargetRuntimeEvidenceCheckNames = [
   "compose_config_secrets",
   "compose_config_sanitized",
   "compose_config_images",
+  "compose_config_release_image_digest",
   "compose_config_no_build_fallback",
   "compose_config_observation",
   "startup_present",
@@ -316,10 +317,40 @@ function digestPinnedImage(value: unknown) {
   return Boolean(raw && imageDigestPinPattern.test(raw));
 }
 
+function imageDigestFromReference(value: unknown) {
+  const raw = stringValue(value);
+  const match = raw?.match(/@?(sha256:[a-f0-9]{64})$/i);
+
+  return match?.[1];
+}
+
 function composeImagesDigestPinned(composeConfig: Record<string, unknown> | undefined) {
   return ["postgres", "api", "worker"].every((service) =>
     digestPinnedImage(serviceImageFromComposeConfig(composeConfig, service))
   );
+}
+
+function composeReleaseImageDigestIssues(
+  composeConfig: Record<string, unknown> | undefined,
+  expectedDigest: string | undefined
+) {
+  if (!sha256DigestPattern.test(expectedDigest ?? "")) {
+    return ["expected release digest is missing or invalid"];
+  }
+
+  const issues: string[] = [];
+
+  for (const service of ["api", "worker"]) {
+    const digest = imageDigestFromReference(serviceImageFromComposeConfig(composeConfig, service));
+
+    if (!digest) {
+      issues.push(`${service} image is missing a sha256 digest`);
+    } else if (digest !== expectedDigest) {
+      issues.push(`${service} image digest ${digest} does not match expected ${expectedDigest}`);
+    }
+  }
+
+  return issues;
 }
 
 function emptyArrayField(value: unknown) {
@@ -448,6 +479,15 @@ export function evaluateReleaseTargetRuntimeEvidence(
   addCheck(checks, "compose_config_secrets", arrayIncludesAllStrings(composeConfig?.secrets, ["siteflow_app_secret", "siteflow_api_token", "siteflow_metrics_token", "siteflow_postgres_password"]), "Compose config evidence must summarize required Docker secrets.");
   addCheck(checks, "compose_config_sanitized", composeConfig?.sanitized === true && composeConfig?.rawConfigArchived === false && sha256HexPattern.test(stringValue(composeConfig?.configSha256) ?? ""), "Compose config evidence must be sanitized and include only a SHA-256 config hash, not raw config.");
   addCheck(checks, "compose_config_images", composeImagesDigestPinned(composeConfig), "Compose config evidence must prove postgres, API, and worker services use digest-pinned images.");
+  const composeReleaseDigestIssues = composeReleaseImageDigestIssues(composeConfig, stringValue(imageBinding?.expectedDigest));
+  addCheck(
+    checks,
+    "compose_config_release_image_digest",
+    composeReleaseDigestIssues.length === 0,
+    composeReleaseDigestIssues.length === 0
+      ? "Compose config evidence must prove API and worker services are pinned to the release image digest."
+      : `Compose config API/worker image digest mismatch: ${composeReleaseDigestIssues.join("; ")}.`
+  );
   addCheck(checks, "compose_config_no_build_fallback", composeNoBuildFallback(composeConfig), "Compose config evidence must prove the target Compose config has no build services or build fallback.");
   addCheck(checks, "compose_config_observation", Boolean(stringValue(composeConfig?.command) && stringValue(composeConfig?.source) && stringValue(composeConfig?.composeProject)), "Compose config evidence must include the redacted command, observation source, and compose project used on the target host.");
 

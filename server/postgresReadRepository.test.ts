@@ -44,12 +44,25 @@ function releaseRouteRows(overrides: {
   sourceBranch?: string | null;
   sourceCommitSha?: string | null;
   sourceRepository?: string | null;
+  sourceType?: string;
+  manifestReleaseEvidence?: ReturnType<typeof releaseEvidence> | null;
 } = {}) {
   const now = new Date("2026-06-08T12:00:00.000Z");
+  const candidateSourceBranch = overrides.sourceBranch ?? "main";
+  const candidateSourceCommitSha = overrides.sourceCommitSha ?? "abc123def4567890";
+  const candidateSourceRepository = overrides.sourceRepository ?? "acme/siteflow";
+  const candidateManifestReleaseEvidence = "manifestReleaseEvidence" in overrides
+    ? overrides.manifestReleaseEvidence
+    : releaseEvidence({
+        repository: candidateSourceRepository ?? "acme/siteflow",
+        branch: candidateSourceBranch ?? "main",
+        commitRef: candidateSourceCommitSha ?? "abc123def4567890"
+      });
   const currentDeployment = {
     id: "dep_current",
     project_id: "project_docs",
     status: "ready",
+    source_type: "prebuilt",
     source_branch: "main",
     source_commit_sha: "current1234567890",
     source_repository: "acme/siteflow",
@@ -61,15 +74,27 @@ function releaseRouteRows(overrides: {
     },
     artifact_root: "/tmp/siteflow/dep_current",
     entrypoint: "index.html",
-    preview_host: "current.w33d.xyz"
+    preview_host: "current.w33d.xyz",
+    artifact_manifest: {
+      entrypoint: "index.html",
+      metadata: {
+        source: {
+          repository: "acme/siteflow",
+          branch: "main",
+          commitSha: "current1234567890"
+        },
+        releaseEvidence: releaseEvidence({ commitRef: "current1234567890" })
+      }
+    }
   };
   const candidateDeployment = {
     id: "dep_prebuilt",
     project_id: "project_docs",
     status: "ready",
-    source_branch: overrides.sourceBranch ?? "main",
-    source_commit_sha: overrides.sourceCommitSha ?? "abc123def4567890",
-    source_repository: overrides.sourceRepository ?? "acme/siteflow",
+    source_type: overrides.sourceType ?? "prebuilt",
+    source_branch: candidateSourceBranch,
+    source_commit_sha: candidateSourceCommitSha,
+    source_repository: candidateSourceRepository,
     project_repository: {
       provider: "github",
       owner: "acme",
@@ -78,7 +103,18 @@ function releaseRouteRows(overrides: {
     },
     artifact_root: "/tmp/siteflow/dep_prebuilt",
     entrypoint: "index.html",
-    preview_host: "preview.w33d.xyz"
+    preview_host: "preview.w33d.xyz",
+    artifact_manifest: {
+      entrypoint: "index.html",
+      metadata: {
+        source: {
+          repository: candidateSourceRepository,
+          branch: candidateSourceBranch,
+          commitSha: candidateSourceCommitSha
+        },
+        ...(candidateManifestReleaseEvidence ? { releaseEvidence: candidateManifestReleaseEvidence } : {})
+      }
+    }
   };
 
   return {
@@ -674,6 +710,68 @@ describe("PostgresSiteFlowReadRepository", () => {
     expect(releaseCommandInsert?.values?.[12]).toBe(JSON.stringify(evidence));
   });
 
+  it("rejects production promotion for prebuilt targets without manifest release evidence", async () => {
+    const { client, queries } = releaseRouteClient({ manifestReleaseEvidence: null });
+    const pool = {
+      connect: async () => client
+    };
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow"
+    });
+
+    const result = await repository.promoteDeployment({
+      projectId: "project_docs",
+      channel: "production",
+      targetDeploymentId: "dep_prebuilt",
+      actor: { id: "actor-1", name: "Ops", role: "operator" },
+      reason: "ship",
+      idempotencyKey: "promote-production-missing-manifest-evidence",
+      releaseEvidence: releaseEvidence()
+    });
+
+    expect(result.status).toBe("rejected");
+    expect(result.message).toContain("Production prebuilt target must include checked release evidence metadata");
+    expect(result.safetyChecks).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "check-release-evidence-prebuilt-origin",
+        status: "fail"
+      })
+    ]));
+    expect(queries.some((query) => query.text.includes("INSERT INTO siteflow_route_revisions"))).toBe(false);
+  });
+
+  it("rejects production promotion when prebuilt manifest release evidence does not match the target evidence", async () => {
+    const { client, queries } = releaseRouteClient({
+      manifestReleaseEvidence: releaseEvidence({ commitRef: "different-commit" })
+    });
+    const pool = {
+      connect: async () => client
+    };
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow"
+    });
+
+    const result = await repository.promoteDeployment({
+      projectId: "project_docs",
+      channel: "production",
+      targetDeploymentId: "dep_prebuilt",
+      actor: { id: "actor-1", name: "Ops", role: "operator" },
+      reason: "ship",
+      idempotencyKey: "promote-production-manifest-evidence-mismatch",
+      releaseEvidence: releaseEvidence()
+    });
+
+    expect(result.status).toBe("rejected");
+    expect(result.message).toContain("Prebuilt artifact manifest release evidence targets");
+    expect(result.safetyChecks).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "check-release-evidence-prebuilt-origin",
+        status: "fail"
+      })
+    ]));
+    expect(queries.some((query) => query.text.includes("INSERT INTO siteflow_route_revisions"))).toBe(false);
+  });
+
   it("rejects production promotion when release evidence does not match the target deployment identity", async () => {
     const { client, queries } = releaseRouteClient({ sourceCommitSha: "different-commit" });
     const pool = {
@@ -1166,6 +1264,37 @@ describe("PostgresSiteFlowReadRepository", () => {
     expect(releaseEvidenceQueryValue(routeRevisionInsert ?? {})).toBe(JSON.stringify(evidence));
   });
 
+  it("rejects production rolling start for prebuilt candidates without manifest release evidence", async () => {
+    const { client, queries } = releaseRouteClient({ manifestReleaseEvidence: null });
+    const pool = {
+      connect: async () => client
+    };
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow"
+    });
+
+    const result = await repository.startRollingRelease({
+      projectId: "project_docs",
+      channel: "production",
+      candidateDeploymentId: "dep_prebuilt",
+      percentage: 10,
+      actor: { id: "actor-1", name: "Ops", role: "operator" },
+      reason: "start canary",
+      idempotencyKey: "rolling-start-missing-manifest-evidence",
+      releaseEvidence: releaseEvidence()
+    });
+
+    expect(result.status).toBe("rejected");
+    expect(result.message).toContain("Production prebuilt target must include checked release evidence metadata");
+    expect(result.safetyChecks).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "check-release-evidence-prebuilt-origin",
+        status: "fail"
+      })
+    ]));
+    expect(queries.some((query) => query.text.includes("INSERT INTO siteflow_route_revisions"))).toBe(false);
+  });
+
   it("rejects production rolling start when release evidence does not match the candidate deployment identity", async () => {
     const { client, queries } = releaseRouteClient({ sourceBranch: "release/wrong" });
     const pool = {
@@ -1286,6 +1415,53 @@ describe("PostgresSiteFlowReadRepository", () => {
       rolloutId: "rollout_active",
       releaseEvidenceException
     });
+  });
+
+  it.each([
+    {
+      label: "missing exception",
+      command: {}
+    },
+    {
+      label: "mismatched reason",
+      command: {
+        releaseEvidenceException: {
+          type: "production_rolling_abort_stop_rollout" as const,
+          targetEnvironment: "production" as const,
+          acceptedWithoutReleaseEvidence: true as const,
+          reason: "other reason"
+        }
+      }
+    }
+  ])("rejects production rolling abort with $label", async ({ command }) => {
+    const { client, queries } = releaseRouteClient({ activeRollout: true });
+    const pool = {
+      connect: async () => client
+    };
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow"
+    });
+
+    const result = await repository.abortRollingRelease({
+      projectId: "project_docs",
+      channel: "production",
+      actor: { id: "actor-1", name: "Ops", role: "operator" },
+      reason: "stop canary",
+      idempotencyKey: "rolling-abort-invalid-exception",
+      ...command
+    });
+
+    expect(result.status).toBe("rejected");
+    expect(result.message).toContain("Production rolling abort must record a stop-rollout release evidence exception");
+    expect(result.safetyChecks).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "check-release-evidence-exception",
+        status: "fail"
+      })
+    ]));
+    expect(queries.some((query) => query.text.includes("INSERT INTO siteflow_route_revisions"))).toBe(false);
+    expect(queries.some((query) => query.text.includes("UPDATE siteflow_rolling_releases"))).toBe(false);
+    expect(queries.some((query) => query.text.includes("INSERT INTO siteflow_audit_events"))).toBe(false);
   });
 
   it.each([
@@ -1661,6 +1837,28 @@ describe("PostgresSiteFlowReadRepository", () => {
     } finally {
       await rm(artifactRoot, { recursive: true, force: true });
     }
+  });
+
+  it("rejects prebuilt source provenance without release evidence before database writes", async () => {
+    const repository = new PostgresSiteFlowReadRepository({
+      connect: async () => {
+        throw new Error("database should not be touched");
+      }
+    } as never, {
+      artifactRoot: "/tmp/siteflow",
+      baseDomain: "w33d.xyz"
+    });
+
+    await expect(repository.deployPrebuilt({
+      projectSlug: "docs",
+      requestedHostPrefix: "sourcewithoutrelease123",
+      files: [prebuiltFile("index.html", "<h1>Hello</h1>")],
+      source: {
+        repository: "acme/siteflow",
+        branch: "main",
+        commitSha: "abc123def4567890"
+      }
+    })).rejects.toThrow("Prebuilt deploy source requires checked release evidence metadata.");
   });
 
   it("rejects prebuilt source provenance that conflicts with release evidence before database writes", async () => {

@@ -274,6 +274,7 @@ interface DeploymentRouteRow {
   id: string;
   project_id: string;
   status: DeploymentStatus;
+  source_type: string;
   source_branch: string | null;
   source_commit_sha: string | null;
   source_repository: string | null;
@@ -281,6 +282,7 @@ interface DeploymentRouteRow {
   artifact_root: string;
   entrypoint: string;
   preview_host: string;
+  artifact_manifest: Partial<ArtifactManifest> | Record<string, never>;
 }
 
 interface DeploymentBuildRow {
@@ -3131,6 +3133,56 @@ function deploymentRepositoryName(deployment: DeploymentRouteRow | undefined) {
   return deployment?.source_repository?.trim() || repositoryBindingName(deployment?.project_repository);
 }
 
+function releaseEvidenceMetadataFromArtifactManifest(
+  manifest: Partial<ArtifactManifest> | Record<string, never> | null | undefined
+): ReleaseEvidenceMetadata | undefined {
+  const metadata = isRecord(manifest) && isRecord(manifest.metadata) ? manifest.metadata : undefined;
+  const releaseEvidence = metadata && isRecord(metadata.releaseEvidence) ? metadata.releaseEvidence : undefined;
+  const evidencePath = typeof releaseEvidence?.evidencePath === "string" ? releaseEvidence.evidencePath : undefined;
+  const checkedAt = typeof releaseEvidence?.checkedAt === "string" ? releaseEvidence.checkedAt : undefined;
+  const commitRef = typeof releaseEvidence?.commitRef === "string" ? releaseEvidence.commitRef : undefined;
+  const repository = typeof releaseEvidence?.repository === "string" ? releaseEvidence.repository : undefined;
+  const branch = typeof releaseEvidence?.branch === "string" ? releaseEvidence.branch : undefined;
+  const targetEnvironment = typeof releaseEvidence?.targetEnvironment === "string" ? releaseEvidence.targetEnvironment : undefined;
+
+  if (
+    releaseEvidence?.status !== "passed" ||
+    !evidencePath ||
+    !checkedAt ||
+    !commitRef ||
+    !repository ||
+    !branch ||
+    !targetEnvironment
+  ) {
+    return undefined;
+  }
+
+  return {
+    evidencePath,
+    checkedAt,
+    status: "passed",
+    commitRef,
+    repository,
+    branch,
+    targetEnvironment,
+    ...(typeof releaseEvidence.releaseTicket === "string" ? { releaseTicket: releaseEvidence.releaseTicket } : {}),
+    ...(typeof releaseEvidence.operatorName === "string" ? { operatorName: releaseEvidence.operatorName } : {})
+  };
+}
+
+function releaseEvidenceCoreIdentity(evidence: ReleaseEvidenceMetadata) {
+  return `${evidence.repository}@${evidence.branch}@${evidence.commitRef}#${evidence.targetEnvironment}`;
+}
+
+function releaseEvidenceCoreIdentityMatches(left: ReleaseEvidenceMetadata, right: ReleaseEvidenceMetadata) {
+  return left.status === "passed" &&
+    right.status === "passed" &&
+    left.repository === right.repository &&
+    left.branch === right.branch &&
+    left.commitRef === right.commitRef &&
+    left.targetEnvironment === right.targetEnvironment;
+}
+
 function releaseEvidenceIdentityCheck(
   deployment: DeploymentRouteRow | undefined,
   evidence: ReleaseEvidenceMetadata | undefined,
@@ -3166,7 +3218,7 @@ function releaseEvidenceIdentityCheck(
     && deployment.source_branch === evidence.branch
     && deployment.source_commit_sha === evidence.commitRef;
 
-  return [
+  const checks: SafetyCheck[] = [
     {
       id: "check-release-evidence-target-identity",
       label: "Release evidence target identity",
@@ -3175,6 +3227,39 @@ function releaseEvidenceIdentityCheck(
         ? `Release evidence matches ${evidence.repository} ${evidence.branch}@${evidence.commitRef}.`
         : `Release evidence targets ${evidenceIdentity}, but deployment source is ${deploymentIdentity}.`,
       evidence: evidenceIdentity
+    }
+  ];
+
+  if (deployment.source_type !== "prebuilt") {
+    return checks;
+  }
+
+  const manifestEvidence = releaseEvidenceMetadataFromArtifactManifest(deployment.artifact_manifest);
+
+  if (!manifestEvidence) {
+    return [
+      ...checks,
+      {
+        id: "check-release-evidence-prebuilt-origin",
+        label: "Prebuilt artifact release evidence",
+        status: "fail",
+        summary: "Production prebuilt target must include checked release evidence metadata in its artifact manifest."
+      }
+    ];
+  }
+
+  const manifestMatches = releaseEvidenceCoreIdentityMatches(manifestEvidence, evidence);
+
+  return [
+    ...checks,
+    {
+      id: "check-release-evidence-prebuilt-origin",
+      label: "Prebuilt artifact release evidence",
+      status: manifestMatches ? "pass" : "fail",
+      summary: manifestMatches
+        ? `Prebuilt artifact manifest release evidence matches ${releaseEvidenceCoreIdentity(evidence)}.`
+        : `Prebuilt artifact manifest release evidence targets ${releaseEvidenceCoreIdentity(manifestEvidence)}, but release evidence targets ${releaseEvidenceCoreIdentity(evidence)}.`,
+      evidence: releaseEvidenceCoreIdentity(manifestEvidence)
     }
   ];
 }
@@ -3198,6 +3283,10 @@ function normalizePrebuiltSourceForReleaseEvidence(
   releaseEvidence: ReleaseEvidenceMetadata | undefined
 ): PrebuiltDeployCommand["source"] | undefined {
   if (!releaseEvidence) {
+    if (source) {
+      throw new Error("Prebuilt deploy source requires checked release evidence metadata.");
+    }
+
     return source;
   }
 
@@ -3217,6 +3306,35 @@ function normalizePrebuiltSourceForReleaseEvidence(
     branch: releaseEvidence.branch,
     commitSha: releaseEvidence.commitRef
   };
+}
+
+function productionRollingAbortReleaseEvidenceExceptionCheck(
+  action: RollingAction,
+  command: AdvanceRollingReleaseCommand | CompleteRollingReleaseCommand | AbortRollingReleaseCommand
+): SafetyCheck[] {
+  if (action !== "abort" || command.channel !== "production") {
+    return [];
+  }
+
+  const reason = command.reason.trim();
+  const releaseEvidenceException = "releaseEvidenceException" in command
+    ? command.releaseEvidenceException
+    : undefined;
+  const matches = releaseEvidenceException?.type === "production_rolling_abort_stop_rollout" &&
+    releaseEvidenceException.targetEnvironment === "production" &&
+    releaseEvidenceException.acceptedWithoutReleaseEvidence === true &&
+    releaseEvidenceException.reason.trim() === reason;
+
+  return [
+    {
+      id: "check-release-evidence-exception",
+      label: "Release evidence exception",
+      status: matches ? "pass" : "fail",
+      summary: matches
+        ? "Production rolling abort records a stop-rollout release evidence exception."
+        : "Production rolling abort must record a stop-rollout release evidence exception with acceptedWithoutReleaseEvidence=true and matching reason."
+    }
+  ];
 }
 
 function safetyChecksForRoute(
@@ -8290,13 +8408,15 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
           deployment.id,
           deployment.project_id,
           deployment.status,
+          deployment.source_type,
           deployment.source_branch,
           deployment.source_commit_sha,
           deployment.artifact_manifest->'metadata'->'source'->>'repository' AS source_repository,
           project.repository AS project_repository,
           deployment.artifact_root,
           COALESCE(route.entrypoint, deployment.artifact_manifest->>'entrypoint', 'index.html') AS entrypoint,
-          deployment.preview_host
+          deployment.preview_host,
+          deployment.artifact_manifest
         FROM siteflow_deployments deployment
         JOIN siteflow_projects project
           ON project.id = deployment.project_id
@@ -8417,7 +8537,8 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
           summary: current ? `Current deployment ${current.id} is ${current.status}.` : "Current deployment does not exist."
         },
         ...safetyChecksForRoute(command.projectId, candidate, domains, command.channel),
-        ...(action === "abort" ? [] : releaseEvidenceIdentityCheck(candidate, releaseEvidence, command.channel))
+        ...(action === "abort" ? [] : releaseEvidenceIdentityCheck(candidate, releaseEvidence, command.channel)),
+        ...productionRollingAbortReleaseEvidenceExceptionCheck(action, command)
       ];
       const failedCheck = safetyChecks.find((check) => check.status === "fail");
 

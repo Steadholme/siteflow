@@ -234,6 +234,17 @@ describe("releaseTargetRuntimeEvidenceCheck", () => {
       expectedCheck: "compose_config_images"
     },
     {
+      label: "compose release image digest mismatch",
+      mutate: (evidence: Record<string, unknown>) => {
+        const images = (evidence.composeConfig as Record<string, unknown>).images as Record<string, unknown>;
+        const otherReleaseImage = `ghcr.io/siteflow/siteflow@sha256:${"d".repeat(64)}`;
+
+        images.api = otherReleaseImage;
+        images.worker = otherReleaseImage;
+      },
+      expectedCheck: "compose_config_release_image_digest"
+    },
+    {
       label: "compose build fallback",
       mutate: (evidence: Record<string, unknown>) => {
         const composeConfig = evidence.composeConfig as Record<string, unknown>;
