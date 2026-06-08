@@ -196,6 +196,7 @@ describe("releaseArtifactCheck", () => {
       expect(result.status).toBe("passed");
       expect(result.exitCode).toBe(0);
       expect(result.selectedEvidence.fileCount).toBe(6);
+      expect(result.selectedEvidence.checksum).toMatch(/^sha256:[a-f0-9]{64}$/);
       expect(result.selectedEvidence).toMatchObject({
         commitRef: "abc123def456",
         repository: "acme/siteflow",
@@ -216,6 +217,7 @@ describe("releaseArtifactCheck", () => {
       });
       expect(result.checks.every((check) => check.status === "pass")).toBe(true);
       expect(manifest.schemaVersion).toBe("siteflow.releaseArtifactManifest.v1");
+      expect(manifest.checksum).toBe(result.selectedEvidence.checksum);
       expect(manifest.artifacts).toHaveLength(6);
       expect(manifest.artifacts[0].sha256).toMatch(/^[a-f0-9]{64}$/);
     } finally {

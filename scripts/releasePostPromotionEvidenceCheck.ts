@@ -4,6 +4,7 @@ import {
   evaluateReleaseEvidenceBundle,
   type ReleaseEvidenceBundleResult
 } from "./releaseEvidenceBundleCheck.js";
+import { strictIsoTimestampValue } from "./isoTimestamp.js";
 
 type PostPromotionStatus = "passed" | "blocked";
 type CheckStatus = "pass" | "fail";
@@ -97,18 +98,18 @@ function numberValue(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function timestampValue(value: unknown) {
+function checksumValue(value: unknown) {
   const raw = stringValue(value);
 
-  if (!raw || Number.isNaN(Date.parse(raw))) {
-    return undefined;
-  }
+  return raw && sha256DigestPattern.test(raw) ? raw : undefined;
+}
 
-  return raw;
+function timestampValue(value: unknown) {
+  return strictIsoTimestampValue(value);
 }
 
 function timestampNotAfter(left: string | undefined, right: string | undefined) {
-  return Boolean(left && right && Date.parse(left) <= Date.parse(right));
+  return Boolean(left && right && new Date(left).getTime() <= new Date(right).getTime());
 }
 
 function nestedObject(candidate: unknown, path: string[]) {
@@ -174,6 +175,7 @@ const allowedFunctionRuntimeIsolationValues = new Set([
   "v8_isolate",
   "isolate"
 ]);
+const sha256DigestPattern = /^sha256:[a-f0-9]{64}$/i;
 
 function runtimeIsolationIsAllowed(value: string | undefined) {
   return Boolean(value && allowedFunctionRuntimeIsolationValues.has(value));
@@ -328,24 +330,30 @@ function probeStatus(probe: unknown) {
   };
 }
 
-function artifactCountsMatch(rawEvidence: unknown, deploymentDetail: unknown) {
+function artifactManifestMatches(rawEvidence: unknown, deploymentDetail: unknown) {
   const selected = releaseArtifactSelectedEvidence(rawEvidence);
   const manifest = deploymentArtifactManifest(deploymentDetail);
   const expectedFileCount = numberValue(selected?.fileCount);
   const expectedTotalBytes = numberValue(selected?.totalBytes);
+  const expectedChecksum = checksumValue(selected?.checksum);
   const actualFileCount = numberValue(manifest?.fileCount);
   const actualTotalBytes = numberValue(manifest?.totalBytes);
+  const actualChecksum = checksumValue(manifest?.checksum);
 
   return {
     expectedFileCount,
     expectedTotalBytes,
+    expectedChecksum: expectedChecksum ?? null,
     actualFileCount,
     actualTotalBytes,
+    actualChecksum: actualChecksum ?? null,
     passed:
       typeof expectedFileCount === "number" &&
       typeof expectedTotalBytes === "number" &&
+      Boolean(expectedChecksum) &&
       actualFileCount === expectedFileCount &&
-      actualTotalBytes === expectedTotalBytes
+      actualTotalBytes === expectedTotalBytes &&
+      actualChecksum === expectedChecksum
   };
 }
 
@@ -375,7 +383,7 @@ export async function runReleasePostPromotionEvidenceCheck(
   const routeReleaseEvidenceCheckedAt = timestampValue(releaseEvidence?.checkedAt);
   const readiness = options.readinessProbe ? probeStatus(options.readinessProbe) : undefined;
   const metrics = options.metricsProbe ? probeStatus(options.metricsProbe) : undefined;
-  const artifactCounts = artifactCountsMatch(rawEvidence, deploymentDetail);
+  const artifactManifest = artifactManifestMatches(rawEvidence, deploymentDetail);
   const functionRuntimeIsolation = deploymentFunctionRuntimeIsolationSummary(deploymentDetail);
   const checks: ReleasePostPromotionEvidenceCheck[] = [
     check(
@@ -501,10 +509,10 @@ export async function runReleasePostPromotionEvidenceCheck(
     ),
     check(
       "artifact_manifest_matches_release_evidence",
-      artifactCounts.passed,
-      "Deployment artifact manifest file count and byte count match release artifact evidence.",
-      "Deployment artifact manifest does not match release artifact evidence file count and byte count.",
-      artifactCounts
+      artifactManifest.passed,
+      "Deployment artifact manifest file count, byte count, and checksum match release artifact evidence.",
+      "Deployment artifact manifest does not match release artifact evidence file count, byte count, and checksum.",
+      artifactManifest
     ),
     check(
       "artifact_function_runtime_isolation",

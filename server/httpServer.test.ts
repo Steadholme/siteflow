@@ -4871,6 +4871,31 @@ describe("SiteFlow control-plane HTTP server", () => {
     );
   });
 
+  it("rejects production rolling abort requests that include release evidence", async () => {
+    await withServer(
+      fixtureRepository(),
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/rolling/production/abort`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer deploy-token"
+          },
+          body: JSON.stringify({
+            reason: "stop",
+            idempotencyKey: "rollout-abort-with-evidence",
+            releaseEvidence: releaseEvidenceRequest()
+          })
+        });
+        const body = await response.json();
+
+        expect(response.status).toBe(400);
+        expect(body.message).toContain("must not include releaseEvidence");
+      },
+      { apiToken: "deploy-token", releaseEvidenceEvaluator: passingReleaseEvidenceEvaluator() }
+    );
+  });
+
   it("accepts prebuilt deploy uploads through the HTTP API", async () => {
     await withServer(fixtureRepository(), async (baseUrl) => {
       const response = await fetch(`${baseUrl}/api/deployments/prebuilt`, {

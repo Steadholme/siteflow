@@ -434,6 +434,7 @@ function passedReleaseArtifactEvidence() {
     { path: "dist-server/server/index.js", sizeBytes: 2048, sha256: "d".repeat(64) },
     { path: "dist-worker/worker/index.js", sizeBytes: 2048, sha256: "e".repeat(64) }
   ];
+  const checksum = `sha256:${"9".repeat(64)}`;
 
   return {
     name: "siteflow-release-artifact-check",
@@ -448,6 +449,7 @@ function passedReleaseArtifactEvidence() {
       targetEnvironment: "production",
       fileCount: artifacts.length,
       totalBytes: artifacts.reduce((total, artifact) => total + artifact.sizeBytes, 0),
+      checksum,
       packageBinSiteflow: "./dist-cli/cli/index.js",
       auditExitCode: 0
     },
@@ -455,6 +457,7 @@ function passedReleaseArtifactEvidence() {
       schemaVersion: "siteflow.releaseArtifactManifest.v1",
       name: "siteflow-release-artifact-manifest",
       generatedAt: "2026-06-08T11:29:00.000Z",
+      checksum,
       artifacts
     },
     artifactManifest: {
@@ -1130,6 +1133,49 @@ describe("releaseEvidenceGapReport", () => {
     }
   });
 
+  it.each([
+    {
+      topStatus: "manual_required",
+      expectedStatus: "manual_required" as const,
+      expectedMessage: "manual_required"
+    },
+    {
+      topStatus: "blocked",
+      expectedStatus: "blocked" as const,
+      expectedMessage: "Evidence output is not passing."
+    }
+  ])("does not treat nested release-gate pass as passing when top-level status is $topStatus", async ({ topStatus, expectedStatus, expectedMessage }) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-release-gate-top-status-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const gate = passedReleaseGateEvidence() as Record<string, unknown>;
+
+      gate.status = topStatus;
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.releaseGate, gate);
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+
+      expect(result.status).toBe("blocked");
+      expect(result.summary.gaps).toBeGreaterThan(0);
+      expect(result.items.find((item) => item.id === "release_gate")).toMatchObject({
+        status: expectedStatus,
+        message: expect.stringContaining(expectedMessage),
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "release_gate_passed",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("blocks passing release-gate evidence when checkedAt is missing", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-release-gate-timestamp-"));
 
@@ -1646,6 +1692,39 @@ describe("releaseEvidenceGapReport", () => {
       const targetRuntime = passedTargetRuntimeEvidence();
 
       (targetRuntime.selectedEvidence as Record<string, unknown>).composeConfig = { status: "passed" };
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.targetRuntime, targetRuntime);
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const targetRuntimeItem = result.items.find((item) => item.id === "target_runtime_evidence");
+
+      expect(targetRuntimeItem).toMatchObject({
+        status: "blocked",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "target_runtime_selected_evidence",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks target runtime evidence with blocked selected section summaries", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-target-runtime-blocked-summary-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const targetRuntime = passedTargetRuntimeEvidence();
+
+      (targetRuntime.selectedEvidence as Record<string, unknown>).composeConfig = {
+        status: "blocked",
+        timestamp: "2026-06-08T11:20:00.000Z"
+      };
 
       await writeJson(packPath, pack);
       await writeJson(pack.evidenceFiles.targetRuntime, targetRuntime);

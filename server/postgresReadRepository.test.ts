@@ -160,6 +160,8 @@ function releaseRouteClient(overrides: {
   sourceBranch?: string | null;
   sourceCommitSha?: string | null;
   sourceRepository?: string | null;
+  sourceType?: string;
+  manifestReleaseEvidence?: ReturnType<typeof releaseEvidence> | null;
   activeRollout?: boolean;
   existingReleaseCommand?: boolean;
   releaseCommandInsertConflict?: boolean;
@@ -708,6 +710,20 @@ describe("PostgresSiteFlowReadRepository", () => {
     ]));
     expect(releaseEvidenceQueryValue(routeRevisionInsert ?? {})).toBe(JSON.stringify(evidence));
     expect(releaseCommandInsert?.values?.[12]).toBe(JSON.stringify(evidence));
+    const auditInsert = queries.find((query) => query.text.includes("INSERT INTO siteflow_audit_events"));
+    const auditMetadata = JSON.parse(String(auditInsert?.values?.[8] ?? "{}"));
+
+    expect(auditInsert?.values?.[2]).toBe("deployment.promoted");
+    expect(auditInsert?.values?.[7]).toBe("ship");
+    expect(auditMetadata).toMatchObject({
+      channel: "production",
+      routeRevisionId: "route_promote",
+      previousDeploymentId: "dep_current",
+      targetDeploymentId: "dep_prebuilt",
+      releaseEvidence: {
+        identity: "acme/siteflow@main@abc123def4567890#production"
+      }
+    });
   });
 
   it("rejects production promotion for prebuilt targets without manifest release evidence", async () => {
@@ -803,6 +819,90 @@ describe("PostgresSiteFlowReadRepository", () => {
     ]));
     expect(queries.some((query) => query.text.includes("INSERT INTO siteflow_route_revisions"))).toBe(false);
     expect(failedReleaseCommandInsert?.values?.[12]).toBe(JSON.stringify(evidence));
+  });
+
+  it("rejects production promotion when direct repository metadata is not passed for production", async () => {
+    const { client, queries } = releaseRouteClient({ sourceType: "source" });
+    const pool = {
+      connect: async () => client
+    };
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow"
+    });
+    const evidence = releaseEvidence({ status: "blocked" });
+
+    const result = await repository.promoteDeployment({
+      projectId: "project_docs",
+      channel: "production",
+      targetDeploymentId: "dep_prebuilt",
+      actor: { id: "actor-1", name: "Ops", role: "operator" },
+      reason: "ship",
+      idempotencyKey: "promote-production-blocked-evidence",
+      releaseEvidence: evidence as never
+    });
+    const failedReleaseCommandInsert = releaseCommandInsertByState(queries, "failed");
+
+    expect(result.status).toBe("rejected");
+    expect(result.message).toContain("Production release evidence must be passed for production");
+    expect(result.safetyChecks).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "check-release-evidence-production-target",
+        status: "fail"
+      })
+    ]));
+    expect(queries.some((query) => query.text.includes("INSERT INTO siteflow_route_revisions"))).toBe(false);
+    expect(failedReleaseCommandInsert?.values?.[12]).toBe(JSON.stringify(evidence));
+  });
+
+  it.each([
+    {
+      action: "promotion" as const,
+      run: (repository: PostgresSiteFlowReadRepository, evidence: ReturnType<typeof releaseEvidence>) =>
+        repository.promoteDeployment({
+          projectId: "project_docs",
+          channel: "production",
+          targetDeploymentId: "dep_prebuilt",
+          actor: { id: "actor-1", name: "Ops", role: "operator" },
+          reason: "ship",
+          idempotencyKey: "promote-production-staging-evidence",
+          releaseEvidence: evidence
+        })
+    },
+    {
+      action: "rollback" as const,
+      run: (repository: PostgresSiteFlowReadRepository, evidence: ReturnType<typeof releaseEvidence>) =>
+        repository.rollbackDeployment({
+          projectId: "project_docs",
+          channel: "production",
+          currentDeploymentId: "dep_current",
+          targetDeploymentId: "dep_prebuilt",
+          actor: { id: "actor-1", name: "Ops", role: "operator" },
+          reason: "rollback",
+          idempotencyKey: "rollback-production-staging-evidence",
+          releaseEvidence: evidence
+        })
+    }
+  ])("rejects production $action when supplied and prebuilt manifest evidence both target staging", async ({ run }) => {
+    const stagingEvidence = releaseEvidence({ targetEnvironment: "staging" });
+    const { client, queries } = releaseRouteClient({ manifestReleaseEvidence: stagingEvidence });
+    const pool = {
+      connect: async () => client
+    };
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow"
+    });
+
+    const result = await run(repository, stagingEvidence);
+
+    expect(result.status).toBe("rejected");
+    expect(result.message).toContain("Production release evidence must be passed for production");
+    expect(result.safetyChecks).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "check-release-evidence-production-target",
+        status: "fail"
+      })
+    ]));
+    expect(queries.some((query) => query.text.includes("INSERT INTO siteflow_route_revisions"))).toBe(false);
   });
 
   it("returns persisted release evidence on idempotent production promotion replay", async () => {
@@ -936,6 +1036,20 @@ describe("PostgresSiteFlowReadRepository", () => {
     ]));
     expect(releaseEvidenceQueryValue(routeRevisionInsert ?? {})).toBe(JSON.stringify(evidence));
     expect(releaseCommandInsert?.values?.[12]).toBe(JSON.stringify(evidence));
+    const auditInsert = queries.find((query) => query.text.includes("INSERT INTO siteflow_audit_events"));
+    const auditMetadata = JSON.parse(String(auditInsert?.values?.[8] ?? "{}"));
+
+    expect(auditInsert?.values?.[2]).toBe("deployment.rolled_back");
+    expect(auditInsert?.values?.[7]).toBe("rollback");
+    expect(auditMetadata).toMatchObject({
+      channel: "production",
+      routeRevisionId: "route_promote",
+      previousDeploymentId: "dep_current",
+      targetDeploymentId: "dep_prebuilt",
+      releaseEvidence: {
+        identity: "acme/siteflow@main@abc123def4567890#production"
+      }
+    });
   });
 
   it("rejects production rollback without release evidence metadata", async () => {
@@ -968,6 +1082,39 @@ describe("PostgresSiteFlowReadRepository", () => {
     ]));
     expect(queries.some((query) => query.text.includes("INSERT INTO siteflow_route_revisions"))).toBe(false);
     expect(failedReleaseCommandInsert?.values?.[12]).toBeNull();
+  });
+
+  it("rejects production rollback without current deployment drift guard", async () => {
+    const { client, queries } = releaseRouteClient();
+    const pool = {
+      connect: async () => client
+    };
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow"
+    });
+    const evidence = releaseEvidence();
+
+    const result = await repository.rollbackDeployment({
+      projectId: "project_docs",
+      channel: "production",
+      targetDeploymentId: "dep_prebuilt",
+      actor: { id: "actor-1", name: "Ops", role: "operator" },
+      reason: "rollback",
+      idempotencyKey: "rollback-production-missing-current",
+      releaseEvidence: evidence
+    });
+    const failedReleaseCommandInsert = releaseCommandInsertByState(queries, "failed");
+
+    expect(result.status).toBe("rejected");
+    expect(result.message).toContain("Production rollback requires currentDeploymentId");
+    expect(result.safetyChecks).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "check-current-deployment-present",
+        status: "fail"
+      })
+    ]));
+    expect(queries.some((query) => query.text.includes("INSERT INTO siteflow_route_revisions"))).toBe(false);
+    expect(failedReleaseCommandInsert?.values?.[12]).toBe(JSON.stringify(evidence));
   });
 
   it("rejects production rollback when release evidence does not match the target deployment identity", async () => {
@@ -1262,6 +1409,21 @@ describe("PostgresSiteFlowReadRepository", () => {
       })
     ]));
     expect(releaseEvidenceQueryValue(routeRevisionInsert ?? {})).toBe(JSON.stringify(evidence));
+    const auditInsert = queries.find((query) => query.text.includes("INSERT INTO siteflow_audit_events"));
+    const auditMetadata = JSON.parse(String(auditInsert?.values?.[8] ?? "{}"));
+
+    expect(auditInsert?.values?.[2]).toBe("rolling_release.started");
+    expect(auditInsert?.values?.[7]).toBe("start canary");
+    expect(auditMetadata).toMatchObject({
+      channel: "production",
+      routeRevisionId: "route_promote",
+      currentDeploymentId: "dep_current",
+      candidateDeploymentId: "dep_prebuilt",
+      percentage: 10,
+      releaseEvidence: {
+        identity: "acme/siteflow@main@abc123def4567890#production"
+      }
+    });
   });
 
   it("rejects production rolling start for prebuilt candidates without manifest release evidence", async () => {
@@ -1329,6 +1491,7 @@ describe("PostgresSiteFlowReadRepository", () => {
   it.each([
     {
       action: "advance" as const,
+      expectedAuditAction: "rolling_release.advanced",
       run: (repository: PostgresSiteFlowReadRepository, evidence: ReturnType<typeof releaseEvidence>) =>
         repository.advanceRollingRelease({
           projectId: "project_docs",
@@ -1342,6 +1505,7 @@ describe("PostgresSiteFlowReadRepository", () => {
     },
     {
       action: "complete" as const,
+      expectedAuditAction: "rolling_release.completed",
       run: (repository: PostgresSiteFlowReadRepository, evidence: ReturnType<typeof releaseEvidence>) =>
         repository.completeRollingRelease({
           projectId: "project_docs",
@@ -1352,7 +1516,7 @@ describe("PostgresSiteFlowReadRepository", () => {
           releaseEvidence: evidence
         })
     }
-  ])("binds production rolling $action release evidence to the active candidate deployment identity", async ({ run }) => {
+  ])("binds production rolling $action release evidence to the active candidate deployment identity", async ({ expectedAuditAction, run }) => {
     const { client, queries } = releaseRouteClient({ activeRollout: true });
     const pool = {
       connect: async () => client
@@ -1373,6 +1537,86 @@ describe("PostgresSiteFlowReadRepository", () => {
       })
     ]));
     expect(releaseEvidenceQueryValue(routeRevisionInsert ?? {})).toBe(JSON.stringify(evidence));
+    const auditInsert = queries.find((query) => query.text.includes("INSERT INTO siteflow_audit_events"));
+    const auditMetadata = JSON.parse(String(auditInsert?.values?.[8] ?? "{}"));
+
+    expect(auditInsert?.values?.[2]).toBe(expectedAuditAction);
+    expect(auditMetadata).toMatchObject({
+      channel: "production",
+      routeRevisionId: "route_promote",
+      currentDeploymentId: "dep_current",
+      candidateDeploymentId: "dep_prebuilt",
+      releaseEvidence: {
+        identity: "acme/siteflow@main@abc123def4567890#production"
+      }
+    });
+  });
+
+  it.each([
+    {
+      action: "start" as const,
+      activeRollout: false,
+      run: (repository: PostgresSiteFlowReadRepository, evidence: ReturnType<typeof releaseEvidence>) =>
+        repository.startRollingRelease({
+          projectId: "project_docs",
+          channel: "production",
+          candidateDeploymentId: "dep_prebuilt",
+          percentage: 10,
+          actor: { id: "actor-1", name: "Ops", role: "operator" },
+          reason: "start canary",
+          idempotencyKey: "rolling-start-staging-evidence",
+          releaseEvidence: evidence
+        })
+    },
+    {
+      action: "advance" as const,
+      activeRollout: true,
+      run: (repository: PostgresSiteFlowReadRepository, evidence: ReturnType<typeof releaseEvidence>) =>
+        repository.advanceRollingRelease({
+          projectId: "project_docs",
+          channel: "production",
+          percentage: 50,
+          actor: { id: "actor-1", name: "Ops", role: "operator" },
+          reason: "advance canary",
+          idempotencyKey: "rolling-advance-staging-evidence",
+          releaseEvidence: evidence
+        })
+    },
+    {
+      action: "complete" as const,
+      activeRollout: true,
+      run: (repository: PostgresSiteFlowReadRepository, evidence: ReturnType<typeof releaseEvidence>) =>
+        repository.completeRollingRelease({
+          projectId: "project_docs",
+          channel: "production",
+          actor: { id: "actor-1", name: "Ops", role: "operator" },
+          reason: "complete canary",
+          idempotencyKey: "rolling-complete-staging-evidence",
+          releaseEvidence: evidence
+        })
+    }
+  ])("rejects production rolling $action when supplied and prebuilt manifest evidence both target staging", async ({ activeRollout, run }) => {
+    const stagingEvidence = releaseEvidence({ targetEnvironment: "staging" });
+    const { client, queries } = releaseRouteClient({ activeRollout, manifestReleaseEvidence: stagingEvidence });
+    const pool = {
+      connect: async () => client
+    };
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow"
+    });
+
+    const result = await run(repository, stagingEvidence);
+
+    expect(result.status).toBe("rejected");
+    expect(result.message).toContain("Production release evidence must be passed for production");
+    expect(result.safetyChecks).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "check-release-evidence-production-target",
+        status: "fail"
+      })
+    ]));
+    expect(queries.some((query) => query.text.includes("INSERT INTO siteflow_route_revisions"))).toBe(false);
+    expect(queries.some((query) => query.text.includes("UPDATE siteflow_rolling_releases"))).toBe(false);
   });
 
   it("records production rolling abort stop-rollout release evidence exception", async () => {
@@ -1415,6 +1659,44 @@ describe("PostgresSiteFlowReadRepository", () => {
       rolloutId: "rollout_active",
       releaseEvidenceException
     });
+  });
+
+  it("rejects production rolling abort that carries release evidence metadata", async () => {
+    const { client, queries } = releaseRouteClient({ activeRollout: true });
+    const pool = {
+      connect: async () => client
+    };
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow"
+    });
+    const releaseEvidenceException = {
+      type: "production_rolling_abort_stop_rollout" as const,
+      targetEnvironment: "production" as const,
+      acceptedWithoutReleaseEvidence: true as const,
+      reason: "stop canary"
+    };
+
+    const result = await repository.abortRollingRelease({
+      projectId: "project_docs",
+      channel: "production",
+      actor: { id: "actor-1", name: "Ops", role: "operator" },
+      reason: "stop canary",
+      idempotencyKey: "rolling-abort-with-evidence",
+      releaseEvidence: releaseEvidence() as never,
+      releaseEvidenceException
+    });
+
+    expect(result.status).toBe("rejected");
+    expect(result.message).toContain("Production rolling abort must omit release evidence");
+    expect(result.safetyChecks).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "check-release-evidence-omitted",
+        status: "fail"
+      })
+    ]));
+    expect(queries.some((query) => query.text.includes("INSERT INTO siteflow_route_revisions"))).toBe(false);
+    expect(queries.some((query) => query.text.includes("UPDATE siteflow_rolling_releases"))).toBe(false);
+    expect(queries.some((query) => query.text.includes("INSERT INTO siteflow_audit_events"))).toBe(false);
   });
 
   it.each([

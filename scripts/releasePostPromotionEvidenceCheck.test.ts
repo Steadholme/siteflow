@@ -13,6 +13,7 @@ const commitRef = "abc123def4567890";
 const repository = "acme/siteflow";
 const branch = "main";
 const releaseEvidencePathLabel = "evidence/release-evidence.json";
+const artifactChecksum = `sha256:${"a".repeat(64)}`;
 
 async function writeJson(root: string, relativePath: string, value: unknown) {
   const filePath = path.join(root, relativePath);
@@ -40,7 +41,8 @@ function releaseEvidenceBundle() {
       evidence: {
         selectedEvidence: {
           fileCount: 5,
-          totalBytes: 4096
+          totalBytes: 4096,
+          checksum: artifactChecksum
         }
       }
     }
@@ -64,7 +66,8 @@ function deploymentDetail(overrides: Record<string, unknown> = {}) {
       artifact: {
         manifest: {
           fileCount: 5,
-          totalBytes: 4096
+          totalBytes: 4096,
+          checksum: artifactChecksum
         }
       },
       routeRevision: {
@@ -96,6 +99,7 @@ function deploymentDetailWithFunctions(functions: Array<Record<string, unknown>>
         manifest: {
           fileCount: 5,
           totalBytes: 4096,
+          checksum: artifactChecksum,
           ...(manifestRuntimeIsolation ? { runtimeIsolation: manifestRuntimeIsolation } : {}),
           functions
         }
@@ -225,7 +229,8 @@ describe("releasePostPromotionEvidenceCheck", () => {
           artifact: {
             manifest: {
               fileCount: 5,
-              totalBytes: 4096
+              totalBytes: 4096,
+              checksum: artifactChecksum
             }
           },
           routeRevision: {
@@ -258,6 +263,37 @@ describe("releasePostPromotionEvidenceCheck", () => {
       expect(result.selectedEvidence.routeEvidenceCheckedAt).toBeNull();
       expect(timestamp).toMatchObject({
         status: "fail"
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks when route release evidence metadata uses a non-ISO checkedAt timestamp", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-post-promote-timestamp-non-iso-"));
+
+    try {
+      const evidencePath = await writeJson(root, "release-evidence.json", releaseEvidenceBundle());
+      const detail = deploymentDetail();
+      detail.lineage.routeRevision.releaseEvidence.checkedAt = "June 8, 2026 10:05 UTC";
+
+      const result = await runReleasePostPromotionEvidenceCheck({
+        releaseEvidencePath: evidencePath,
+        deploymentDetail: detail,
+        evaluateBundle: () => bundleCheck(),
+        now
+      });
+      const timestamp = result.checks.find((check) => check.name === "route_release_evidence_timestamp");
+
+      expect(result.status).toBe("blocked");
+      expect(result.selectedEvidence.routeEvidenceCheckedAt).toBeNull();
+      expect(timestamp).toMatchObject({
+        status: "fail",
+        details: {
+          releaseEvidenceCheckedAt: "2026-06-08T10:00:00.000Z",
+          routeReleaseEvidenceCheckedAt: null,
+          checkedAt: "2026-06-08T12:00:00.000Z"
+        }
       });
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -319,6 +355,35 @@ describe("releasePostPromotionEvidenceCheck", () => {
           releaseEvidenceCheckedAt: "2026-06-08T10:00:00.000Z",
           routeReleaseEvidenceCheckedAt: "2026-06-08T12:00:01.000Z",
           checkedAt: "2026-06-08T12:00:00.000Z"
+        }
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks when the promoted deployment artifact checksum differs from release artifact evidence", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-post-promote-artifact-checksum-"));
+
+    try {
+      const evidencePath = await writeJson(root, "release-evidence.json", releaseEvidenceBundle());
+      const detail = deploymentDetail();
+      detail.lineage.artifact.manifest.checksum = `sha256:${"b".repeat(64)}`;
+
+      const result = await runReleasePostPromotionEvidenceCheck({
+        releaseEvidencePath: evidencePath,
+        deploymentDetail: detail,
+        evaluateBundle: () => bundleCheck(),
+        now
+      });
+      const artifact = result.checks.find((check) => check.name === "artifact_manifest_matches_release_evidence");
+
+      expect(result.status).toBe("blocked");
+      expect(artifact).toMatchObject({
+        status: "fail",
+        details: {
+          expectedChecksum: artifactChecksum,
+          actualChecksum: `sha256:${"b".repeat(64)}`
         }
       });
     } finally {
@@ -444,7 +509,8 @@ describe("releasePostPromotionEvidenceCheck", () => {
           artifact: {
             manifest: {
               fileCount: 5,
-              totalBytes: 4096
+              totalBytes: 4096,
+              checksum: artifactChecksum
             }
           },
           routeRevision: {

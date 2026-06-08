@@ -623,9 +623,13 @@ function releaseArtifactPathSafe(value: unknown) {
 }
 
 function releaseArtifactManifestEntriesPassed(
-  artifacts: unknown,
+  manifest: Record<string, unknown> | undefined,
   selectedEvidence: Record<string, unknown> | undefined
 ) {
+  const artifacts = manifest?.artifacts;
+  const manifestChecksum = stringValue(manifest?.checksum);
+  const selectedChecksum = stringValue(selectedEvidence?.checksum);
+
   if (!Array.isArray(artifacts) || artifacts.length === 0) {
     return false;
   }
@@ -651,7 +655,9 @@ function releaseArtifactManifestEntriesPassed(
   }
 
   return Number(selectedEvidence?.fileCount) === artifacts.length &&
-    Number(selectedEvidence?.totalBytes) === totalBytes;
+    Number(selectedEvidence?.totalBytes) === totalBytes &&
+    sha256DigestPattern.test(manifestChecksum ?? "") &&
+    selectedChecksum === manifestChecksum;
 }
 
 function manifestDeclaresIsolatedFunctionRuntime(manifest: Record<string, unknown>) {
@@ -795,7 +801,6 @@ function releaseArtifactEvidenceFailedChecks(evidence: Record<string, unknown>, 
   const expectedRepository = stringValue(release.repository);
   const expectedBranch = stringValue(release.branch);
   const expectedTargetEnvironment = stringValue(release.targetEnvironment);
-  const manifestArtifacts = nestedValue(evidence, ["manifest", "artifacts"]);
 
   return [
     ...failedCheck(
@@ -817,9 +822,10 @@ function releaseArtifactEvidenceFailedChecks(evidence: Record<string, unknown>, 
           stringValue(nestedValue(selectedEvidence, ["targetEnvironment"])) &&
           Number(nestedValue(selectedEvidence, ["fileCount"])) > 0 &&
           Number(nestedValue(selectedEvidence, ["totalBytes"])) > 0 &&
+          sha256DigestPattern.test(stringValue(nestedValue(selectedEvidence, ["checksum"])) ?? "") &&
           stringValue(nestedValue(selectedEvidence, ["packageBinSiteflow"]))
       ),
-      "Release artifact evidence output must include selected release identity, file/byte counts, and CLI bin path."
+      "Release artifact evidence output must include selected release identity, file/byte counts, checksum, and CLI bin path."
     ),
     ...failedCheck(
       "release_artifact_dependency_audit",
@@ -847,8 +853,8 @@ function releaseArtifactEvidenceFailedChecks(evidence: Record<string, unknown>, 
       "release_artifact_manifest",
       nestedValue(evidence, ["manifest", "schemaVersion"]) === "siteflow.releaseArtifactManifest.v1" &&
         nestedValue(evidence, ["manifest", "name"]) === "siteflow-release-artifact-manifest" &&
-        releaseArtifactManifestEntriesPassed(manifestArtifacts, selectedEvidence),
-      "Release artifact evidence must include a safe SHA-256 manifest whose file count and total bytes match selected evidence."
+        releaseArtifactManifestEntriesPassed(nestedObject(evidence, "manifest"), selectedEvidence),
+      "Release artifact evidence must include a safe SHA-256 manifest whose file count, total bytes, and checksum match selected evidence."
     ),
     ...failedCheck(
       "release_artifact_function_runtime_isolation",
@@ -1134,10 +1140,11 @@ function targetRuntimeEvidenceFailedChecks(evidence: Record<string, unknown>, re
 
 function selectedEvidenceSummaryPassed(selectedEvidence: Record<string, unknown> | undefined, key: string) {
   const summary = nestedObject(selectedEvidence, key);
+  const passingStatuses = new Set(["pass", "passed", "completed", "ok", "healthy", "scraped", "applied", "delivered", "available"]);
 
   return Boolean(
     summary &&
-      stringValue(summary.status) &&
+      passingStatuses.has(statusValue(summary.status) ?? "") &&
       timestampValue(summary.timestamp)
   );
 }
@@ -1479,8 +1486,28 @@ function releaseGateFailedChecks(evidence: Record<string, unknown>) {
   const runtimeEnv = nestedObject(promotion, "runtimeEnv");
   const protectedBranchCommit = nestedObject(promotion, "protectedBranchCommit");
   const releaseCommit = stringValue(promotion?.commitRef);
+  const topStatus = statusValue(evidence.status);
+  const gateStatus = statusValue(promotion?.gateStatus);
+  const manualRequired = statusValue(promotion?.manualRequired) === "true" ||
+    promotion?.manualRequired === true ||
+    Array.isArray(promotion?.manualRequiredCheckIds) && promotion.manualRequiredCheckIds.length > 0;
 
   return [
+    ...failedCheck(
+      "release_gate_passed",
+      (topStatus === "pass" || topStatus === "passed") && gateStatus === "pass",
+      "Release gate evidence must have top-level pass/passed status and promotionEvidence.gateStatus: pass."
+    ),
+    ...failedCheck(
+      "release_gate_promotion_mode",
+      promotion?.promotion === true,
+      "Release gate evidence must be collected with promotion: true."
+    ),
+    ...failedCheck(
+      "release_gate_no_manual_required",
+      !manualRequired,
+      "Release gate evidence must not contain manual_required checks."
+    ),
     ...failedCheck(
       "release_gate_protected_branch_commit",
       statusValue(protectedBranchCommit?.status) === "pass" &&
@@ -1758,6 +1785,21 @@ function evidencePassed(evidence: Record<string, unknown>) {
 
   return (status === "passed" || status === "pass" || gateStatus === "pass") &&
     (exitCode === undefined || exitCode === 0) &&
+    failedChecks(evidence).length === 0;
+}
+
+function releaseGateEvidencePassed(evidence: Record<string, unknown>) {
+  const status = statusValue(evidence.status);
+  const promotion = releaseGatePromotion(evidence);
+  const gateStatus = statusValue(promotion.gateStatus);
+  const manualRequired = statusValue(promotion.manualRequired) === "true" ||
+    promotion.manualRequired === true ||
+    Array.isArray(promotion.manualRequiredCheckIds) && promotion.manualRequiredCheckIds.length > 0;
+
+  return (status === "pass" || status === "passed") &&
+    gateStatus === "pass" &&
+    promotion.promotion === true &&
+    !manualRequired &&
     failedChecks(evidence).length === 0;
 }
 
@@ -2103,11 +2145,13 @@ function evaluateEvidenceObject(
   const hasItemDiagnosticsFailures = itemFailedChecks.length > baseFailedChecks.length;
   const evidenceIsPassing = id === "release_image_evidence"
     ? releaseImageEvidencePassed(evidence, release, now, maxEvidenceAgeHours)
+    : id === "release_gate"
+      ? releaseGateEvidencePassed(evidence)
     : evidencePassed(evidence);
   let itemStatus: GapItemStatus = "passed";
   let message = "Evidence output exists and is currently passing.";
 
-  if (statusValue(promotion.manualRequired) === "true" || promotion.manualRequired === true ||
+  if (status === "manual_required" || statusValue(promotion.manualRequired) === "true" || promotion.manualRequired === true ||
     Array.isArray(promotion.manualRequiredCheckIds) && promotion.manualRequiredCheckIds.length > 0) {
     itemStatus = "manual_required";
     message = "Release gate evidence still contains manual_required checks.";

@@ -310,10 +310,11 @@ function nestedValue(candidate: Record<string, unknown> | undefined, path: strin
 
 function selectedEvidenceSummaryPassed(selectedEvidence: Record<string, unknown> | undefined, key: string) {
   const summary = nestedObject(selectedEvidence, key);
+  const passingStatuses = new Set(["pass", "passed", "completed", "ok", "healthy", "scraped", "applied", "delivered", "available"]);
 
   return Boolean(
     summary &&
-      stringValue(summary.status) &&
+      passingStatuses.has(statusValue(summary.status) ?? "") &&
       timestampValue(summary.timestamp)
   );
 }
@@ -929,9 +930,13 @@ function releaseArtifactPathSafe(value: unknown) {
 }
 
 function releaseArtifactManifestEntriesPassed(
-  artifacts: unknown,
+  manifest: Record<string, unknown> | undefined,
   selectedEvidence: Record<string, unknown> | undefined
 ) {
+  const artifacts = manifest?.artifacts;
+  const manifestChecksum = stringValue(manifest?.checksum);
+  const selectedChecksum = stringValue(selectedEvidence?.checksum);
+
   if (!Array.isArray(artifacts) || artifacts.length === 0) {
     return false;
   }
@@ -957,7 +962,9 @@ function releaseArtifactManifestEntriesPassed(
   }
 
   return Number(selectedEvidence?.fileCount) === artifacts.length &&
-    Number(selectedEvidence?.totalBytes) === totalBytes;
+    Number(selectedEvidence?.totalBytes) === totalBytes &&
+    sha256DigestPattern.test(manifestChecksum ?? "") &&
+    selectedChecksum === manifestChecksum;
 }
 
 function bundleTargetEnvironment(root: Record<string, unknown> | undefined) {
@@ -1307,7 +1314,6 @@ export function evaluateReleaseEvidenceBundle(
   const postgresTargetDatabase = nestedObject(postgres, "targetDatabase");
   const artifactCheckedAt = timestampValue(artifact?.checkedAt);
   const artifactSelectedEvidence = nestedObject(artifact, "selectedEvidence");
-  const artifactManifestArtifacts = nestedValue(artifact, ["manifest", "artifacts"]);
   const releaseImageCheckedAt = timestampValue(releaseImage?.checkedAt);
   const targetRuntimeCheckedAt = timestampValue(targetRuntime?.checkedAt);
   const sourceProviderCheckedAt = timestampValue(sourceProvider?.checkedAt);
@@ -1701,10 +1707,11 @@ export function evaluateReleaseEvidenceBundle(
         stringValue(nestedValue(artifact, ["selectedEvidence", "targetEnvironment"])) &&
         Number(nestedValue(artifact, ["selectedEvidence", "fileCount"])) > 0 &&
         Number(nestedValue(artifact, ["selectedEvidence", "totalBytes"])) > 0 &&
+        sha256DigestPattern.test(stringValue(nestedValue(artifact, ["selectedEvidence", "checksum"])) ?? "") &&
         stringValue(nestedValue(artifact, ["selectedEvidence", "packageBinSiteflow"])) &&
         nestedValue(artifact, ["selectedEvidence", "auditExitCode"]) === 0
     ),
-    "Release artifact evidence output must include selected release identity, file/byte counts, CLI bin path, and successful production dependency audit."
+    "Release artifact evidence output must include selected release identity, file/byte counts, checksum, CLI bin path, and successful production dependency audit."
   );
   addCheck(
     checks,
@@ -1738,9 +1745,9 @@ export function evaluateReleaseEvidenceBundle(
       artifact?.manifest &&
       nestedValue(artifact, ["manifest", "schemaVersion"]) === "siteflow.releaseArtifactManifest.v1" &&
         nestedValue(artifact, ["manifest", "name"]) === "siteflow-release-artifact-manifest" &&
-        releaseArtifactManifestEntriesPassed(artifactManifestArtifacts, artifactSelectedEvidence)
+        releaseArtifactManifestEntriesPassed(nestedObject(artifact, "manifest"), artifactSelectedEvidence)
     ),
-    "Release artifact evidence must include a safe SHA-256 manifest whose file count and total bytes match selected evidence."
+    "Release artifact evidence must include a safe SHA-256 manifest whose file count, total bytes, and checksum match selected evidence."
   );
   addCheck(
     checks,

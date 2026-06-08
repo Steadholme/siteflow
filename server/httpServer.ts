@@ -1281,6 +1281,10 @@ function bodyWithProductionRollingAbortException(channel: string, body: unknown,
     throw new SyntaxError("Production rolling release abort requires a non-empty audit reason because it records a stop-rollout release evidence exception.");
   }
 
+  if (normalizedBody.releaseEvidence !== undefined) {
+    throw new SyntaxError("Production rolling release abort must not include releaseEvidence; it records a stop-rollout release evidence exception instead.");
+  }
+
   const suppliedException = isRecord(normalizedBody.releaseEvidenceException)
     ? normalizedBody.releaseEvidenceException
     : undefined;

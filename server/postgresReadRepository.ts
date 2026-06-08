@@ -3174,6 +3174,23 @@ function releaseEvidenceCoreIdentity(evidence: ReleaseEvidenceMetadata) {
   return `${evidence.repository}@${evidence.branch}@${evidence.commitRef}#${evidence.targetEnvironment}`;
 }
 
+function releaseEvidenceAuditMetadata(evidence: ReleaseEvidenceMetadata | undefined) {
+  if (!evidence) {
+    return null;
+  }
+
+  return {
+    evidencePath: evidence.evidencePath,
+    checkedAt: evidence.checkedAt,
+    status: evidence.status,
+    commitRef: evidence.commitRef,
+    repository: evidence.repository,
+    branch: evidence.branch,
+    targetEnvironment: evidence.targetEnvironment,
+    identity: releaseEvidenceCoreIdentity(evidence)
+  };
+}
+
 function releaseEvidenceCoreIdentityMatches(left: ReleaseEvidenceMetadata, right: ReleaseEvidenceMetadata) {
   return left.status === "passed" &&
     right.status === "passed" &&
@@ -3203,8 +3220,22 @@ function releaseEvidenceIdentityCheck(
     ];
   }
 
+  const evidenceProductionTarget = evidence.status === "passed" && evidence.targetEnvironment === "production";
+  const evidenceCoreIdentity = releaseEvidenceCoreIdentity(evidence);
+  const checks: SafetyCheck[] = [
+    {
+      id: "check-release-evidence-production-target",
+      label: "Release evidence production target",
+      status: evidenceProductionTarget ? "pass" : "fail",
+      summary: evidenceProductionTarget
+        ? `Release evidence is passed for production: ${evidenceCoreIdentity}.`
+        : `Production release evidence must be passed for production, found status=${String(evidence.status)} targetEnvironment=${evidence.targetEnvironment}.`,
+      evidence: evidenceCoreIdentity
+    }
+  ];
+
   if (!deployment) {
-    return [];
+    return checks;
   }
 
   const repository = deploymentRepositoryName(deployment);
@@ -3218,17 +3249,15 @@ function releaseEvidenceIdentityCheck(
     && deployment.source_branch === evidence.branch
     && deployment.source_commit_sha === evidence.commitRef;
 
-  const checks: SafetyCheck[] = [
-    {
-      id: "check-release-evidence-target-identity",
-      label: "Release evidence target identity",
-      status: matches ? "pass" : "fail",
-      summary: matches
-        ? `Release evidence matches ${evidence.repository} ${evidence.branch}@${evidence.commitRef}.`
-        : `Release evidence targets ${evidenceIdentity}, but deployment source is ${deploymentIdentity}.`,
-      evidence: evidenceIdentity
-    }
-  ];
+  checks.push({
+    id: "check-release-evidence-target-identity",
+    label: "Release evidence target identity",
+    status: matches ? "pass" : "fail",
+    summary: matches
+      ? `Release evidence matches ${evidence.repository} ${evidence.branch}@${evidence.commitRef}.`
+      : `Release evidence targets ${evidenceIdentity}, but deployment source is ${deploymentIdentity}.`,
+    evidence: evidenceIdentity
+  });
 
   if (deployment.source_type !== "prebuilt") {
     return checks;
@@ -3324,6 +3353,7 @@ function productionRollingAbortReleaseEvidenceExceptionCheck(
     releaseEvidenceException.targetEnvironment === "production" &&
     releaseEvidenceException.acceptedWithoutReleaseEvidence === true &&
     releaseEvidenceException.reason.trim() === reason;
+  const releaseEvidenceOmitted = command.releaseEvidence === undefined;
 
   return [
     {
@@ -3333,6 +3363,14 @@ function productionRollingAbortReleaseEvidenceExceptionCheck(
       summary: matches
         ? "Production rolling abort records a stop-rollout release evidence exception."
         : "Production rolling abort must record a stop-rollout release evidence exception with acceptedWithoutReleaseEvidence=true and matching reason."
+    },
+    {
+      id: "check-release-evidence-omitted",
+      label: "Release evidence omitted",
+      status: releaseEvidenceOmitted ? "pass" : "fail",
+      summary: releaseEvidenceOmitted
+        ? "Production rolling abort omits release evidence and records only the stop-rollout exception."
+        : "Production rolling abort must omit release evidence and record only the stop-rollout exception."
     }
   ];
 }
@@ -6671,6 +6709,25 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
         ]
       );
 
+      await insertAuditEvent(client, {
+        projectId: command.projectId,
+        action: "rolling_release.started",
+        actor: command.actor,
+        targetType: "route_revision",
+        targetId: routeRevision.id,
+        summary: `Rolling release started at ${percentage}%.`,
+        reason: command.reason,
+        metadata: {
+          channel: command.channel,
+          rolloutId,
+          routeRevisionId: routeRevision.id,
+          currentDeploymentId: current.id,
+          candidateDeploymentId: candidate.id,
+          percentage,
+          releaseEvidence: releaseEvidenceAuditMetadata(releaseEvidence)
+        }
+      });
+
       await client.query("COMMIT");
 
       return {
@@ -8347,7 +8404,9 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
   ): Promise<RouteRevision> {
     const routeRevisionId = stableId("route", `${command.idempotencyKey}:rolling:${rolloutId}:${percentage}`);
     const idempotencyKey = `${command.idempotencyKey}:rolling:${rolloutId}:${percentage}`;
-    const releaseEvidence = releaseEvidenceMetadataForStorage(command.releaseEvidence);
+    const releaseEvidence = "releaseEvidenceException" in command
+      ? undefined
+      : releaseEvidenceMetadataForStorage(command.releaseEvidence);
     const releaseEvidenceException = "releaseEvidenceException" in command
       ? command.releaseEvidenceException
       : undefined;
@@ -8519,7 +8578,9 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
       const current = await this.readDeploymentForRoute(client, rollout.current_deployment_id);
       const candidate = await this.readDeploymentForRoute(client, rollout.candidate_deployment_id);
       const domains = await this.listVerifiedDomainsForChannel(client, command.projectId, command.channel);
-      const releaseEvidence = releaseEvidenceMetadataForStorage(command.releaseEvidence);
+      const releaseEvidence = action === "abort"
+        ? undefined
+        : releaseEvidenceMetadataForStorage(command.releaseEvidence);
       const releaseEvidenceException = "releaseEvidenceException" in command
         ? command.releaseEvidenceException
         : undefined;
@@ -8642,9 +8703,31 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
           metadata: {
             channel: command.channel,
             rolloutId: rollout.id,
+            routeRevisionId: routeRevision.id,
             currentDeploymentId: current.id,
             candidateDeploymentId: candidate.id,
             ...(releaseEvidenceException ? { releaseEvidenceException } : {})
+          }
+        });
+      } else {
+        await insertAuditEvent(client, {
+          projectId: command.projectId,
+          action: action === "advance" ? "rolling_release.advanced" : "rolling_release.completed",
+          actor: command.actor,
+          targetType: "route_revision",
+          targetId: routeRevision.id,
+          summary: action === "advance"
+            ? `Rolling release advanced to ${nextPercentage}%.`
+            : "Rolling release completed and production route applied.",
+          reason: command.reason,
+          metadata: {
+            channel: command.channel,
+            rolloutId: rollout.id,
+            routeRevisionId: routeRevision.id,
+            currentDeploymentId: current.id,
+            candidateDeploymentId: candidate.id,
+            percentage: nextPercentage,
+            releaseEvidence: releaseEvidenceAuditMetadata(releaseEvidence)
           }
         });
       }
@@ -8727,7 +8810,17 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
       const releaseEvidence = releaseEvidenceMetadataForStorage(command.releaseEvidence);
       const safetyChecks = [
         ...safetyChecksForRoute(command.projectId, deployment, domains, command.channel),
-        ...releaseEvidenceIdentityCheck(deployment, releaseEvidence, command.channel)
+        ...releaseEvidenceIdentityCheck(deployment, releaseEvidence, command.channel),
+        ...(action === "rollback" && command.channel === "production" && !currentDeploymentId
+          ? [
+              {
+                id: "check-current-deployment-present",
+                label: "Current deployment present",
+                status: "fail" as const,
+                summary: "Production rollback requires currentDeploymentId to guard against channel drift."
+              }
+            ]
+          : [])
       ];
       const previousDeploymentId = channel?.current_deployment_id ?? null;
       const releaseEvidenceJson = releaseEvidence ? JSON.stringify(releaseEvidence) : null;
@@ -8886,6 +8979,27 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
         const existingResult = await this.releaseCommandResultFromRow(client, insertedCommand.row);
         await client.query("COMMIT");
         return existingResult;
+      }
+
+      if (!dryRun) {
+        await insertAuditEvent(client, {
+          projectId: command.projectId,
+          action: action === "promote" ? "deployment.promoted" : "deployment.rolled_back",
+          actor: command.actor,
+          targetType: "route_revision",
+          targetId: routeRevision.id,
+          summary: action === "promote"
+            ? `Deployment ${deployment.id} promoted to ${command.channel}.`
+            : `Deployment ${deployment.id} rolled back to ${command.channel}.`,
+          reason: command.reason,
+          metadata: {
+            channel: command.channel,
+            routeRevisionId: routeRevision.id,
+            previousDeploymentId,
+            targetDeploymentId: deployment.id,
+            releaseEvidence: releaseEvidenceAuditMetadata(releaseEvidence)
+          }
+        });
       }
 
       await client.query("COMMIT");

@@ -60,6 +60,7 @@ export interface ReleaseArtifactManifest {
   name: "siteflow-release-artifact-manifest";
   generatedAt: string;
   rootDir: string;
+  checksum: string;
   artifacts: ReleaseArtifactManifestEntry[];
 }
 
@@ -100,6 +101,7 @@ export interface ReleaseArtifactCheckResult {
     targetEnvironment: string | null;
     fileCount: number;
     totalBytes: number;
+    checksum: string;
     packageBinSiteflow: string | null;
     installProfileStatus: string | null;
     dependencyPolicyStatus: string | null;
@@ -754,24 +756,29 @@ async function collectArtifactFiles(rootDir: string, artifactDirs: string[]) {
   };
 }
 
-async function hashFile(filePath: string) {
-  const contents = await readFile(filePath);
-
-  return createHash("sha256").update(contents).digest("hex");
-}
-
 async function createManifest(rootDir: string, files: ArtifactFile[], generatedAt: string): Promise<ReleaseArtifactManifest> {
-  const artifacts = await Promise.all(files.map(async (file) => ({
-    path: file.relativePath,
-    sizeBytes: file.sizeBytes,
-    sha256: await hashFile(file.absolutePath)
-  })));
+  const checksum = createHash("sha256");
+  const artifacts: ReleaseArtifactManifestEntry[] = [];
+
+  for (const file of files) {
+    const contents = await readFile(file.absolutePath);
+
+    checksum.update(file.relativePath);
+    checksum.update("\0");
+    checksum.update(contents);
+    artifacts.push({
+      path: file.relativePath,
+      sizeBytes: file.sizeBytes,
+      sha256: createHash("sha256").update(contents).digest("hex")
+    });
+  }
 
   return {
     schemaVersion: "siteflow.releaseArtifactManifest.v1",
     name: "siteflow-release-artifact-manifest",
     generatedAt,
     rootDir,
+    checksum: `sha256:${checksum.digest("hex")}`,
     artifacts
   };
 }
@@ -1345,7 +1352,7 @@ export async function runReleaseArtifactCheck(options: ReleaseArtifactCheckOptio
     "sha256_manifest",
     manifest.artifacts.length === files.length && manifest.artifacts.length > 0,
     `Computed SHA-256 manifest for ${manifest.artifacts.length} files.`,
-    { fileCount: manifest.artifacts.length, totalBytes }
+    { fileCount: manifest.artifacts.length, totalBytes, checksum: manifest.checksum }
   ));
 
   try {
@@ -1641,6 +1648,7 @@ export async function runReleaseArtifactCheck(options: ReleaseArtifactCheckOptio
       targetEnvironment: targetEnvironment ?? null,
       fileCount: files.length,
       totalBytes,
+      checksum: manifest.checksum,
       packageBinSiteflow: siteflowBin,
       installProfileStatus,
       dependencyPolicyStatus,

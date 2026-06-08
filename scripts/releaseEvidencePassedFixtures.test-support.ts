@@ -243,6 +243,7 @@ export function passedReleaseArtifactEvidence() {
     { path: "dist-server/server/index.js", sizeBytes: 2048, sha256: "d".repeat(64) },
     { path: "dist-worker/worker/index.js", sizeBytes: 2048, sha256: "e".repeat(64) }
   ];
+  const checksum = `sha256:${"9".repeat(64)}`;
 
   return {
     name: "siteflow-release-artifact-check",
@@ -257,6 +258,7 @@ export function passedReleaseArtifactEvidence() {
       targetEnvironment: "production",
       fileCount: artifacts.length,
       totalBytes: artifacts.reduce((total, artifact) => total + artifact.sizeBytes, 0),
+      checksum,
       packageBinSiteflow: "./dist-cli/cli/index.js",
       auditExitCode: 0
     },
@@ -264,6 +266,7 @@ export function passedReleaseArtifactEvidence() {
       schemaVersion: "siteflow.releaseArtifactManifest.v1",
       name: "siteflow-release-artifact-manifest",
       generatedAt: "2026-06-08T11:29:00.000Z",
+      checksum,
       artifacts
     },
     artifactManifest: {
