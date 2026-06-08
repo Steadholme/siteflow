@@ -1099,6 +1099,86 @@ describe("releaseEvidenceBundleCompose", () => {
     }
   });
 
+  it.each([
+    [
+      "source provider failed status",
+      "sourceProvider",
+      () => ({ ...sourceProviderEvidence(), status: "failed" }),
+      /source provider evidence must have status passed/
+    ],
+    [
+      "target runtime failed check",
+      "targetRuntime",
+      () => ({
+        ...targetRuntimeEvidence(),
+        checks: [
+          ...targetRuntimeEvidence().checks,
+          { name: "image_binding_digests", status: "fail", message: "digest mismatch" }
+        ]
+      }),
+      /target runtime evidence must include non-empty checks and all checks must pass/
+    ],
+    [
+      "operator access wrong checker name",
+      "operatorAccess",
+      () => ({ ...operatorAccessEvidence(), name: "siteflow-operator-access-template" }),
+      /operator access evidence must be checked by siteflow-operator-access-evidence-check/
+    ],
+    [
+      "ingress missing checkedAt",
+      "ingress",
+      () => {
+        const evidence = ingressEvidence() as Record<string, unknown>;
+        delete evidence.checkedAt;
+        return evidence;
+      },
+      /ingress evidence must include a checkedAt timestamp/
+    ],
+    [
+      "source provider target environment mismatch",
+      "sourceProvider",
+      () => {
+        const evidence = sourceProviderEvidence();
+        (evidence.selectedEvidence as Record<string, unknown>).environment = "staging";
+        return evidence;
+      },
+      /source provider evidence target environment staging does not match production/
+    ]
+  ] as const)("rejects %s before writing a bundle", async (_label, pathKey, replacementFactory, expectedMessage) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-compose-final-checker-"));
+
+    try {
+      const paths = await writeEvidenceSet(root);
+      const outputPath = path.join(root, "release-evidence.json");
+
+      await writeFile(paths[pathKey], `${JSON.stringify(replacementFactory())}\n`, "utf8");
+
+      await expect(composeReleaseEvidenceBundle({
+        releaseGatePath: paths.releaseGate,
+        dockerBuildRehearsalPath: paths.dockerBuild,
+        dockerSocketProfileAccepted: true,
+        postgresRehearsalPath: paths.postgres,
+        artifactEvidencePath: paths.artifact,
+        releaseImageEvidencePath: paths.releaseImage,
+        targetRuntimeEvidencePath: paths.targetRuntime,
+        sourceProviderEvidencePath: paths.sourceProvider,
+        backupEvidencePath: paths.backup,
+        observabilityEvidencePath: paths.observability,
+        operatorAccessEvidencePath: paths.operatorAccess,
+        nonSessionCredentialEvidencePath: paths.nonSessionCredential,
+        ingressEvidencePath: paths.ingress,
+        upgradeRollbackEvidencePath: paths.upgradeRollback,
+        outputPath,
+        operatorName: "release-operator",
+        releaseTicket: "REL-2026-0607",
+        now
+      })).rejects.toThrow(expectedMessage);
+      expect(await exists(outputPath)).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("rejects evidence inputs with raw secret-like values before writing a bundle", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-compose-secret-scan-"));
 

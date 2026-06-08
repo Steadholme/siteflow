@@ -1,6 +1,11 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
+import { requiredOffHostBackupEvidenceCheckNames } from "./backupEvidenceCheck.js";
 import { evidenceSecretFindingSummary, scanEvidenceForRawSecrets } from "./evidenceSecretScan.js";
+import { requiredIngressEvidenceCheckNames } from "./ingressEvidenceCheck.js";
+import { requiredReleaseArtifactCheckNames } from "./releaseArtifactContracts.js";
+import { requiredSourceProviderEvidenceCheckNames } from "./sourceProviderEvidenceCheck.js";
+import { requiredTargetRuntimeEvidenceCheckNames } from "./releaseTargetRuntimeEvidenceCheck.js";
 
 type ComposeStatus = "composed" | "blocked";
 
@@ -78,6 +83,7 @@ interface CliIo {
 const expectedSchemaVersion = "siteflow.releaseEvidence.v1";
 const expectedBundleName = "siteflow-release-evidence-bundle";
 const sha256DigestPattern = /^sha256:[a-f0-9]{64}$/i;
+const requiredBackupEvidenceCheckNames = [...requiredOffHostBackupEvidenceCheckNames];
 
 function isEntrypoint() {
   const entryPath = process.argv[1];
@@ -247,6 +253,85 @@ function assertComposedEvidenceIsFinal(label: string, evidence: Record<string, u
   }
 }
 
+function evidenceCheckRows(evidence: Record<string, unknown>) {
+  return Array.isArray(evidence.checks)
+    ? evidence.checks.filter(isObject)
+    : [];
+}
+
+function evidencePassedCheckNames(evidence: Record<string, unknown>) {
+  return new Set(
+    evidenceCheckRows(evidence)
+      .filter((check) => stringValue(check.status)?.toLowerCase() === "pass")
+      .map((check) => stringValue(check.name))
+      .filter((name): name is string => Boolean(name))
+  );
+}
+
+function evidenceChecksAllPassed(evidence: Record<string, unknown>) {
+  const checks = evidenceCheckRows(evidence);
+
+  return checks.length > 0 && checks.every((check) => stringValue(check.status)?.toLowerCase() === "pass");
+}
+
+function optionalEvidenceTargetEnvironment(evidence: Record<string, unknown>) {
+  return stringValue(evidence.targetEnvironment) ??
+    stringValue(nestedValue(evidence, ["release", "targetEnvironment"])) ??
+    stringValue(nestedValue(evidence, ["selectedEvidence", "targetEnvironment"])) ??
+    stringValue(nestedValue(evidence, ["selectedEvidence", "environment"]));
+}
+
+function assertCheckerOutputFinal(
+  label: string,
+  evidence: Record<string, unknown>,
+  expectedName: string,
+  options: {
+    requiredChecks?: string[];
+    targetEnvironment?: string;
+    requireTargetEnvironment?: boolean;
+  } = {}
+) {
+  assertComposedEvidenceIsFinal(label, evidence);
+
+  if (evidence.name !== expectedName) {
+    throw new Error(`${label} evidence must be checked by ${expectedName} before compose.`);
+  }
+
+  if (stringValue(evidence.status)?.toLowerCase() !== "passed") {
+    throw new Error(`${label} evidence must have status passed before compose.`);
+  }
+
+  if (evidence.exitCode !== 0) {
+    throw new Error(`${label} evidence must have exitCode 0 before compose.`);
+  }
+
+  if (!timestampValue(evidence.checkedAt)) {
+    throw new Error(`${label} evidence must include a checkedAt timestamp before compose.`);
+  }
+
+  if (!evidenceChecksAllPassed(evidence)) {
+    throw new Error(`${label} evidence must include non-empty checks and all checks must pass before compose.`);
+  }
+
+  const requiredChecks = options.requiredChecks ?? [];
+  const passedNames = evidencePassedCheckNames(evidence);
+  const missingChecks = requiredChecks.filter((name) => !passedNames.has(name));
+
+  if (missingChecks.length > 0) {
+    throw new Error(`${label} evidence is missing required passed checks before compose: ${missingChecks.join(", ")}.`);
+  }
+
+  const targetEnvironment = optionalEvidenceTargetEnvironment(evidence);
+
+  if (options.requireTargetEnvironment && !targetEnvironment) {
+    throw new Error(`${label} evidence must include target environment before compose.`);
+  }
+
+  if (options.targetEnvironment && targetEnvironment && targetEnvironment !== options.targetEnvironment) {
+    throw new Error(`${label} evidence target environment ${targetEnvironment} does not match ${options.targetEnvironment}.`);
+  }
+}
+
 function optionalEvidenceCommit(evidence: Record<string, unknown>) {
   return stringValue(evidence.releaseCommit) ??
     stringValue(evidence.commitRef) ??
@@ -293,6 +378,23 @@ function assertEvidenceIdentity(
 
   if (branch && branch !== release.branch) {
     throw new Error(`${name} evidence branch ${branch} does not match release branch ${release.branch}.`);
+  }
+}
+
+function assertEvidenceTargetEnvironment(
+  name: string,
+  evidence: Record<string, unknown>,
+  targetEnvironment: string,
+  options: { requireIdentity?: boolean } = {}
+) {
+  const actualTargetEnvironment = optionalEvidenceTargetEnvironment(evidence);
+
+  if (options.requireIdentity && !actualTargetEnvironment) {
+    throw new Error(`${name} evidence must include target environment release identity.`);
+  }
+
+  if (actualTargetEnvironment && actualTargetEnvironment !== targetEnvironment) {
+    throw new Error(`${name} evidence target environment ${actualTargetEnvironment} does not match release target environment ${targetEnvironment}.`);
   }
 }
 
@@ -378,6 +480,7 @@ export async function composeReleaseEvidenceBundle(
 
   const releaseGate = await readEvidenceJson(options.releaseGatePath);
   const release = resolveReleaseMetadata(releaseGate, options);
+  const targetEnvironment = options.targetEnvironment ?? "production";
   const needsDockerBuild = dockerBuildRequired(releaseGate);
   const needsHostBuildException = hostBuildExceptionRequired(releaseGate);
 
@@ -408,26 +511,67 @@ export async function composeReleaseEvidenceBundle(
   const ingress = await readEvidenceJson(options.ingressEvidencePath);
   const upgradeRollback = await readEvidenceJson(options.upgradeRollbackEvidencePath);
 
-  assertComposedEvidenceIsFinal("source provider", sourceProvider);
-  assertComposedEvidenceIsFinal("target runtime", targetRuntime);
-  assertComposedEvidenceIsFinal("operator access", operatorAccess);
-  assertComposedEvidenceIsFinal("non-session credential", nonSessionCredential);
-  assertComposedEvidenceIsFinal("ingress", ingress);
-  assertComposedEvidenceIsFinal("upgrade/rollback drill", upgradeRollback);
+  assertCheckerOutputFinal("release artifact", artifact, "siteflow-release-artifact-check", {
+    requiredChecks: requiredReleaseArtifactCheckNames,
+    targetEnvironment,
+    requireTargetEnvironment: true
+  });
+  assertCheckerOutputFinal("source provider", sourceProvider, "siteflow-source-provider-evidence-check", {
+    requiredChecks: requiredSourceProviderEvidenceCheckNames,
+    targetEnvironment,
+    requireTargetEnvironment: true
+  });
+  assertCheckerOutputFinal("target runtime", targetRuntime, "siteflow-target-runtime-evidence-check", {
+    requiredChecks: requiredTargetRuntimeEvidenceCheckNames,
+    targetEnvironment,
+    requireTargetEnvironment: true
+  });
+  assertCheckerOutputFinal("backup", backup, "siteflow-backup-evidence-check", {
+    requiredChecks: requiredBackupEvidenceCheckNames
+  });
+  assertCheckerOutputFinal("observability", observability, "siteflow-observability-evidence-check", {
+    targetEnvironment,
+    requireTargetEnvironment: true
+  });
+  assertCheckerOutputFinal("operator access", operatorAccess, "siteflow-operator-access-evidence-check", {
+    targetEnvironment,
+    requireTargetEnvironment: true
+  });
+  assertCheckerOutputFinal("non-session credential", nonSessionCredential, "siteflow-non-session-credential-evidence-check", {
+    targetEnvironment,
+    requireTargetEnvironment: true
+  });
+  assertCheckerOutputFinal("ingress", ingress, "siteflow-ingress-evidence-check", {
+    requiredChecks: requiredIngressEvidenceCheckNames,
+    targetEnvironment,
+    requireTargetEnvironment: true
+  });
+  assertCheckerOutputFinal("upgrade/rollback drill", upgradeRollback, "siteflow-upgrade-rollback-drill-evidence-check", {
+    targetEnvironment,
+    requireTargetEnvironment: true
+  });
 
   assertEvidenceIdentity("release-gate", promotionEvidence(releaseGate), release);
   assertEvidenceIdentity("postgres rehearsal", postgres, release, { requireIdentity: true });
   assertEvidenceIdentity("release artifact", artifact, release, { requireIdentity: true });
+  assertEvidenceTargetEnvironment("release artifact", artifact, targetEnvironment, { requireIdentity: true });
   assertReleaseImageEvidenceIdentity(releaseImage, release);
   assertReleaseImageEvidenceAttestations(releaseImage);
   assertEvidenceIdentity("target runtime", targetRuntime, release);
+  assertEvidenceTargetEnvironment("target runtime", targetRuntime, targetEnvironment, { requireIdentity: true });
   assertEvidenceIdentity("source provider", sourceProvider, release);
+  assertEvidenceTargetEnvironment("source provider", sourceProvider, targetEnvironment, { requireIdentity: true });
   assertEvidenceIdentity("backup", backup, release);
   assertEvidenceIdentity("observability", observability, release, { requireIdentity: true });
+  assertEvidenceTargetEnvironment("observability", observability, targetEnvironment, { requireIdentity: true });
   assertEvidenceIdentity("operator access", operatorAccess, release);
+  assertEvidenceTargetEnvironment("operator access", operatorAccess, targetEnvironment, { requireIdentity: true });
   assertEvidenceIdentity("non-session credential", nonSessionCredential, release);
+  assertEvidenceTargetEnvironment("non-session credential", nonSessionCredential, targetEnvironment, { requireIdentity: true });
   assertEvidenceIdentity("ingress", ingress, release);
+  assertEvidenceTargetEnvironment("ingress", ingress, targetEnvironment, { requireIdentity: true });
   assertEvidenceIdentity("upgrade/rollback drill", upgradeRollback, release);
+  assertEvidenceTargetEnvironment("upgrade/rollback drill", upgradeRollback, targetEnvironment, { requireIdentity: true });
 
   if (dockerBuild) {
     assertEvidenceIdentity("Docker build rehearsal", dockerBuild, release, { requireIdentity: true });
@@ -437,10 +581,10 @@ export async function composeReleaseEvidenceBundle(
     schemaVersion: expectedSchemaVersion,
     name: expectedBundleName,
     checkedAt,
-    targetEnvironment: options.targetEnvironment ?? "production",
+    targetEnvironment,
     release: {
       ...release,
-      targetEnvironment: options.targetEnvironment ?? "production",
+      targetEnvironment,
       ...(options.dockerSocketProfileAccepted ? { dockerSocketProfileAccepted: true } : {}),
       ...(options.hostBuildExceptionAccepted ? { hostBuildExceptionAccepted: true } : {})
     },

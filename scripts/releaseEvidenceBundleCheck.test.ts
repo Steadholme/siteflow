@@ -1242,6 +1242,38 @@ describe("releaseEvidenceBundleCheck", () => {
     }));
   });
 
+  it("blocks target runtime evidence whose running image digest does not match the release image digest", () => {
+    const targetRuntime = validTargetRuntimeEvidence();
+    const selectedEvidence = targetRuntime.selectedEvidence as Record<string, unknown>;
+    const imageBinding = selectedEvidence.imageBinding as Record<string, unknown>;
+
+    imageBinding.expectedDigest = `sha256:${"a".repeat(64)}`;
+    imageBinding.apiImageDigest = `sha256:${"a".repeat(64)}`;
+    imageBinding.workerImageDigest = `sha256:${"a".repeat(64)}`;
+
+    const result = evaluateReleaseEvidenceBundle(
+      validEvidence({
+        targetRuntimeEvidence: {
+          ...validEvidence().targetRuntimeEvidence,
+          evidence: targetRuntime
+        }
+      }),
+      {
+        evidencePath: "release-evidence.json",
+        now,
+        commitRef,
+        repo: repository,
+        branch
+      }
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "target_runtime_release_image_digest",
+      status: "fail"
+    }));
+  });
+
   it("blocks release gate evidence that omits runtime resource controls", () => {
     const evidence = validEvidence();
     const releaseGate = evidence.releaseGate.evidence as ReturnType<typeof validReleaseGateEvidence>;

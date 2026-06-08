@@ -749,7 +749,7 @@ export function passedUpgradeRollbackEvidence() {
 }
 
 export function passedTargetRuntimeEvidence() {
-  const digest = `sha256:${"a".repeat(64)}`;
+  const digest = `sha256:${"f".repeat(64)}`;
 
   return {
     name: "siteflow-target-runtime-evidence-check",

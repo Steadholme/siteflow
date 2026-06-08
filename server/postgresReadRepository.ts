@@ -3193,6 +3193,32 @@ function releaseEvidenceMetadataForStorage(
   return evidence;
 }
 
+function normalizePrebuiltSourceForReleaseEvidence(
+  source: PrebuiltDeployCommand["source"] | undefined,
+  releaseEvidence: ReleaseEvidenceMetadata | undefined
+): PrebuiltDeployCommand["source"] | undefined {
+  if (!releaseEvidence) {
+    return source;
+  }
+
+  const mismatches = [
+    source?.repository && source.repository !== releaseEvidence.repository ? "repository" : undefined,
+    source?.branch && source.branch !== releaseEvidence.branch ? "branch" : undefined,
+    source?.commitSha && source.commitSha !== releaseEvidence.commitRef ? "commitSha" : undefined
+  ].filter((entry): entry is string => Boolean(entry));
+
+  if (mismatches.length > 0) {
+    throw new Error(`Prebuilt deploy source must match release evidence metadata: ${mismatches.join(", ")}.`);
+  }
+
+  return {
+    ...source,
+    repository: releaseEvidence.repository,
+    branch: releaseEvidence.branch,
+    commitSha: releaseEvidence.commitRef
+  };
+}
+
 function safetyChecksForRoute(
   projectId: SiteFlowId,
   deployment: DeploymentRouteRow | undefined,
@@ -6621,6 +6647,7 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
     const artifactStagingRoot = path.join(artifactBaseRoot, `.publish-${deploymentId}-${randomUUID().replace(/-/g, "")}`);
     const entrypoint = safeArtifactPath(command.entrypoint ?? "index.html");
     const releaseEvidence = releaseEvidenceMetadataForStorage(command.releaseEvidence);
+    const source = normalizePrebuiltSourceForReleaseEvidence(command.source, releaseEvidence);
     const artifactManifest: ArtifactManifest = {
       entrypoint,
       fileCount: command.files.length,
@@ -6631,7 +6658,7 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
         ...(command.public !== undefined ? { public: command.public } : {}),
         ...(command.fluid !== undefined ? { fluid: command.fluid } : {}),
         ...(command.images !== undefined ? { images: command.images } : {}),
-        ...(command.source !== undefined ? { source: command.source } : {}),
+        ...(source !== undefined ? { source } : {}),
         ...(releaseEvidence !== undefined ? { releaseEvidence } : {}),
         precompressed: precompressedStats(command.files),
         routing: {
@@ -6719,8 +6746,8 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
         [
           deploymentId,
           projectId,
-          command.source?.branch ?? null,
-          command.source?.commitSha ?? null,
+          source?.branch ?? null,
+          source?.commitSha ?? null,
           artifactRoot,
           digest,
           command.files.length,

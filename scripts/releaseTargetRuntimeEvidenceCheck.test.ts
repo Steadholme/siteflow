@@ -124,7 +124,10 @@ describe("releaseTargetRuntimeEvidenceCheck", () => {
       repository: "acme/siteflow",
       branch: "main",
       imageBinding: {
-        status: "passed"
+        status: "passed",
+        expectedDigest: digest,
+        apiImageDigest: digest,
+        workerImageDigest: digest
       }
     });
   });

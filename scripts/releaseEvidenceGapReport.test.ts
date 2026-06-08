@@ -1148,7 +1148,32 @@ describe("releaseEvidenceGapReport", () => {
 
       expect(result.items.find((item) => item.id === "release_gate")).toMatchObject({
         status: "blocked",
-        message: "Release gate evidence is missing checkedAt and cannot prove raw evidence freshness."
+        message: "Evidence output is missing checkedAt and cannot prove raw evidence freshness."
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks passing checker evidence when checkedAt is missing", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-checker-timestamp-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const operatorAccess = passedOperatorAccessEvidence() as Record<string, unknown>;
+
+      delete operatorAccess.checkedAt;
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.operatorAccess, operatorAccess);
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+
+      expect(result.items.find((item) => item.id === "operator_access_evidence")).toMatchObject({
+        status: "blocked",
+        message: "Evidence output is missing checkedAt and cannot prove raw evidence freshness.",
+        nextCommand: expect.stringContaining("operator-access:evidence")
       });
     } finally {
       await rm(root, { recursive: true, force: true });

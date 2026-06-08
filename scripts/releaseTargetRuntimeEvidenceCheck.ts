@@ -50,6 +50,9 @@ export interface ReleaseTargetRuntimeEvidenceCheckResult {
 interface RuntimeEvidenceSummary {
   status?: string;
   timestamp?: string;
+  expectedDigest?: string;
+  apiImageDigest?: string;
+  workerImageDigest?: string;
 }
 
 interface ParsedArgs {
@@ -249,6 +252,21 @@ function summarize(candidate: Record<string, unknown> | undefined): RuntimeEvide
   return {
     status: stringValue(candidate.status),
     timestamp: sectionTimestamp(candidate)
+  };
+}
+
+function summarizeImageBinding(candidate: Record<string, unknown> | undefined): RuntimeEvidenceSummary | null {
+  const summary = summarize(candidate);
+
+  if (!summary) {
+    return null;
+  }
+
+  return {
+    ...summary,
+    ...(stringValue(candidate?.expectedDigest) ? { expectedDigest: stringValue(candidate?.expectedDigest) } : {}),
+    ...(stringValue(candidate?.apiImageDigest) ? { apiImageDigest: stringValue(candidate?.apiImageDigest) } : {}),
+    ...(stringValue(candidate?.workerImageDigest) ? { workerImageDigest: stringValue(candidate?.workerImageDigest) } : {})
   };
 }
 
@@ -479,7 +497,7 @@ export function evaluateReleaseTargetRuntimeEvidence(
       startup: summarize(startup),
       serviceHealth: summarize(serviceHealth),
       readiness: summarize(readiness),
-      imageBinding: summarize(imageBinding),
+      imageBinding: summarizeImageBinding(imageBinding),
       restartSmoke: summarize(restartSmoke),
       logSanity: summarize(logSanity)
     },

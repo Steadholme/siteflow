@@ -5035,6 +5035,93 @@ describe("SiteFlow control-plane HTTP server", () => {
     });
   });
 
+  it("derives prebuilt deploy source from checked release evidence metadata", async () => {
+    let receivedCommand: PrebuiltDeployCommand | undefined;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      deployPrebuilt: async (command: PrebuiltDeployCommand): Promise<PrebuiltDeployResult> => {
+        receivedCommand = command;
+        return fixtureRepository().deployPrebuilt(command);
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/deployments/prebuilt`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
+        body: JSON.stringify({
+          projectSlug: "docs",
+          baseDomain: "w33d.xyz",
+          releaseEvidence: releaseEvidenceRequest(),
+          files: [
+            {
+              path: "index.html",
+              contentBase64: Buffer.from("<h1>Hello</h1>").toString("base64"),
+              size: 14,
+              sha256: "unused-by-fixture"
+            }
+          ]
+        })
+      });
+
+      expect(response.status).toBe(201);
+    }, { apiToken: "deploy-token", releaseEvidenceEvaluator: passingReleaseEvidenceEvaluator() });
+
+    expect(receivedCommand?.source).toEqual({
+      repository: "acme/siteflow",
+      branch: "main",
+      commitSha: "abc123def4567890"
+    });
+  });
+
+  it("rejects prebuilt deploy source that conflicts with checked release evidence metadata", async () => {
+    let deployPrebuiltCalled = false;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      deployPrebuilt: async (command: PrebuiltDeployCommand): Promise<PrebuiltDeployResult> => {
+        deployPrebuiltCalled = true;
+        return fixtureRepository().deployPrebuilt(command);
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/deployments/prebuilt`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
+        body: JSON.stringify({
+          projectSlug: "docs",
+          baseDomain: "w33d.xyz",
+          source: {
+            repository: "acme/siteflow",
+            branch: "main",
+            commitSha: "different-commit"
+          },
+          releaseEvidence: releaseEvidenceRequest(),
+          files: [
+            {
+              path: "index.html",
+              contentBase64: Buffer.from("<h1>Hello</h1>").toString("base64"),
+              size: 14,
+              sha256: "unused-by-fixture"
+            }
+          ]
+        })
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(400);
+      expect(body.message).toContain("Prebuilt deploy source must match release evidence metadata: commitSha");
+    }, { apiToken: "deploy-token", releaseEvidenceEvaluator: passingReleaseEvidenceEvaluator() });
+
+    expect(deployPrebuiltCalled).toBe(false);
+  });
+
   it("rejects release evidence bundles that fail checking on prebuilt deploy uploads", async () => {
     let deployPrebuiltCalled = false;
     const repository: SiteFlowReadRepository = {

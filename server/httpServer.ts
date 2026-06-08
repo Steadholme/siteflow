@@ -1198,6 +1198,47 @@ function bodyWithProductionReleaseEvidence(
   };
 }
 
+function normalizePrebuiltSourceForReleaseEvidenceBody(body: Record<string, unknown>) {
+  const releaseEvidence = isRecord(body.releaseEvidence) ? body.releaseEvidence : undefined;
+
+  if (!releaseEvidence) {
+    return body;
+  }
+
+  const repository = evidenceString(releaseEvidence.repository);
+  const branch = evidenceString(releaseEvidence.branch);
+  const commitRef = evidenceString(releaseEvidence.commitRef);
+
+  if (!repository || !branch || !commitRef) {
+    throw new SyntaxError("Prebuilt deploy release evidence metadata must include repository, branch, and commitRef.");
+  }
+
+  if (body.source !== undefined && !isRecord(body.source)) {
+    throw new SyntaxError("Prebuilt deploy source must be a JSON object when release evidence is supplied.");
+  }
+
+  const source = isRecord(body.source) ? body.source : {};
+  const mismatches = [
+    evidenceString(source.repository) && evidenceString(source.repository) !== repository ? "repository" : undefined,
+    evidenceString(source.branch) && evidenceString(source.branch) !== branch ? "branch" : undefined,
+    evidenceString(source.commitSha) && evidenceString(source.commitSha) !== commitRef ? "commitSha" : undefined
+  ].filter((entry): entry is string => Boolean(entry));
+
+  if (mismatches.length > 0) {
+    throw new SyntaxError(`Prebuilt deploy source must match release evidence metadata: ${mismatches.join(", ")}.`);
+  }
+
+  return {
+    ...body,
+    source: {
+      ...source,
+      repository,
+      branch,
+      commitSha: commitRef
+    }
+  };
+}
+
 function bodyWithOptionalProductionReleaseEvidence(
   channel: string,
   body: unknown,
@@ -1268,7 +1309,9 @@ function bodyWithOptionalPrebuiltReleaseEvidence(body: unknown, options: SiteFlo
     return body;
   }
 
-  return bodyWithProductionReleaseEvidence("production", body, "prebuilt deploy upload", options);
+  return normalizePrebuiltSourceForReleaseEvidenceBody(
+    bodyWithProductionReleaseEvidence("production", body, "prebuilt deploy upload", options)
+  );
 }
 
 function bodyWithRequestedBy(body: unknown, requestedBy: Actor) {

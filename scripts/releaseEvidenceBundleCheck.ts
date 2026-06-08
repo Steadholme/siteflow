@@ -545,6 +545,38 @@ function releaseImageDigestPassed(evidence: Record<string, unknown> | undefined)
   return sha256DigestPattern.test(releaseImageDigestValue(evidence) ?? "");
 }
 
+function targetRuntimeImageBindingEvidence(evidence: Record<string, unknown> | undefined) {
+  const selectedEvidenceImageBinding = nestedObject(nestedObject(evidence, "selectedEvidence"), "imageBinding");
+  const targetRuntimeSummary = nestedObject(evidence, "targetRuntimeSummary");
+  const targetRuntimeSummaryImageBinding = nestedObject(targetRuntimeSummary, "imageBinding");
+  const candidates = [selectedEvidenceImageBinding, targetRuntimeSummaryImageBinding, targetRuntimeSummary];
+
+  return candidates.find((candidate) =>
+    stringValue(candidate?.expectedDigest) &&
+      stringValue(candidate?.apiImageDigest) &&
+      stringValue(candidate?.workerImageDigest)
+  ) ?? selectedEvidenceImageBinding ?? targetRuntimeSummaryImageBinding ?? targetRuntimeSummary;
+}
+
+function targetRuntimeReleaseImageDigestPassed(
+  targetRuntime: Record<string, unknown> | undefined,
+  releaseImage: Record<string, unknown> | undefined
+) {
+  const releaseDigest = releaseImageDigestValue(releaseImage);
+  const imageBinding = targetRuntimeImageBindingEvidence(targetRuntime);
+  const expectedDigest = stringValue(imageBinding?.expectedDigest);
+  const apiImageDigest = stringValue(imageBinding?.apiImageDigest);
+  const workerImageDigest = stringValue(imageBinding?.workerImageDigest);
+
+  return Boolean(
+    releaseDigest &&
+      sha256DigestPattern.test(releaseDigest) &&
+      expectedDigest === releaseDigest &&
+      apiImageDigest === releaseDigest &&
+      workerImageDigest === releaseDigest
+  );
+}
+
 function releaseImageTagsPassed(evidence: Record<string, unknown> | undefined) {
   const imageName = releaseImageNameValue(evidence);
   const versionTag = releaseImageVersionTagValue(evidence);
@@ -1876,6 +1908,12 @@ export function evaluateReleaseEvidenceBundle(
     "target_runtime_required_checks",
     checkArrayIncludesPassedNames(targetRuntime, requiredTargetRuntimeEvidenceCheckNames),
     "Target runtime evidence output must include passed checks for Compose config, startup, service health, readiness, image binding, restart smoke, log sanity, redaction, operator, and ticket evidence."
+  );
+  addCheck(
+    checks,
+    "target_runtime_release_image_digest",
+    targetRuntimeReleaseImageDigestPassed(targetRuntime, releaseImage),
+    "Target runtime evidence must prove API and worker containers are running the exact release image digest."
   );
   addCheck(
     checks,

@@ -170,6 +170,20 @@ const inputFileFlags = new Set([
   "--ingress-evidence",
   "--upgrade-rollback-evidence"
 ]);
+const checkedAtRequiredEvidenceIds = new Set([
+  "release_gate",
+  "release_artifact_evidence",
+  "release_image_evidence",
+  "source_provider_evidence",
+  "target_runtime_evidence",
+  "backup_evidence",
+  "observability_evidence",
+  "operator_access_evidence",
+  "non_session_credential_evidence",
+  "ingress_evidence",
+  "upgrade_rollback_evidence",
+  "release_evidence_check"
+]);
 const requiredPostgresRehearsalScopes = [
   "migration_advisory_lock",
   "migration_checksum_drift",
@@ -1597,6 +1611,11 @@ function finalReleaseEvidenceCheckFailedChecks(
       "Final release evidence check output must be passed with all checks passing."
     ),
     ...failedCheck(
+      "final_release_evidence_check_checked_at",
+      Boolean(timestampValue(evidence.checkedAt)),
+      "Final release evidence check output must include a checkedAt timestamp."
+    ),
+    ...failedCheck(
       "final_release_evidence_check_evidence_path",
       Boolean(stringValue(evidence.evidencePath)),
       "Final release evidence check output must include the checked release evidence bundle path."
@@ -2103,9 +2122,9 @@ function evaluateEvidenceObject(
   } else if (identityMismatch(evidence, release)) {
     itemStatus = "identity_mismatch";
     message = "Evidence release identity does not match the rehearsal pack release.";
-  } else if (id === "release_gate" && !checkedAt) {
+  } else if (checkedAtRequiredEvidenceIds.has(id) && !checkedAt) {
     itemStatus = "blocked";
-    message = "Release gate evidence is missing checkedAt and cannot prove raw evidence freshness.";
+    message = "Evidence output is missing checkedAt and cannot prove raw evidence freshness.";
   } else if (checkedAt && !isFresh(checkedAt, now, maxEvidenceAgeHours)) {
     itemStatus = "stale";
     message = `Evidence timestamp is older than ${maxEvidenceAgeHours} hours or from the future.`;

@@ -1614,6 +1614,86 @@ describe("PostgresSiteFlowReadRepository", () => {
     }
   });
 
+  it("derives prebuilt source provenance from release evidence before persisting artifact manifests", async () => {
+    const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "siteflow-postgres-derived-provenance-"));
+    const queries: Array<{ text: string; values?: unknown[] }> = [];
+    const client = {
+      query: async (text: string, values?: unknown[]) => {
+        queries.push({ text, values });
+        return { rows: [] };
+      },
+      release: () => undefined
+    };
+    const pool = {
+      connect: async () => client
+    };
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot,
+      baseDomain: "w33d.xyz"
+    });
+    const releaseEvidence = {
+      evidencePath: "evidence/release-evidence.json",
+      checkedAt: "2026-06-08T12:00:00.000Z",
+      status: "passed" as const,
+      commitRef: "abc123def4567890",
+      repository: "acme/siteflow",
+      branch: "main",
+      targetEnvironment: "production"
+    };
+
+    try {
+      await repository.deployPrebuilt({
+        projectSlug: "docs",
+        requestedHostPrefix: "derived123",
+        files: [prebuiltFile("index.html", "<h1>Hello</h1>")],
+        releaseEvidence
+      });
+      const deploymentInsert = queries.find((query) => query.text.includes("INSERT INTO siteflow_deployments"));
+      const manifest = JSON.parse(String(deploymentInsert?.values?.[9]));
+
+      expect(deploymentInsert?.values?.[2]).toBe("main");
+      expect(deploymentInsert?.values?.[3]).toBe("abc123def4567890");
+      expect(manifest.metadata.source).toEqual({
+        repository: "acme/siteflow",
+        branch: "main",
+        commitSha: "abc123def4567890"
+      });
+    } finally {
+      await rm(artifactRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects prebuilt source provenance that conflicts with release evidence before database writes", async () => {
+    const repository = new PostgresSiteFlowReadRepository({
+      connect: async () => {
+        throw new Error("database should not be touched");
+      }
+    } as never, {
+      artifactRoot: "/tmp/siteflow",
+      baseDomain: "w33d.xyz"
+    });
+
+    await expect(repository.deployPrebuilt({
+      projectSlug: "docs",
+      requestedHostPrefix: "conflict123",
+      files: [prebuiltFile("index.html", "<h1>Hello</h1>")],
+      source: {
+        repository: "acme/siteflow",
+        branch: "main",
+        commitSha: "different-commit"
+      },
+      releaseEvidence: {
+        evidencePath: "evidence/release-evidence.json",
+        checkedAt: "2026-06-08T12:00:00.000Z",
+        status: "passed",
+        commitRef: "abc123def4567890",
+        repository: "acme/siteflow",
+        branch: "main",
+        targetEnvironment: "production"
+      }
+    })).rejects.toThrow("Prebuilt deploy source must match release evidence metadata: commitSha");
+  });
+
   it("rejects raw prebuilt release evidence bundle requests before persisting artifact manifests", async () => {
     const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "siteflow-postgres-prebuilt-raw-evidence-"));
     const queries: Array<{ text: string; values?: unknown[] }> = [];
