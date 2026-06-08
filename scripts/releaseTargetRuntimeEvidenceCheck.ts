@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { evidenceSecretFindingSummary, scanEvidenceForRawSecrets } from "./evidenceSecretScan.js";
+import { strictIsoTimestampValue } from "./isoTimestamp.js";
 
 type EvidenceStatus = "passed" | "blocked";
 type CheckStatus = "pass" | "fail";
@@ -145,13 +146,7 @@ function statusValue(value: unknown) {
 }
 
 function timestampValue(value: unknown) {
-  const raw = stringValue(value);
-
-  if (!raw || Number.isNaN(Date.parse(raw))) {
-    return undefined;
-  }
-
-  return raw;
+  return strictIsoTimestampValue(value);
 }
 
 function nestedObject(candidate: Record<string, unknown> | undefined, key: string) {

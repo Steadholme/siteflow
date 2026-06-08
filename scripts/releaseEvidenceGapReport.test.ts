@@ -1155,6 +1155,31 @@ describe("releaseEvidenceGapReport", () => {
     }
   });
 
+  it("blocks passing release-gate evidence when checkedAt is not strict ISO", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-release-gate-non-iso-timestamp-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const gate = passedReleaseGateEvidence() as Record<string, unknown>;
+
+      gate.checkedAt = "June 8, 2026 11:30 UTC";
+      (gate.promotionEvidence as Record<string, unknown>).checkedAt = "June 8, 2026 11:30 UTC";
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.releaseGate, gate);
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+
+      expect(result.items.find((item) => item.id === "release_gate")).toMatchObject({
+        status: "blocked",
+        message: "Evidence output is missing checkedAt and cannot prove raw evidence freshness."
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("blocks passing checker evidence when checkedAt is missing", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-checker-timestamp-"));
 

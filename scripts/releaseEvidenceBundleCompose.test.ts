@@ -1135,6 +1135,15 @@ describe("releaseEvidenceBundleCompose", () => {
       /ingress evidence must include a checkedAt timestamp/
     ],
     [
+      "ingress non-ISO checkedAt",
+      "ingress",
+      () => ({
+        ...ingressEvidence(),
+        checkedAt: "June 7, 2026 11:30 UTC"
+      }),
+      /ingress evidence must include a checkedAt timestamp/
+    ],
+    [
       "source provider target environment mismatch",
       "sourceProvider",
       () => {

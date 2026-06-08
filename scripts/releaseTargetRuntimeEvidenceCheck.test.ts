@@ -220,6 +220,13 @@ describe("releaseTargetRuntimeEvidenceCheck", () => {
       expectedCheck: "environment"
     },
     {
+      label: "non-ISO checkedAt",
+      mutate: (evidence: Record<string, unknown>) => {
+        evidence.checkedAt = "June 8, 2026 11:45 UTC";
+      },
+      expectedCheck: "evidence_age"
+    },
+    {
       label: "unsanitized compose config",
       mutate: (evidence: Record<string, unknown>) => {
         (evidence.composeConfig as Record<string, unknown>).sanitized = false;

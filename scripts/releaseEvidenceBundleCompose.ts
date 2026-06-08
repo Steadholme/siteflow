@@ -3,6 +3,7 @@ import { pathToFileURL } from "node:url";
 import { requiredOffHostBackupEvidenceCheckNames } from "./backupEvidenceCheck.js";
 import { evidenceSecretFindingSummary, scanEvidenceForRawSecrets } from "./evidenceSecretScan.js";
 import { requiredIngressEvidenceCheckNames } from "./ingressEvidenceCheck.js";
+import { strictIsoTimestampValue } from "./isoTimestamp.js";
 import { requiredReleaseArtifactCheckNames } from "./releaseArtifactContracts.js";
 import { requiredSourceProviderEvidenceCheckNames } from "./sourceProviderEvidenceCheck.js";
 import { requiredTargetRuntimeEvidenceCheckNames } from "./releaseTargetRuntimeEvidenceCheck.js";
@@ -99,13 +100,7 @@ function stringValue(value: unknown) {
 }
 
 function timestampValue(value: unknown) {
-  const raw = stringValue(value);
-
-  if (!raw || Number.isNaN(Date.parse(raw))) {
-    return undefined;
-  }
-
-  return raw;
+  return strictIsoTimestampValue(value);
 }
 
 function nestedObject(candidate: Record<string, unknown> | undefined, key: string) {

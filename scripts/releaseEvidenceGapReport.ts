@@ -8,6 +8,7 @@ import {
 } from "./releaseEvidenceBundleCheck.js";
 import { evidenceSecretFindingSummary, scanEvidenceForRawSecrets, sensitiveOutputReasons } from "./evidenceSecretScan.js";
 import { requiredIngressEvidenceCheckNames } from "./ingressEvidenceCheck.js";
+import { strictIsoTimestampValue } from "./isoTimestamp.js";
 import { requiredReleaseArtifactCheckNames } from "./releaseArtifactContracts.js";
 import { validateReleaseEvidenceRehearsalPackContract } from "./releaseEvidenceRehearsalPackContract.js";
 import { requiredSourceProviderEvidenceCheckNames } from "./sourceProviderEvidenceCheck.js";
@@ -386,13 +387,7 @@ function statusValue(value: unknown) {
 }
 
 function timestampValue(value: unknown) {
-  const raw = stringValue(value);
-
-  if (!raw || Number.isNaN(Date.parse(raw))) {
-    return undefined;
-  }
-
-  return raw;
+  return strictIsoTimestampValue(value);
 }
 
 function nestedObject(candidate: Record<string, unknown> | undefined, key: string) {

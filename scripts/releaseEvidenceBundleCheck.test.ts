@@ -1546,6 +1546,25 @@ describe("releaseEvidenceBundleCheck", () => {
     }));
   });
 
+  it("blocks loose non-ISO bundle timestamps even when Date.parse accepts them", () => {
+    const evidence = validEvidence();
+    evidence.checkedAt = "June 7, 2026 11:30 UTC";
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "bundle_checked_at",
+      status: "fail"
+    }));
+  });
+
   it("blocks release image evidence with an invalid digest", () => {
     const evidence = validEvidence();
     const releaseImage = ((evidence.releaseImageEvidence as Record<string, unknown>).evidence ?? {}) as Record<string, unknown>;
