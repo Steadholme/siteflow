@@ -129,6 +129,20 @@ export function createReleaseTargetRuntimeEvidenceTemplate(options: ReleaseTarge
       services: [],
       secrets: [],
       healthchecks: [],
+      images: {
+        postgres: null,
+        api: null,
+        worker: null
+      },
+      imagePolicy: {
+        postgresDigestPinned: null,
+        apiDigestPinned: null,
+        workerDigestPinned: null,
+        noBuildFallback: null
+      },
+      buildServices: [],
+      buildFallbacks: [],
+      noBuildFallback: null,
       configSha256: null,
       sanitized: null,
       rawConfigArchived: null

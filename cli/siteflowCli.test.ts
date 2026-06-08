@@ -69,6 +69,7 @@ const validReleaseGateCliWorkflow = [
   "      - run: npm run --silent release:dependency:policy -- --json",
   "      - run: npm ci",
   "      - run: npm run --silent release:source:check -- --json",
+  "      - run: npm run --silent release:commit:plan -- --fail-on-blocked --json",
   "      - run: npm test -- --run",
   "      - run: npm run build",
   "      - run: npm run --silent release:artifacts:check -- --json",
@@ -435,7 +436,7 @@ function releaseEvidenceDependencies() {
         allowHostBuildException: false
       },
       selectedEvidence: {
-        releaseCommitRef: "abc123def4567890",
+        releaseCommitRef: "abc123def456abc123def456abc123def456abcd7890",
         repository: "acme/siteflow",
         branch: "main",
         releaseGateStatus: "pass",
@@ -468,7 +469,7 @@ async function writeReleaseEvidence(root: string, overrides: Record<string, unkn
       name: "siteflow-release-evidence-bundle",
       targetEnvironment: "production",
       release: {
-        commitRef: "abc123def4567890",
+        commitRef: "abc123def456abc123def456abc123def456abcd7890",
         repository: "acme/siteflow",
         branch: "main",
         targetEnvironment: "production",
@@ -1084,7 +1085,7 @@ describe("siteflow CLI", () => {
         "--promotion",
         "--allow-manual-branch-protection",
         "--commit-ref",
-        "abc123def456",
+        "abc123def456abc123def456abc123def456abcd",
         "--json"
       ], io, {
         env: validReleaseGateProductionEnv,
@@ -1103,18 +1104,23 @@ describe("siteflow CLI", () => {
       expect(result.promotionEvidence).toMatchObject({
         gateStatus: "manual_required",
         promotion: true,
-        commitRef: "abc123def456",
+        commitRef: "abc123def456abc123def456abc123def456abcd",
         manualRequired: true,
         manualRequiredCheckIds: [
           "external.githubBranchProtection",
+          "external.githubProtectedBranchCommit",
           "external.githubCommitStatus"
         ],
         branchProtection: {
           status: "manual_required"
         },
+        protectedBranchCommit: {
+          status: "manual_required",
+          commitRef: "abc123def456abc123def456abc123def456abcd"
+        },
         commitStatus: {
           status: "manual_required",
-          commitRef: "abc123def456"
+          commitRef: "abc123def456abc123def456abc123def456abcd"
         },
         runtimeEnv: {
           status: "pass",
@@ -1154,7 +1160,7 @@ describe("siteflow CLI", () => {
         "--branch",
         "release",
         "--commit-ref",
-        "abc123def456",
+        "abc123def456abc123def456abc123def456abcd",
         "--required-status-check",
         "Required / siteflow",
         "--require-commit-status",
@@ -1188,6 +1194,15 @@ describe("siteflow CLI", () => {
               });
             }
 
+            if (/\/branches\/[^/]+$/.test(url)) {
+              return new Response(JSON.stringify({
+                commit: { sha: "abc123def456abc123def456abc123def456abcd" }
+              }), {
+                status: 200,
+                headers: { "content-type": "application/json" }
+              });
+            }
+
             return new Response(JSON.stringify({
               check_runs: [
                 {
@@ -1210,7 +1225,7 @@ describe("siteflow CLI", () => {
       expect(result.promotionEvidence).toMatchObject({
         gateStatus: "pass",
         promotion: true,
-        commitRef: "abc123def456",
+        commitRef: "abc123def456abc123def456abc123def456abcd",
         repository: "acme/siteflow",
         branch: "release",
         requiredStatusCheck: "Required / siteflow",
@@ -1221,10 +1236,17 @@ describe("siteflow CLI", () => {
           requiredStatusCheck: "Required / siteflow",
           requiredStatusChecks: ["Required / siteflow"]
         },
+        protectedBranchCommit: {
+          status: "pass",
+          repository: "acme/siteflow",
+          branch: "release",
+          commitRef: "abc123def456abc123def456abc123def456abcd",
+          branchHeadSha: "abc123def456abc123def456abc123def456abcd"
+        },
         commitStatus: {
           status: "pass",
           repository: "acme/siteflow",
-          commitRef: "abc123def456",
+          commitRef: "abc123def456abc123def456abc123def456abcd",
           requiredStatusCheck: "Required / siteflow",
           checkRun: {
             name: "Required / siteflow",
@@ -1257,7 +1279,11 @@ describe("siteflow CLI", () => {
           authorization: "Bearer ghs_test"
         },
         {
-          url: "https://api.github.com/repos/acme/siteflow/commits/abc123def456/check-runs?check_name=Required+%2F+siteflow",
+          url: "https://api.github.com/repos/acme/siteflow/branches/release",
+          authorization: "Bearer ghs_test"
+        },
+        {
+          url: "https://api.github.com/repos/acme/siteflow/commits/abc123def456abc123def456abc123def456abcd/check-runs?check_name=Required+%2F+siteflow",
           authorization: "Bearer ghs_test"
         }
       ]);
@@ -2743,7 +2769,7 @@ describe("siteflow CLI", () => {
           source: {
             repository: "acme/siteflow",
             branch: "main",
-            commitSha: "abc123def4567890"
+            commitSha: "abc123def456abc123def456abc123def456abcd7890"
           },
           releaseEvidence: {
             evidencePath,
@@ -4684,7 +4710,7 @@ describe("siteflow CLI", () => {
                     evidencePath: "evidence/release-evidence.json",
                     checkedAt: "2026-06-08T12:00:00.000Z",
                     status: "passed",
-                    commitRef: "abc123def4567890",
+                    commitRef: "abc123def456abc123def456abc123def456abcd7890",
                     repository: "acme/siteflow",
                     branch: "main",
                     targetEnvironment: "production",

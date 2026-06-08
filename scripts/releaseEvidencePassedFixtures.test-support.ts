@@ -46,6 +46,13 @@ export function passedReleaseGateEvidence() {
         requiredStatusCheck: "Install, test, and build",
         requiredStatusChecks: ["Install, test, and build"]
       },
+      protectedBranchCommit: {
+        status: "pass",
+        repository: "acme/siteflow",
+        branch: "main",
+        commitRef: "abc123def4567890",
+        branchHeadSha: "abc123def4567890"
+      },
       commitStatus: {
         status: "pass",
         repository: "acme/siteflow",

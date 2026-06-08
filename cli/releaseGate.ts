@@ -43,6 +43,13 @@ export interface ReleaseGatePromotionEvidence {
     requiredStatusCheck: string;
     requiredStatusChecks?: string[];
   };
+  protectedBranchCommit: {
+    status: ReleaseGateCheckStatus;
+    repository?: string;
+    branch: string;
+    commitRef?: string;
+    branchHeadSha?: string;
+  };
   commitStatus: {
     status: ReleaseGateCheckStatus;
     repository?: string;
@@ -160,6 +167,7 @@ const requiredCiCommands = [
   "npm ci",
   "release:dependency:policy",
   "release:source:check",
+  "release:commit:plan -- --fail-on-blocked",
   "npm test",
   "npm run build",
   "release:artifacts:check",
@@ -258,6 +266,7 @@ const requiredProductionDeploymentDocTerms = [
 ];
 const maxDirtyWorktreeEntries = 200;
 const defaultRequiredStatusCheck = "Install, test, and build";
+const fullGitShaPattern = /^[a-f0-9]{40}$/i;
 const requiredDocumentedEnvNames = [
   "DATABASE_URL",
   "SITEFLOW_API_PORT",
@@ -1767,6 +1776,10 @@ function resolveRequiredStatusCheck(options: ReleaseGateOptions, env: NodeJS.Pro
     || defaultRequiredStatusCheck;
 }
 
+function isFullGitSha(value: string | undefined) {
+  return Boolean(value && fullGitShaPattern.test(value));
+}
+
 async function resolveCommitSha(
   root: string,
   options: ReleaseGateOptions,
@@ -1902,6 +1915,169 @@ async function checkGitHubBranchProtection(options: ReleaseGateOptions): Promise
   }
 }
 
+function branchHeadShaFromResponse(body: unknown) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return undefined;
+  }
+
+  const value = body as { commit?: unknown };
+
+  if (!value.commit || typeof value.commit !== "object" || Array.isArray(value.commit)) {
+    return undefined;
+  }
+
+  const commit = value.commit as { sha?: unknown };
+
+  return typeof commit.sha === "string" && commit.sha.trim()
+    ? commit.sha.trim()
+    : undefined;
+}
+
+async function checkGitHubProtectedBranchCommit(
+  root: string,
+  options: ReleaseGateOptions,
+  runner: ReleaseGateCommandRunner
+): Promise<ReleaseGateCheck> {
+  const required = Boolean(options.promotion || options.requireCommitStatus);
+  const env = options.env ?? process.env;
+  const token = env.GITHUB_TOKEN;
+  const repository = resolveGitHubRepository(options);
+  const branch = options.branch ?? "main";
+  const commitSha = await resolveCommitSha(root, options, env, runner);
+
+  if (!required) {
+    return {
+      id: "external.githubProtectedBranchCommit",
+      label: "GitHub protected branch commit",
+      status: "skipped",
+      summary: "Protected branch head binding skipped; pass --require-commit-status or --promotion to verify the release commit is the protected branch head."
+    };
+  }
+
+  if (!token || !repository || !commitSha) {
+    return {
+      id: "external.githubProtectedBranchCommit",
+      label: "GitHub protected branch commit",
+      status: "manual_required",
+      summary: "GITHUB_TOKEN, GITHUB_REPOSITORY/--repo, and a commit SHA were not all available; protected branch head binding was not verified.",
+      remediation: "Set GITHUB_TOKEN and GITHUB_REPOSITORY, and pass a full --commit-ref for the protected release branch before production promotion.",
+      details: {
+        branch,
+        ...(repository ? { repository: `${repository.owner}/${repository.name}` } : {}),
+        ...(commitSha ? { commitSha } : {}),
+        hasToken: Boolean(token),
+        hasRepository: Boolean(repository),
+        hasCommitSha: Boolean(commitSha)
+      }
+    };
+  }
+
+  if (!isFullGitSha(commitSha)) {
+    return {
+      id: "external.githubProtectedBranchCommit",
+      label: "GitHub protected branch commit",
+      status: "fail",
+      summary: "--commit-ref must be a canonical 40-character Git SHA for production promotion.",
+      remediation: "Resolve the release commit with git rev-parse HEAD and rerun release-gate with the full SHA.",
+      details: {
+        branch,
+        repository: `${repository.owner}/${repository.name}`,
+        commitSha
+      }
+    };
+  }
+
+  const fetchImpl = options.fetch ?? fetch;
+  const url = `https://api.github.com/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}/branches/${encodeURIComponent(branch)}`;
+
+  try {
+    const response = await fetchImpl(url, {
+      headers: {
+        accept: "application/vnd.github+json",
+        authorization: `Bearer ${token}`,
+        "x-github-api-version": "2022-11-28"
+      }
+    });
+
+    if (!response.ok) {
+      const body = (await response.json().catch(() => undefined)) as { message?: string } | undefined;
+
+      return {
+        id: "external.githubProtectedBranchCommit",
+        label: "GitHub protected branch commit",
+        status: "fail",
+        summary: body?.message ?? `GitHub branch head check failed with HTTP ${response.status}.`,
+        remediation: "Verify that the release commit is the current head of the protected branch before promotion.",
+        details: {
+          branch,
+          repository: `${repository.owner}/${repository.name}`,
+          commitSha,
+          httpStatus: response.status
+        }
+      };
+    }
+
+    const branchHeadSha = branchHeadShaFromResponse(await response.json());
+
+    if (!branchHeadSha) {
+      return {
+        id: "external.githubProtectedBranchCommit",
+        label: "GitHub protected branch commit",
+        status: "fail",
+        summary: "GitHub branch response did not include a branch head commit SHA.",
+        remediation: "Retry with a token that can read the protected branch metadata.",
+        details: {
+          branch,
+          repository: `${repository.owner}/${repository.name}`,
+          commitSha
+        }
+      };
+    }
+
+    if (branchHeadSha !== commitSha) {
+      return {
+        id: "external.githubProtectedBranchCommit",
+        label: "GitHub protected branch commit",
+        status: "fail",
+        summary: `Release commit ${commitSha} is not the current head of protected branch ${branch}.`,
+        remediation: "Promote only the exact commit currently protected on the release branch, or update the branch and rerun CI/preflight.",
+        details: {
+          branch,
+          repository: `${repository.owner}/${repository.name}`,
+          commitSha,
+          branchHeadSha
+        }
+      };
+    }
+
+    return {
+      id: "external.githubProtectedBranchCommit",
+      label: "GitHub protected branch commit",
+      status: "pass",
+      summary: `Release commit ${commitSha} is the current head of protected branch ${branch}.`,
+      details: {
+        branch,
+        repository: `${repository.owner}/${repository.name}`,
+        commitSha,
+        branchHeadSha
+      }
+    };
+  } catch (error) {
+    return {
+      id: "external.githubProtectedBranchCommit",
+      label: "GitHub protected branch commit",
+      status: "fail",
+      summary: error instanceof Error ? error.message : "Unable to verify GitHub protected branch commit.",
+      remediation: "Retry with network access or verify the protected branch head manually before release.",
+      details: {
+        branch,
+        repository: `${repository.owner}/${repository.name}`,
+        commitSha
+      }
+    };
+  }
+}
+
 async function checkGitHubCommitStatus(
   root: string,
   options: ReleaseGateOptions,
@@ -1937,6 +2113,21 @@ async function checkGitHubCommitStatus(
         hasToken: Boolean(token),
         hasRepository: Boolean(repository),
         hasCommitSha: Boolean(commitSha)
+      }
+    };
+  }
+
+  if (!isFullGitSha(commitSha)) {
+    return {
+      id: "external.githubCommitStatus",
+      label: "GitHub commit status",
+      status: "fail",
+      summary: "--commit-ref must be a canonical 40-character Git SHA before exact commit status can be verified.",
+      remediation: "Resolve the release commit with git rev-parse HEAD and rerun release-gate with the full SHA.",
+      details: {
+        requiredStatusCheck,
+        repository: `${repository.owner}/${repository.name}`,
+        commitSha
       }
     };
   }
@@ -2100,6 +2291,7 @@ function buildReleaseGatePromotionEvidence(
   const branch = options.branch ?? "main";
   const requiredStatusCheck = resolveRequiredStatusCheck(options, env);
   const branchProtection = getCheck(checks, "external.githubBranchProtection");
+  const protectedBranchCommit = getCheck(checks, "external.githubProtectedBranchCommit");
   const commitStatus = getCheck(checks, "external.githubCommitStatus");
   const runtimeEnv = getCheck(checks, "local.requiredEnv");
   const gitStatus = getCheck(checks, "local.gitStatus");
@@ -2127,6 +2319,15 @@ function buildReleaseGatePromotionEvidence(
       requiredStatusCheck: detailString(branchProtection?.details, "requiredStatusCheck") ?? requiredStatusCheck,
       ...(detailStringArray(branchProtection?.details, "requiredStatusChecks")
         ? { requiredStatusChecks: detailStringArray(branchProtection?.details, "requiredStatusChecks") }
+        : {})
+    },
+    protectedBranchCommit: {
+      status: protectedBranchCommit?.status ?? "skipped",
+      repository: detailString(protectedBranchCommit?.details, "repository") ?? repositoryName,
+      branch: detailString(protectedBranchCommit?.details, "branch") ?? branch,
+      ...(commitRef ? { commitRef } : {}),
+      ...(detailString(protectedBranchCommit?.details, "branchHeadSha")
+        ? { branchHeadSha: detailString(protectedBranchCommit?.details, "branchHeadSha") }
         : {})
     },
     commitStatus: {
@@ -2217,6 +2418,7 @@ export async function runReleaseGate(options: ReleaseGateOptions = {}): Promise<
   ]);
 
   checks.push(await checkGitHubBranchProtection({ ...options, env }));
+  checks.push(await checkGitHubProtectedBranchCommit(root, { ...options, env }, runner));
   checks.push(await checkGitHubCommitStatus(root, { ...options, env }, runner));
   const status = aggregateReleaseGateStatus(checks, !promotion && Boolean(options.allowManualBranchProtection));
 

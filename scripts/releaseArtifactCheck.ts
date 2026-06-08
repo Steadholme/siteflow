@@ -64,6 +64,7 @@ export interface ReleaseArtifactManifest {
 }
 
 export interface ReleaseDeploymentArtifactManifestEvidence {
+  release?: ReleaseDeploymentDetailIdentity;
   functions: Record<string, unknown>[];
   runtimeIsolation?: string;
   functionRuntimeIsolation?: string;
@@ -412,8 +413,13 @@ function deploymentArtifactManifestFromJson(parsed: Record<string, unknown>, sou
 
   const runtime = sanitizeRuntimeIsolationObject(manifest.runtime);
   const functionRuntime = sanitizeRuntimeIsolationObject(manifest.functionRuntime);
+  const identity = deploymentDetailIdentityFromJson(parsed);
+  const release = Object.fromEntries(
+    Object.entries(identity).filter(([, value]) => Boolean(value))
+  ) as ReleaseDeploymentDetailIdentity;
 
   return {
+    ...(Object.keys(release).length > 0 ? { release } : {}),
     functions: objectValues(manifest.functions).map(sanitizeFunctionEntry),
     ...(stringField(manifest.runtimeIsolation) ? { runtimeIsolation: stringField(manifest.runtimeIsolation) } : {}),
     ...(stringField(manifest.functionRuntimeIsolation) ? { functionRuntimeIsolation: stringField(manifest.functionRuntimeIsolation) } : {}),
@@ -484,6 +490,8 @@ function firstRepositoryName(root: Record<string, unknown>, paths: string[][]) {
 function deploymentDetailIdentityFromJson(parsed: Record<string, unknown>): ReleaseDeploymentDetailIdentity {
   return {
     commitRef: firstStringField(parsed, [
+      ["release", "commitRef"],
+      ["release", "commitSha"],
       ["lineage", "sourceEvent", "commitSha"],
       ["sourceEvent", "commitSha"],
       ["deployment", "commitSha"],
@@ -491,18 +499,23 @@ function deploymentDetailIdentityFromJson(parsed: Record<string, unknown>): Rele
       ["commitRef"]
     ]),
     repository: firstRepositoryName(parsed, [
+      ["release", "repository"],
+      ["release", "repo"],
       ["lineage", "sourceEvent", "repository"],
       ["sourceEvent", "repository"],
       ["project", "repository"],
       ["repository"]
     ]),
     branch: firstStringField(parsed, [
+      ["release", "branch"],
       ["lineage", "sourceEvent", "branch"],
       ["sourceEvent", "branch"],
       ["deployment", "branch"],
       ["branch"]
     ]),
     targetEnvironment: firstStringField(parsed, [
+      ["release", "targetEnvironment"],
+      ["release", "environment"],
       ["deployment", "environment"],
       ["lineage", "deployment", "environment"],
       ["targetEnvironment"],
@@ -573,9 +586,12 @@ async function readDeploymentArtifactManifestEvidence(options: ReleaseArtifactCh
   const manifest = deploymentArtifactManifestFromJson(parsed, sourcePath);
 
   if (!options.deploymentDetailPath) {
+    const identity = deploymentDetailIdentityFromJson(parsed);
+
     return {
       manifest,
-      identityFindings: []
+      identity,
+      identityFindings: deploymentDetailIdentityFindings(identity, options, sourcePath)
     };
   }
 

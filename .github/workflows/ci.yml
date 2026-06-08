@@ -36,8 +36,8 @@ jobs:
       - name: Release source tree check
         run: npm run --silent release:source:check -- --json
 
-      - name: Release commit readiness plan (advisory)
-        run: npm run --silent release:commit:plan -- --json
+      - name: Release commit readiness plan
+        run: npm run --silent release:commit:plan -- --fail-on-blocked --json
 
       - name: Production Docker compose config check
         env:

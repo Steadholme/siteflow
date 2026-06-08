@@ -96,7 +96,15 @@ async function writeCleanArtifacts(root: string) {
   ].join("\n"));
 }
 
-async function writeDeploymentArtifactManifest(root: string, manifest: Record<string, unknown> = { functions: [] }) {
+async function writeDeploymentArtifactManifest(root: string, manifest: Record<string, unknown> = {
+  release: {
+    commitRef: releaseIdentity.commitRef,
+    repository: releaseIdentity.repo,
+    branch: releaseIdentity.branch,
+    targetEnvironment: releaseIdentity.targetEnvironment
+  },
+  functions: []
+}) {
   const relativePath = "deployment-artifact-manifest.json";
 
   await writeText(root, relativePath, JSON.stringify(manifest));
@@ -197,7 +205,15 @@ describe("releaseArtifactCheck", () => {
       expect(result.selectedEvidence.packageBinSiteflow).toBe("./dist-cli/cli/index.js");
       expect(result.selectedEvidence.installProfileStatus).toBe("passed");
       expect(result.selectedEvidence.dependencyPolicyStatus).toBe("passed");
-      expect(result.artifactManifest).toEqual({ functions: [] });
+      expect(result.artifactManifest).toEqual({
+        release: {
+          commitRef: "abc123def456",
+          repository: "acme/siteflow",
+          branch: "main",
+          targetEnvironment: "production"
+        },
+        functions: []
+      });
       expect(result.checks.every((check) => check.status === "pass")).toBe(true);
       expect(manifest.schemaVersion).toBe("siteflow.releaseArtifactManifest.v1");
       expect(manifest.artifacts).toHaveLength(6);
@@ -263,6 +279,12 @@ describe("releaseArtifactCheck", () => {
 
       expect(result.status).toBe("passed");
       expect(result.artifactManifest).toEqual({
+        release: {
+          commitRef: "abc123def456",
+          repository: "acme/siteflow",
+          branch: "main",
+          targetEnvironment: "production"
+        },
         functions: [
           {
             path: "/api/revalidate",
@@ -312,6 +334,75 @@ describe("releaseArtifactCheck", () => {
       const result = await runReleaseArtifactCheck({
         rootDir: root,
         deploymentDetailPath,
+        runAudit: false,
+        commandRunner: passingCommandRunner(),
+        ...releaseIdentity,
+        now
+      });
+      const manifestCheck = result.checks.find((check) => check.name === "deployment_artifact_manifest");
+
+      expect(result.status).toBe("blocked");
+      expect(manifestCheck).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("commitRef must be abc123def456")
+      });
+      expect(manifestCheck?.details?.deploymentIdentity).toMatchObject({
+        commitRef: "different-commit",
+        repository: "acme/siteflow",
+        branch: "main",
+        targetEnvironment: "production"
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks sanitized deployment artifact manifests without release identity", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-artifacts-anonymous-deployment-manifest-"));
+
+    try {
+      await writeCleanArtifacts(root);
+      const deploymentArtifactManifestPath = await writeDeploymentArtifactManifest(root, { functions: [] });
+
+      const result = await runReleaseArtifactCheck({
+        rootDir: root,
+        deploymentArtifactManifestPath,
+        runAudit: false,
+        commandRunner: passingCommandRunner(),
+        ...releaseIdentity,
+        now
+      });
+      const manifestCheck = result.checks.find((check) => check.name === "deployment_artifact_manifest");
+
+      expect(result.status).toBe("blocked");
+      expect(manifestCheck).toMatchObject({
+        status: "fail",
+        message: expect.stringContaining("must include commitRef")
+      });
+      expect(manifestCheck?.details?.deploymentIdentity).toEqual({});
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks sanitized deployment artifact manifests with mismatched release identity", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-artifacts-manifest-mismatch-"));
+
+    try {
+      await writeCleanArtifacts(root);
+      const deploymentArtifactManifestPath = await writeDeploymentArtifactManifest(root, {
+        release: {
+          commitRef: "different-commit",
+          repository: "acme/siteflow",
+          branch: "main",
+          targetEnvironment: "production"
+        },
+        functions: []
+      });
+
+      const result = await runReleaseArtifactCheck({
+        rootDir: root,
+        deploymentArtifactManifestPath,
         runAudit: false,
         commandRunner: passingCommandRunner(),
         ...releaseIdentity,

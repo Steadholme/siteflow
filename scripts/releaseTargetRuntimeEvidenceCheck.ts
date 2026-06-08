@@ -73,6 +73,8 @@ const expectedSchemaVersion = "siteflow.targetRuntimeEvidence.v1";
 const expectedName = "siteflow-target-runtime-evidence";
 const passStatuses = new Set(["pass", "passed", "ok", "healthy", "running", "verified", "active", "enabled"]);
 const sha256DigestPattern = /^sha256:[a-f0-9]{64}$/i;
+const sha256HexPattern = /^[a-f0-9]{64}$/i;
+const imageDigestPinPattern = /@sha256:[a-f0-9]{64}$/i;
 
 export const requiredTargetRuntimeEvidenceCheckNames = [
   "schema_version",
@@ -90,6 +92,8 @@ export const requiredTargetRuntimeEvidenceCheckNames = [
   "compose_config_services",
   "compose_config_secrets",
   "compose_config_sanitized",
+  "compose_config_images",
+  "compose_config_no_build_fallback",
   "startup_present",
   "startup_status",
   "service_health_present",
@@ -258,6 +262,55 @@ function arrayIncludesAllStrings(value: unknown, expected: string[]) {
   return expected.every((entry) => values.includes(entry));
 }
 
+function serviceImageFromComposeConfig(composeConfig: Record<string, unknown> | undefined, serviceName: string) {
+  const images = composeConfig?.images;
+
+  if (isObject(images)) {
+    return stringValue(images[serviceName]);
+  }
+
+  if (Array.isArray(images)) {
+    for (const entry of images) {
+      if (!isObject(entry)) {
+        continue;
+      }
+
+      const service = stringValue(entry.service) ?? stringValue(entry.name);
+
+      if (service === serviceName) {
+        return stringValue(entry.image);
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function digestPinnedImage(value: unknown) {
+  const raw = stringValue(value);
+
+  return Boolean(raw && imageDigestPinPattern.test(raw));
+}
+
+function composeImagesDigestPinned(composeConfig: Record<string, unknown> | undefined) {
+  return ["postgres", "api", "worker"].every((service) =>
+    digestPinnedImage(serviceImageFromComposeConfig(composeConfig, service))
+  );
+}
+
+function emptyArrayField(value: unknown) {
+  return Array.isArray(value) && value.length === 0;
+}
+
+function composeNoBuildFallback(composeConfig: Record<string, unknown> | undefined) {
+  const imagePolicy = nestedObject(composeConfig, "imagePolicy");
+
+  return composeConfig?.noBuildFallback === true &&
+    imagePolicy?.noBuildFallback === true &&
+    emptyArrayField(composeConfig?.buildServices) &&
+    emptyArrayField(composeConfig?.buildFallbacks);
+}
+
 function statusCodeOk(value: unknown) {
   return typeof value === "number" && value >= 200 && value < 300;
 }
@@ -369,7 +422,9 @@ export function evaluateReleaseTargetRuntimeEvidence(
   addCheck(checks, "compose_config_status", sectionPassed(composeConfig, now, maxAgeHours), "Compose config evidence must have passing status and fresh timestamp.");
   addCheck(checks, "compose_config_services", arrayIncludesAllStrings(composeConfig?.services, ["postgres", "api", "worker"]), "Compose config evidence must summarize postgres, api, and worker services.");
   addCheck(checks, "compose_config_secrets", arrayIncludesAllStrings(composeConfig?.secrets, ["siteflow_app_secret", "siteflow_api_token", "siteflow_metrics_token", "siteflow_postgres_password"]), "Compose config evidence must summarize required Docker secrets.");
-  addCheck(checks, "compose_config_sanitized", composeConfig?.sanitized === true && composeConfig?.rawConfigArchived === false && Boolean(stringValue(composeConfig?.configSha256)), "Compose config evidence must be sanitized and include only a config hash, not raw config.");
+  addCheck(checks, "compose_config_sanitized", composeConfig?.sanitized === true && composeConfig?.rawConfigArchived === false && sha256HexPattern.test(stringValue(composeConfig?.configSha256) ?? ""), "Compose config evidence must be sanitized and include only a SHA-256 config hash, not raw config.");
+  addCheck(checks, "compose_config_images", composeImagesDigestPinned(composeConfig), "Compose config evidence must prove postgres, API, and worker services use digest-pinned images.");
+  addCheck(checks, "compose_config_no_build_fallback", composeNoBuildFallback(composeConfig), "Compose config evidence must prove the target Compose config has no build services or build fallback.");
 
   addCheck(checks, "startup_present", Boolean(startup), "Target runtime evidence must include startup evidence.");
   addCheck(checks, "startup_status", sectionPassed(startup, now, maxAgeHours) && (startup?.systemdActive === true || startup?.composeUpExitCode === 0), "Startup evidence must show systemd active or docker compose up succeeded.");

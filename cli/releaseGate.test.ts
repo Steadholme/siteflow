@@ -17,6 +17,7 @@ const validCiWorkflow = [
   "      - run: npm run --silent release:dependency:policy -- --json",
   "      - run: npm ci",
   "      - run: npm run --silent release:source:check -- --json",
+  "      - run: npm run --silent release:commit:plan -- --fail-on-blocked --json",
   "      - run: npm test -- --run",
   "      - run: npm run build",
   "      - run: npm run --silent release:artifacts:check -- --json",
@@ -356,6 +357,7 @@ describe("release gate", () => {
           missingCommands: [
             "release:dependency:policy",
             "release:source:check",
+            "release:commit:plan -- --fail-on-blocked",
             "release:artifacts:check",
             "release-gate --allow-dirty --allow-manual-branch-protection"
           ]
@@ -1254,6 +1256,15 @@ describe("release gate", () => {
         });
       }
 
+      if (/\/branches\/[^/]+$/.test(url)) {
+        return new Response(JSON.stringify({
+          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
+        }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+
       return new Response(JSON.stringify({
         total_count: 1,
         check_runs: [
@@ -1278,7 +1289,7 @@ describe("release gate", () => {
           GITHUB_TOKEN: "ghs_test",
           GITHUB_REPOSITORY: "acme/siteflow"
         },
-        commitSha: "abc123def456",
+        commitSha: "abc123def456abc123def456abc123def456abcd",
         promotion: true,
         runner: cleanRunner,
         fetch
@@ -1287,7 +1298,8 @@ describe("release gate", () => {
       expect(report.status).toBe("pass");
       expect(requests).toEqual([
         "https://api.github.com/repos/acme/siteflow/branches/main/protection/required_status_checks",
-        "https://api.github.com/repos/acme/siteflow/commits/abc123def456/check-runs?check_name=Install%2C+test%2C+and+build"
+        "https://api.github.com/repos/acme/siteflow/branches/main",
+        "https://api.github.com/repos/acme/siteflow/commits/abc123def456abc123def456abc123def456abcd/check-runs?check_name=Install%2C+test%2C+and+build"
       ]);
       expect(report.checks).toContainEqual(expect.objectContaining({
         id: "external.githubCommitStatus",
@@ -1296,7 +1308,7 @@ describe("release gate", () => {
       expect(report.promotionEvidence).toMatchObject({
         gateStatus: "pass",
         promotion: true,
-        commitRef: "abc123def456",
+        commitRef: "abc123def456abc123def456abc123def456abcd",
         repository: "acme/siteflow",
         branch: "main",
         requiredStatusCheck: "Install, test, and build",
@@ -1304,9 +1316,14 @@ describe("release gate", () => {
           status: "pass",
           requiredStatusChecks: ["Install, test, and build"]
         },
+        protectedBranchCommit: {
+          status: "pass",
+          commitRef: "abc123def456abc123def456abc123def456abcd",
+          branchHeadSha: "abc123def456abc123def456abc123def456abcd"
+        },
         commitStatus: {
           status: "pass",
-          commitRef: "abc123def456",
+          commitRef: "abc123def456abc123def456abc123def456abcd",
           checkRun: {
             name: "Install, test, and build",
             status: "completed",
@@ -1372,6 +1389,15 @@ describe("release gate", () => {
         });
       }
 
+      if (/\/branches\/[^/]+$/.test(url)) {
+        return new Response(JSON.stringify({
+          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
+        }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+
       return new Response(JSON.stringify({
         total_count: 1,
         check_runs: [
@@ -1397,7 +1423,7 @@ describe("release gate", () => {
           GITHUB_REPOSITORY: "acme/siteflow"
         },
         allowDirty: true,
-        commitSha: "abc123def456",
+        commitSha: "abc123def456abc123def456abc123def456abcd",
         promotion: true,
         runner: dirtyRunner,
         fetch
@@ -1444,6 +1470,15 @@ describe("release gate", () => {
         });
       }
 
+      if (/\/branches\/[^/]+$/.test(url)) {
+        return new Response(JSON.stringify({
+          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
+        }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+
       return new Response(JSON.stringify({
         total_count: 1,
         check_runs: [
@@ -1467,7 +1502,7 @@ describe("release gate", () => {
           GITHUB_TOKEN: "ghs_test",
           GITHUB_REPOSITORY: "acme/siteflow"
         },
-        commitSha: "abc123def456",
+        commitSha: "abc123def456abc123def456abc123def456abcd",
         promotion: true,
         runner: cleanRunner,
         fetch
@@ -1482,14 +1517,14 @@ describe("release gate", () => {
       expect(report.promotionEvidence).toMatchObject({
         gateStatus: "fail",
         promotion: true,
-        commitRef: "abc123def456",
+        commitRef: "abc123def456abc123def456abc123def456abcd",
         repository: "acme/siteflow",
         branchProtection: {
           status: "pass"
         },
         commitStatus: {
           status: "fail",
-          commitRef: "abc123def456",
+          commitRef: "abc123def456abc123def456abc123def456abcd",
           checkRuns: [
             {
               name: "Install, test, and build",
@@ -1512,6 +1547,71 @@ describe("release gate", () => {
     }
   });
 
+  it("fails promotion when commit ref is not a canonical full SHA", async () => {
+    const root = await createReleaseRoot();
+    const requests: string[] = [];
+    const fetch: ReleaseGateFetch = async (input) => {
+      const url = input.toString();
+      requests.push(url);
+
+      if (url.includes("/required_status_checks")) {
+        return new Response(JSON.stringify({
+          contexts: ["Install, test, and build"],
+          checks: []
+        }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+
+      throw new Error(`Unexpected GitHub request: ${url}`);
+    };
+
+    try {
+      const report = await runReleaseGate({
+        root,
+        env: {
+          ...validProductionEnv,
+          GITHUB_TOKEN: "ghs_test",
+          GITHUB_REPOSITORY: "acme/siteflow"
+        },
+        commitSha: "abc123",
+        promotion: true,
+        runner: cleanRunner,
+        fetch
+      });
+
+      expect(report.status).toBe("fail");
+      expect(requests).toEqual([
+        "https://api.github.com/repos/acme/siteflow/branches/main/protection/required_status_checks"
+      ]);
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "external.githubProtectedBranchCommit",
+        status: "fail",
+        summary: expect.stringContaining("canonical 40-character Git SHA")
+      }));
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "external.githubCommitStatus",
+        status: "fail",
+        summary: expect.stringContaining("canonical 40-character Git SHA")
+      }));
+      expect(report.promotionEvidence).toMatchObject({
+        gateStatus: "fail",
+        commitRef: "abc123",
+        protectedBranchCommit: {
+          status: "fail",
+          commitRef: "abc123"
+        },
+        commitStatus: {
+          status: "fail",
+          commitRef: "abc123"
+        }
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("does not let promotion mode pass with manual branch protection override", async () => {
     const root = await createReleaseRoot();
 
@@ -1520,7 +1620,7 @@ describe("release gate", () => {
         root,
         env: {
           ...validProductionEnv,
-          GITHUB_SHA: "abc123def456"
+          GITHUB_SHA: "abc123def456abc123def456abc123def456abcd"
         },
         runner: cleanRunner,
         allowManualBranchProtection: true,
@@ -1539,18 +1639,23 @@ describe("release gate", () => {
       expect(report.promotionEvidence).toMatchObject({
         gateStatus: "manual_required",
         promotion: true,
-        commitRef: "abc123def456",
+        commitRef: "abc123def456abc123def456abc123def456abcd",
         manualRequired: true,
         manualRequiredCheckIds: [
           "external.githubBranchProtection",
+          "external.githubProtectedBranchCommit",
           "external.githubCommitStatus"
         ],
         branchProtection: {
           status: "manual_required"
         },
+        protectedBranchCommit: {
+          status: "manual_required",
+          commitRef: "abc123def456abc123def456abc123def456abcd"
+        },
         commitStatus: {
           status: "manual_required",
-          commitRef: "abc123def456"
+          commitRef: "abc123def456abc123def456abc123def456abcd"
         },
         runtimeEnv: {
           status: "pass",
@@ -1592,6 +1697,15 @@ describe("release gate", () => {
         });
       }
 
+      if (/\/branches\/[^/]+$/.test(url)) {
+        return new Response(JSON.stringify({
+          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
+        }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+
       return new Response(JSON.stringify({
         check_runs: [
           {
@@ -1618,7 +1732,7 @@ describe("release gate", () => {
           GITHUB_TOKEN: "ghs_test",
           GITHUB_REPOSITORY: "acme/siteflow"
         },
-        commitSha: "abc123def456",
+        commitSha: "abc123def456abc123def456abc123def456abcd",
         promotion: true,
         runner: cleanRunner,
         fetch
@@ -2062,6 +2176,15 @@ describe("release gate", () => {
         });
       }
 
+      if (/\/branches\/[^/]+$/.test(url)) {
+        return new Response(JSON.stringify({
+          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
+        }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+
       return new Response(JSON.stringify({
         check_runs: [
           {
@@ -2095,7 +2218,7 @@ describe("release gate", () => {
           GITHUB_TOKEN: "ghs_test",
           GITHUB_REPOSITORY: "acme/siteflow"
         },
-        commitSha: "abc123def456",
+        commitSha: "abc123def456abc123def456abc123def456abcd",
         promotion: true,
         runner: cleanRunner,
         fetch
@@ -2187,6 +2310,15 @@ describe("release gate", () => {
         });
       }
 
+      if (/\/branches\/[^/]+$/.test(url)) {
+        return new Response(JSON.stringify({
+          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
+        }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+
       return new Response(JSON.stringify({
         check_runs: [
           {
@@ -2210,7 +2342,7 @@ describe("release gate", () => {
           GITHUB_TOKEN: "ghs_test",
           GITHUB_REPOSITORY: "acme/siteflow"
         },
-        commitSha: "abc123def456",
+        commitSha: "abc123def456abc123def456abc123def456abcd",
         promotion: true,
         runner: cleanRunner,
         fetch
@@ -2258,6 +2390,15 @@ describe("release gate", () => {
         });
       }
 
+      if (/\/branches\/[^/]+$/.test(url)) {
+        return new Response(JSON.stringify({
+          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
+        }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+
       return new Response(JSON.stringify({
         check_runs: [
           {
@@ -2288,7 +2429,7 @@ describe("release gate", () => {
           GITHUB_TOKEN: "ghs_test",
           GITHUB_REPOSITORY: "acme/siteflow"
         },
-        commitSha: "abc123def456",
+        commitSha: "abc123def456abc123def456abc123def456abcd",
         promotion: true,
         runner: cleanRunner,
         fetch
@@ -2352,6 +2493,15 @@ describe("release gate", () => {
         });
       }
 
+      if (/\/branches\/[^/]+$/.test(url)) {
+        return new Response(JSON.stringify({
+          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
+        }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+
       return new Response(JSON.stringify({
         check_runs: [
           {
@@ -2379,7 +2529,7 @@ describe("release gate", () => {
           GITHUB_TOKEN: "ghs_test",
           GITHUB_REPOSITORY: "acme/siteflow"
         },
-        commitSha: "abc123def456",
+        commitSha: "abc123def456abc123def456abc123def456abcd",
         promotion: true,
         runner: cleanRunner,
         fetch
@@ -2444,6 +2594,15 @@ describe("release gate", () => {
         });
       }
 
+      if (/\/branches\/[^/]+$/.test(url)) {
+        return new Response(JSON.stringify({
+          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
+        }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+
       return new Response(JSON.stringify({
         check_runs: [
           {
@@ -2467,7 +2626,7 @@ describe("release gate", () => {
           GITHUB_TOKEN: "ghs_test",
           GITHUB_REPOSITORY: "acme/siteflow"
         },
-        commitSha: "abc123def456",
+        commitSha: "abc123def456abc123def456abc123def456abcd",
         promotion: true,
         runner: cleanRunner,
         fetch
@@ -2528,6 +2687,15 @@ describe("release gate", () => {
         });
       }
 
+      if (/\/branches\/[^/]+$/.test(url)) {
+        return new Response(JSON.stringify({
+          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
+        }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+
       return new Response(JSON.stringify({
         check_runs: [
           {
@@ -2556,7 +2724,7 @@ describe("release gate", () => {
           GITHUB_TOKEN: "ghs_test",
           GITHUB_REPOSITORY: "acme/siteflow"
         },
-        commitSha: "abc123def456",
+        commitSha: "abc123def456abc123def456abc123def456abcd",
         promotion: true,
         runner: cleanRunner,
         fetch

@@ -79,6 +79,7 @@ const defaultMaxEvidenceAgeHours = 168;
 const expectedSchemaVersion = "siteflow.releaseEvidence.v1";
 const expectedBundleName = "siteflow-release-evidence-bundle";
 const sha256DigestPattern = /^sha256:[a-f0-9]{64}$/i;
+const sha256HexPattern = /^[a-f0-9]{64}$/i;
 const requiredPostgresRehearsalScopes = [
   "migration_advisory_lock",
   "migration_checksum_drift",
@@ -888,6 +889,50 @@ function artifactManifestCandidates(artifact: Record<string, unknown> | undefine
   ].filter((candidate): candidate is Record<string, unknown> => Boolean(candidate));
 }
 
+function releaseArtifactPathSafe(value: unknown) {
+  const raw = stringValue(value);
+
+  if (!raw || raw.includes("\\") || raw.startsWith("/") || /^[a-z]:/i.test(raw)) {
+    return false;
+  }
+
+  const segments = raw.split("/");
+
+  return segments.every((segment) => segment && segment !== "." && segment !== "..");
+}
+
+function releaseArtifactManifestEntriesPassed(
+  artifacts: unknown,
+  selectedEvidence: Record<string, unknown> | undefined
+) {
+  if (!Array.isArray(artifacts) || artifacts.length === 0) {
+    return false;
+  }
+
+  let totalBytes = 0;
+
+  for (const artifact of artifacts) {
+    if (!isObject(artifact) || !releaseArtifactPathSafe(artifact.path)) {
+      return false;
+    }
+
+    const sizeBytes = artifact.sizeBytes;
+
+    if (!Number.isSafeInteger(sizeBytes) || typeof sizeBytes !== "number" || sizeBytes <= 0) {
+      return false;
+    }
+
+    if (!sha256HexPattern.test(stringValue(artifact.sha256) ?? "")) {
+      return false;
+    }
+
+    totalBytes += sizeBytes;
+  }
+
+  return Number(selectedEvidence?.fileCount) === artifacts.length &&
+    Number(selectedEvidence?.totalBytes) === totalBytes;
+}
+
 function bundleTargetEnvironment(root: Record<string, unknown> | undefined) {
   return stringValue(root?.targetEnvironment) ??
     stringValue(nestedValue(root, ["release", "targetEnvironment"])) ??
@@ -1224,6 +1269,7 @@ export function evaluateReleaseEvidenceBundle(
   const requiredStatusCheck = stringValue(promotion?.requiredStatusCheck);
   const releaseRequiredStatusCheck = stringValue(releaseMetadata(root)?.requiredStatusCheck) ?? requiredStatusCheck;
   const protectedChecks = nestedValue(promotion, ["branchProtection", "requiredStatusChecks"]);
+  const protectedBranchCommit = nestedObject(promotion, "protectedBranchCommit");
   const runtimeEnv = nestedObject(promotion, "runtimeEnv");
   const commitCheckRun = nestedObject(nestedObject(promotion, "commitStatus"), "checkRun");
   const dockerBuildRequired = runtimeEnv?.buildRunner === "docker";
@@ -1233,6 +1279,7 @@ export function evaluateReleaseEvidenceBundle(
   const postgresCompletedAt = timestampValue(postgres?.completedAt);
   const postgresTargetDatabase = nestedObject(postgres, "targetDatabase");
   const artifactCheckedAt = timestampValue(artifact?.checkedAt);
+  const artifactSelectedEvidence = nestedObject(artifact, "selectedEvidence");
   const artifactManifestArtifacts = nestedValue(artifact, ["manifest", "artifacts"]);
   const releaseImageCheckedAt = timestampValue(releaseImage?.checkedAt);
   const targetRuntimeCheckedAt = timestampValue(targetRuntime?.checkedAt);
@@ -1325,6 +1372,15 @@ export function evaluateReleaseEvidenceBundle(
     "branch_protection",
     statusValue(nestedValue(promotion, ["branchProtection", "status"])) === "pass",
     "GitHub branch protection evidence must pass."
+  );
+  addCheck(
+    checks,
+    "protected_branch_commit",
+    statusValue(protectedBranchCommit?.status) === "pass" &&
+      stringValue(protectedBranchCommit?.commitRef) === releaseCommitRef &&
+      stringValue(protectedBranchCommit?.branchHeadSha) === releaseCommitRef &&
+      (!releaseBranchValue(root) || stringValue(protectedBranchCommit?.branch) === releaseBranchValue(root)),
+    "GitHub protected branch head evidence must pass and match the exact release commit."
   );
   addCheck(
     checks,
@@ -1653,12 +1709,11 @@ export function evaluateReleaseEvidenceBundle(
     "artifact_manifest",
     Boolean(
       artifact?.manifest &&
-        nestedValue(artifact, ["manifest", "schemaVersion"]) === "siteflow.releaseArtifactManifest.v1" &&
+      nestedValue(artifact, ["manifest", "schemaVersion"]) === "siteflow.releaseArtifactManifest.v1" &&
         nestedValue(artifact, ["manifest", "name"]) === "siteflow-release-artifact-manifest" &&
-        Array.isArray(artifactManifestArtifacts) &&
-        Number(nestedValue(artifact, ["selectedEvidence", "fileCount"])) === artifactManifestArtifacts.length
+        releaseArtifactManifestEntriesPassed(artifactManifestArtifacts, artifactSelectedEvidence)
     ),
-    "Release artifact evidence must include a SHA-256 manifest whose file count matches selected evidence."
+    "Release artifact evidence must include a safe SHA-256 manifest whose file count and total bytes match selected evidence."
   );
   addCheck(
     checks,

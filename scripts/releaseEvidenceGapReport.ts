@@ -138,6 +138,7 @@ interface FinalReleaseEvidenceCheckContext {
 
 const defaultMaxEvidenceAgeHours = 168;
 const sha256DigestPattern = /^sha256:[a-f0-9]{64}$/i;
+const sha256HexPattern = /^[a-f0-9]{64}$/i;
 const inputFileFlags = new Set([
   "--env-file",
   "--backup-verify",
@@ -600,6 +601,50 @@ function artifactManifestCandidates(evidence: Record<string, unknown>) {
   ].filter((candidate): candidate is Record<string, unknown> => Boolean(candidate));
 }
 
+function releaseArtifactPathSafe(value: unknown) {
+  const raw = stringValue(value);
+
+  if (!raw || raw.includes("\\") || raw.startsWith("/") || /^[a-z]:/i.test(raw)) {
+    return false;
+  }
+
+  const segments = raw.split("/");
+
+  return segments.every((segment) => segment && segment !== "." && segment !== "..");
+}
+
+function releaseArtifactManifestEntriesPassed(
+  artifacts: unknown,
+  selectedEvidence: Record<string, unknown> | undefined
+) {
+  if (!Array.isArray(artifacts) || artifacts.length === 0) {
+    return false;
+  }
+
+  let totalBytes = 0;
+
+  for (const artifact of artifacts) {
+    if (!isObject(artifact) || !releaseArtifactPathSafe(artifact.path)) {
+      return false;
+    }
+
+    const sizeBytes = artifact.sizeBytes;
+
+    if (!Number.isSafeInteger(sizeBytes) || typeof sizeBytes !== "number" || sizeBytes <= 0) {
+      return false;
+    }
+
+    if (!sha256HexPattern.test(stringValue(artifact.sha256) ?? "")) {
+      return false;
+    }
+
+    totalBytes += sizeBytes;
+  }
+
+  return Number(selectedEvidence?.fileCount) === artifacts.length &&
+    Number(selectedEvidence?.totalBytes) === totalBytes;
+}
+
 function manifestDeclaresIsolatedFunctionRuntime(manifest: Record<string, unknown>) {
   const functionEntries = objectValues(manifest.functions);
 
@@ -793,9 +838,8 @@ function releaseArtifactEvidenceFailedChecks(evidence: Record<string, unknown>, 
       "release_artifact_manifest",
       nestedValue(evidence, ["manifest", "schemaVersion"]) === "siteflow.releaseArtifactManifest.v1" &&
         nestedValue(evidence, ["manifest", "name"]) === "siteflow-release-artifact-manifest" &&
-        Array.isArray(manifestArtifacts) &&
-        Number(nestedValue(selectedEvidence, ["fileCount"])) === manifestArtifacts.length,
-      "Release artifact evidence must include a SHA-256 manifest whose file count matches selected evidence."
+        releaseArtifactManifestEntriesPassed(manifestArtifacts, selectedEvidence),
+      "Release artifact evidence must include a safe SHA-256 manifest whose file count and total bytes match selected evidence."
     ),
     ...failedCheck(
       "release_artifact_function_runtime_isolation",
@@ -1422,9 +1466,19 @@ function dockerBuildFailedChecks(evidence: Record<string, unknown>) {
 }
 
 function releaseGateFailedChecks(evidence: Record<string, unknown>) {
-  const runtimeEnv = nestedObject(nestedObject(evidence, "promotionEvidence"), "runtimeEnv");
+  const promotion = nestedObject(evidence, "promotionEvidence");
+  const runtimeEnv = nestedObject(promotion, "runtimeEnv");
+  const protectedBranchCommit = nestedObject(promotion, "protectedBranchCommit");
+  const releaseCommit = stringValue(promotion?.commitRef);
 
   return [
+    ...failedCheck(
+      "release_gate_protected_branch_commit",
+      statusValue(protectedBranchCommit?.status) === "pass" &&
+        stringValue(protectedBranchCommit?.commitRef) === releaseCommit &&
+        stringValue(protectedBranchCommit?.branchHeadSha) === releaseCommit,
+      "Release gate evidence must prove the release commit is the current protected branch head."
+    ),
     ...failedCheck(
       "release_gate_browser_token_fallback",
       statusValue(runtimeEnv?.browserTokenFallbackStatus) === "pass" &&

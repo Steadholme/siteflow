@@ -122,6 +122,13 @@ function releaseGateEvidence() {
         requiredStatusCheck,
         requiredStatusChecks: [requiredStatusCheck]
       },
+      protectedBranchCommit: {
+        status: "pass",
+        repository,
+        branch,
+        commitRef,
+        branchHeadSha: commitRef
+      },
       commitStatus: {
         status: "pass",
         repository,

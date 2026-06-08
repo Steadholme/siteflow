@@ -8,6 +8,8 @@ import {
 const now = () => new Date("2026-06-08T12:00:00.000Z");
 const checkedAt = "2026-06-08T11:45:00.000Z";
 const digest = `sha256:${"a".repeat(64)}`;
+const releaseImage = `ghcr.io/siteflow/siteflow@${digest}`;
+const postgresImage = `postgres@sha256:${"b".repeat(64)}`;
 
 function passedSection(extra: Record<string, unknown> = {}) {
   return {
@@ -36,6 +38,20 @@ function passedEvidence(overrides: Record<string, unknown> = {}) {
       services: ["postgres", "api", "worker"],
       secrets: ["siteflow_app_secret", "siteflow_api_token", "siteflow_metrics_token", "siteflow_postgres_password"],
       healthchecks: ["postgres", "api"],
+      images: {
+        postgres: postgresImage,
+        api: releaseImage,
+        worker: releaseImage
+      },
+      imagePolicy: {
+        postgresDigestPinned: true,
+        apiDigestPinned: true,
+        workerDigestPinned: true,
+        noBuildFallback: true
+      },
+      buildServices: [],
+      buildFallbacks: [],
+      noBuildFallback: true,
       configSha256: "b".repeat(64),
       sanitized: true,
       rawConfigArchived: false
@@ -192,6 +208,23 @@ describe("releaseTargetRuntimeEvidenceCheck", () => {
         (evidence.composeConfig as Record<string, unknown>).sanitized = false;
       },
       expectedCheck: "compose_config_sanitized"
+    },
+    {
+      label: "mutable compose image",
+      mutate: (evidence: Record<string, unknown>) => {
+        ((evidence.composeConfig as Record<string, unknown>).images as Record<string, unknown>).api = "ghcr.io/siteflow/siteflow:latest";
+      },
+      expectedCheck: "compose_config_images"
+    },
+    {
+      label: "compose build fallback",
+      mutate: (evidence: Record<string, unknown>) => {
+        const composeConfig = evidence.composeConfig as Record<string, unknown>;
+
+        composeConfig.noBuildFallback = false;
+        composeConfig.buildServices = ["api"];
+      },
+      expectedCheck: "compose_config_no_build_fallback"
     },
     {
       label: "failed public readiness",

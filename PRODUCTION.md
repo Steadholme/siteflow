@@ -30,14 +30,16 @@ npm run release:source:check
 npm run release:commit:plan -- --fail-on-blocked --json
 npm test -- --run
 npm run build
-npm run release:artifacts:check
+npm run release:artifacts:check -- --commit-ref <full-sha> --repo <owner/repo> --branch main --target-environment ci --json
 npm run test:e2e
 npm run siteflow -- release-gate --allow-dirty --allow-manual-branch-protection
 ```
 
 This is a local/static gate only. `--allow-manual-branch-protection` and dirty
 worktree allowances are acceptable for no-secret sanity checks, not for
-production promotion.
+production promotion. The local artifact check above proves source artifacts;
+production artifact evidence still must attach a release-bound deployment detail
+or sanitized deployment artifact manifest through the release preflight flow.
 
 For promotion, the gate must run against the target release identity and real
 runtime configuration:
