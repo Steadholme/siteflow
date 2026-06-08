@@ -97,11 +97,15 @@ export const requiredTargetRuntimeEvidenceCheckNames = [
   "compose_config_sanitized",
   "compose_config_images",
   "compose_config_no_build_fallback",
+  "compose_config_observation",
   "startup_present",
   "startup_status",
+  "startup_observation",
   "service_health_present",
   "service_health_status",
   "service_health_services",
+  "service_health_observation",
+  "service_health_worker",
   "readiness_present",
   "readiness_status",
   "readiness_loopback",
@@ -109,8 +113,10 @@ export const requiredTargetRuntimeEvidenceCheckNames = [
   "image_binding_present",
   "image_binding_status",
   "image_binding_digests",
+  "image_binding_observation",
   "restart_smoke_present",
   "restart_smoke_status",
+  "restart_smoke_worker_health",
   "log_sanity_present",
   "log_sanity_status",
   "negative_evidence",
@@ -443,13 +449,17 @@ export function evaluateReleaseTargetRuntimeEvidence(
   addCheck(checks, "compose_config_sanitized", composeConfig?.sanitized === true && composeConfig?.rawConfigArchived === false && sha256HexPattern.test(stringValue(composeConfig?.configSha256) ?? ""), "Compose config evidence must be sanitized and include only a SHA-256 config hash, not raw config.");
   addCheck(checks, "compose_config_images", composeImagesDigestPinned(composeConfig), "Compose config evidence must prove postgres, API, and worker services use digest-pinned images.");
   addCheck(checks, "compose_config_no_build_fallback", composeNoBuildFallback(composeConfig), "Compose config evidence must prove the target Compose config has no build services or build fallback.");
+  addCheck(checks, "compose_config_observation", Boolean(stringValue(composeConfig?.command) && stringValue(composeConfig?.source) && stringValue(composeConfig?.composeProject)), "Compose config evidence must include the redacted command, observation source, and compose project used on the target host.");
 
   addCheck(checks, "startup_present", Boolean(startup), "Target runtime evidence must include startup evidence.");
   addCheck(checks, "startup_status", sectionPassed(startup, now, maxAgeHours) && (startup?.systemdActive === true || startup?.composeUpExitCode === 0), "Startup evidence must show systemd active or docker compose up succeeded.");
+  addCheck(checks, "startup_observation", Boolean(stringValue(startup?.command)), "Startup evidence must include the redacted command used to start or restart the target service.");
 
   addCheck(checks, "service_health_present", Boolean(serviceHealth), "Target runtime evidence must include service health evidence.");
   addCheck(checks, "service_health_status", sectionPassed(serviceHealth, now, maxAgeHours) && serviceHealth?.restartLoopDetected === false, "Service health evidence must pass without restart loop detection.");
   addCheck(checks, "service_health_services", serviceHealth?.postgresHealthy === true && serviceHealth?.apiHealthy === true && serviceHealth?.workerRunning === true, "Service health evidence must show Postgres healthy, API healthy, and worker running.");
+  addCheck(checks, "service_health_observation", Boolean(stringValue(serviceHealth?.command) && stringValue(serviceHealth?.composeProject)), "Service health evidence must include the redacted command and compose project used to observe running containers.");
+  addCheck(checks, "service_health_worker", serviceHealth?.workerHealthy === true && serviceHealth?.workerQueueProbePassed === true && serviceHealth?.workerHeartbeatFresh === true, "Service health evidence must prove the worker is healthy, can probe the queue, and has a fresh heartbeat.");
 
   addCheck(checks, "readiness_present", Boolean(readiness), "Target runtime evidence must include readiness evidence.");
   addCheck(checks, "readiness_status", sectionPassed(readiness, now, maxAgeHours), "Readiness evidence must have passing status and fresh timestamp.");
@@ -459,9 +469,11 @@ export function evaluateReleaseTargetRuntimeEvidence(
   addCheck(checks, "image_binding_present", Boolean(imageBinding), "Target runtime evidence must include running image binding evidence.");
   addCheck(checks, "image_binding_status", sectionPassed(imageBinding, now, maxAgeHours) && imageBinding?.apiMatchesReleaseImage === true && imageBinding?.workerMatchesReleaseImage === true, "Image binding evidence must show API and worker run the release image digest.");
   addCheck(checks, "image_binding_digests", sha256DigestPattern.test(stringValue(imageBinding?.expectedDigest) ?? "") && imageBinding?.apiImageDigest === imageBinding?.expectedDigest && imageBinding?.workerImageDigest === imageBinding?.expectedDigest, "Image binding evidence must include matching sha256 digests for expected, API, and worker images.");
+  addCheck(checks, "image_binding_observation", Boolean(stringValue(imageBinding?.command) && stringValue(imageBinding?.apiContainerId) && stringValue(imageBinding?.workerContainerId) && stringValue(imageBinding?.apiImageId) && stringValue(imageBinding?.workerImageId)), "Image binding evidence must include the redacted inspection command plus API and worker container and image identifiers.");
 
   addCheck(checks, "restart_smoke_present", Boolean(restartSmoke), "Target runtime evidence must include restart smoke evidence.");
   addCheck(checks, "restart_smoke_status", sectionPassed(restartSmoke, now, maxAgeHours) && restartSmoke?.restarted === true && restartSmoke?.serviceHealthAfterRestart === true && restartSmoke?.readinessAfterRestart === true, "Restart smoke evidence must pass service health and readiness after restart.");
+  addCheck(checks, "restart_smoke_worker_health", restartSmoke?.workerHealthAfterRestart === true, "Restart smoke evidence must prove worker health after restart.");
 
   addCheck(checks, "log_sanity_present", Boolean(logSanity), "Target runtime evidence must include startup log sanity evidence.");
   addCheck(checks, "log_sanity_status", sectionPassed(logSanity, now, maxAgeHours) && logSanity?.fatalErrors === 0 && logSanity?.workerPreflightFailures === 0 && logSanity?.secretLeakFindings === 0 && logSanity?.rawLogsArchived === false, "Log sanity evidence must show no fatal startup errors, worker preflight failures, secret leaks, or raw log archival.");

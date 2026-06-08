@@ -35,6 +35,9 @@ function passedEvidence(overrides: Record<string, unknown> = {}) {
       branch: "main"
     },
     composeConfig: passedSection({
+      command: "docker compose --env-file /etc/siteflow/target.env -f docker-compose.production.yml config",
+      source: "target_host_docker_compose_config",
+      composeProject: "siteflow-prod",
       services: ["postgres", "api", "worker"],
       secrets: ["siteflow_app_secret", "siteflow_api_token", "siteflow_metrics_token", "siteflow_postgres_password"],
       healthchecks: ["postgres", "api"],
@@ -62,9 +65,14 @@ function passedEvidence(overrides: Record<string, unknown> = {}) {
       systemdEnabled: true
     }),
     serviceHealth: passedSection({
+      command: "docker compose --env-file /etc/siteflow/target.env -f docker-compose.production.yml ps --format json",
+      composeProject: "siteflow-prod",
       postgresHealthy: true,
       apiHealthy: true,
       workerRunning: true,
+      workerHealthy: true,
+      workerQueueProbePassed: true,
+      workerHeartbeatFresh: true,
       restartLoopDetected: false,
       services: ["postgres", "api", "worker"]
     }),
@@ -75,15 +83,21 @@ function passedEvidence(overrides: Record<string, unknown> = {}) {
       publicBodyStatus: "ok"
     }),
     imageBinding: passedSection({
+      command: "docker compose --env-file /etc/siteflow/target.env -f docker-compose.production.yml ps --format json && docker image inspect ghcr.io/siteflow/siteflow",
       expectedDigest: digest,
       apiImageDigest: digest,
       workerImageDigest: digest,
+      apiContainerId: "siteflow-api-1",
+      workerContainerId: "siteflow-worker-1",
+      apiImageId: `sha256:${"c".repeat(64)}`,
+      workerImageId: `sha256:${"c".repeat(64)}`,
       apiMatchesReleaseImage: true,
       workerMatchesReleaseImage: true
     }),
     restartSmoke: passedSection({
       restarted: true,
       serviceHealthAfterRestart: true,
+      workerHealthAfterRestart: true,
       readinessAfterRestart: true
     }),
     logSanity: passedSection({
@@ -230,6 +244,34 @@ describe("releaseTargetRuntimeEvidenceCheck", () => {
       expectedCheck: "compose_config_no_build_fallback"
     },
     {
+      label: "missing compose observation source",
+      mutate: (evidence: Record<string, unknown>) => {
+        delete (evidence.composeConfig as Record<string, unknown>).source;
+      },
+      expectedCheck: "compose_config_observation"
+    },
+    {
+      label: "missing startup command",
+      mutate: (evidence: Record<string, unknown>) => {
+        delete (evidence.startup as Record<string, unknown>).command;
+      },
+      expectedCheck: "startup_observation"
+    },
+    {
+      label: "missing service health command",
+      mutate: (evidence: Record<string, unknown>) => {
+        delete (evidence.serviceHealth as Record<string, unknown>).command;
+      },
+      expectedCheck: "service_health_observation"
+    },
+    {
+      label: "missing worker health probe",
+      mutate: (evidence: Record<string, unknown>) => {
+        (evidence.serviceHealth as Record<string, unknown>).workerQueueProbePassed = false;
+      },
+      expectedCheck: "service_health_worker"
+    },
+    {
       label: "failed public readiness",
       mutate: (evidence: Record<string, unknown>) => {
         (evidence.readiness as Record<string, unknown>).publicStatusCode = 503;
@@ -244,11 +286,25 @@ describe("releaseTargetRuntimeEvidenceCheck", () => {
       expectedCheck: "image_binding_digests"
     },
     {
+      label: "missing image binding observation",
+      mutate: (evidence: Record<string, unknown>) => {
+        delete (evidence.imageBinding as Record<string, unknown>).apiContainerId;
+      },
+      expectedCheck: "image_binding_observation"
+    },
+    {
       label: "restart smoke failure",
       mutate: (evidence: Record<string, unknown>) => {
         (evidence.restartSmoke as Record<string, unknown>).readinessAfterRestart = false;
       },
       expectedCheck: "restart_smoke_status"
+    },
+    {
+      label: "missing worker health after restart",
+      mutate: (evidence: Record<string, unknown>) => {
+        (evidence.restartSmoke as Record<string, unknown>).workerHealthAfterRestart = false;
+      },
+      expectedCheck: "restart_smoke_worker_health"
     },
     {
       label: "log sanity failure",

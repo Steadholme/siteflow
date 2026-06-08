@@ -48,6 +48,27 @@ describe("releaseTargetRuntimeEvidenceTemplate", () => {
       operatorName: "Platform Operator",
       ticketId: "CHG-123"
     });
+    expect(template.composeConfig).toMatchObject({
+      command: "docker compose --env-file <target.env> -f docker-compose.production.yml config",
+      source: "target_host_docker_compose_config",
+      composeProject: null
+    });
+    expect(template.serviceHealth).toMatchObject({
+      command: "docker compose --env-file <target.env> -f docker-compose.production.yml ps --format json",
+      workerHealthy: null,
+      workerQueueProbePassed: null,
+      workerHeartbeatFresh: null
+    });
+    expect(template.imageBinding).toMatchObject({
+      command: expect.stringContaining("docker image inspect"),
+      apiContainerId: null,
+      workerContainerId: null,
+      apiImageId: null,
+      workerImageId: null
+    });
+    expect(template.restartSmoke).toMatchObject({
+      workerHealthAfterRestart: null
+    });
   });
 
   it("writes the template to the requested output file", async () => {

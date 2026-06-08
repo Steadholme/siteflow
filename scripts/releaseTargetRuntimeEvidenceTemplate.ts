@@ -126,6 +126,8 @@ export function createReleaseTargetRuntimeEvidenceTemplate(options: ReleaseTarge
     ],
     composeConfig: todoSection(checkedAt, "Run docker compose --env-file <target.env> -f docker-compose.production.yml config on the target host and record only sanitized summaries.", {
       command: "docker compose --env-file <target.env> -f docker-compose.production.yml config",
+      source: "target_host_docker_compose_config",
+      composeProject: null,
       services: [],
       secrets: [],
       healthchecks: [],
@@ -154,9 +156,14 @@ export function createReleaseTargetRuntimeEvidenceTemplate(options: ReleaseTarge
       composeUpExitCode: null
     }),
     serviceHealth: todoSection(checkedAt, "Record docker compose ps/health summaries after startup.", {
+      command: "docker compose --env-file <target.env> -f docker-compose.production.yml ps --format json",
+      composeProject: null,
       postgresHealthy: null,
       apiHealthy: null,
       workerRunning: null,
+      workerHealthy: null,
+      workerQueueProbePassed: null,
+      workerHeartbeatFresh: null,
       restartLoopDetected: null,
       services: []
     }),
@@ -167,9 +174,14 @@ export function createReleaseTargetRuntimeEvidenceTemplate(options: ReleaseTarge
       publicBodyStatus: null
     }),
     imageBinding: todoSection(checkedAt, "Bind running API and worker containers to the published release image digest.", {
+      command: "docker compose --env-file <target.env> -f docker-compose.production.yml ps --format json && docker image inspect <api-image> <worker-image>",
       expectedDigest: null,
       apiImageDigest: null,
       workerImageDigest: null,
+      apiContainerId: null,
+      workerContainerId: null,
+      apiImageId: null,
+      workerImageId: null,
       apiMatchesReleaseImage: null,
       workerMatchesReleaseImage: null
     }),
@@ -177,6 +189,7 @@ export function createReleaseTargetRuntimeEvidenceTemplate(options: ReleaseTarge
       restartCommand: null,
       restarted: null,
       serviceHealthAfterRestart: null,
+      workerHealthAfterRestart: null,
       readinessAfterRestart: null
     }),
     logSanity: todoSection(checkedAt, "Record redacted startup-window log summary for API, worker, and Postgres.", {
