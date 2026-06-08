@@ -1058,6 +1058,9 @@ describe("releaseEvidenceBundleCompose", () => {
   });
 
   it.each([
+    ["release gate", "releaseGate", { ...releaseGateEvidence(), status: "manual_required" }, /release-gate evidence must have status pass/],
+    ["docker build", "dockerBuild", { ...dockerBuildEvidence(), dryRun: true }, /docker build rehearsal evidence is dry-run output/],
+    ["postgres rehearsal", "postgres", { ...postgresEvidence(), status: "planned" }, /postgres rehearsal evidence must have status passed/],
     ["source provider", "sourceProvider", { ...sourceProviderEvidence(), template: true }, /source provider evidence is a template/],
     ["target runtime", "targetRuntime", { ...targetRuntimeEvidence(), template: true }, /target runtime evidence is a template/],
     ["operator access", "operatorAccess", { ...operatorAccessEvidence(), dryRun: true }, /operator access evidence is dry-run output/],
@@ -1142,6 +1145,26 @@ describe("releaseEvidenceBundleCompose", () => {
         checkedAt: "June 7, 2026 11:30 UTC"
       }),
       /ingress evidence must include a checkedAt timestamp/
+    ],
+    [
+      "release image missing checkedAt",
+      "releaseImage",
+      () => {
+        const evidence = releaseImageEvidence() as Record<string, unknown>;
+        delete evidence.checkedAt;
+        return evidence;
+      },
+      /release image evidence must include a checkedAt timestamp/
+    ],
+    [
+      "release image non-ISO attestation inspection",
+      "releaseImage",
+      () => {
+        const evidence = releaseImageEvidence() as Record<string, unknown>;
+        ((evidence.attestations as Record<string, unknown>).inspectedAt) = "June 7, 2026 10:19 UTC";
+        return evidence;
+      },
+      /release image evidence attestations must include registry inspection metadata/
     ],
     [
       "source provider target environment mismatch",

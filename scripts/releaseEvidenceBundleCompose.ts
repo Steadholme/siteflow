@@ -327,6 +327,48 @@ function assertCheckerOutputFinal(
   }
 }
 
+function assertReleaseGateEvidenceFinal(releaseGate: Record<string, unknown>) {
+  assertComposedEvidenceIsFinal("release-gate", releaseGate);
+
+  const promotion = promotionEvidence(releaseGate);
+
+  if (stringValue(releaseGate.status)?.toLowerCase() !== "pass" || stringValue(promotion?.gateStatus)?.toLowerCase() !== "pass") {
+    throw new Error("release-gate evidence must have status pass before compose.");
+  }
+
+  if (!timestampValue(releaseGate.checkedAt) && !timestampValue(promotion?.checkedAt)) {
+    throw new Error("release-gate evidence must include a checkedAt timestamp before compose.");
+  }
+}
+
+function assertRehearsalEvidenceFinal(label: string, evidence: Record<string, unknown>) {
+  assertComposedEvidenceIsFinal(label, evidence);
+
+  if (stringValue(evidence.status)?.toLowerCase() !== "passed") {
+    throw new Error(`${label} evidence must have status passed before compose.`);
+  }
+
+  if (evidence.dryRun !== false) {
+    throw new Error(`${label} evidence must be non-dry-run output before compose.`);
+  }
+
+  if (evidence.exitCode !== 0) {
+    throw new Error(`${label} evidence must have exitCode 0 before compose.`);
+  }
+
+  if (!timestampValue(evidence.completedAt)) {
+    throw new Error(`${label} evidence must include a completedAt timestamp before compose.`);
+  }
+}
+
+function assertReleaseImageEvidenceFinal(evidence: Record<string, unknown>) {
+  assertComposedEvidenceIsFinal("release image", evidence);
+
+  if (!timestampValue(evidence.checkedAt)) {
+    throw new Error("release image evidence must include a checkedAt timestamp before compose.");
+  }
+}
+
 function optionalEvidenceCommit(evidence: Record<string, unknown>) {
   return stringValue(evidence.releaseCommit) ??
     stringValue(evidence.commitRef) ??
@@ -438,7 +480,7 @@ function assertReleaseImageEvidenceAttestations(evidence: Record<string, unknown
     throw new Error("release image evidence attestations must be inspected from the registry and bound to the image digest.");
   }
 
-  if (stringValue(attestations.mode) !== "registry" || !stringValue(attestations.inspector) || !stringValue(attestations.inspectedAt)) {
+  if (stringValue(attestations.mode) !== "registry" || !stringValue(attestations.inspector) || !timestampValue(attestations.inspectedAt)) {
     throw new Error("release image evidence attestations must include registry inspection metadata.");
   }
 
@@ -505,6 +547,13 @@ export async function composeReleaseEvidenceBundle(
   const nonSessionCredential = await readEvidenceJson(options.nonSessionCredentialEvidencePath);
   const ingress = await readEvidenceJson(options.ingressEvidencePath);
   const upgradeRollback = await readEvidenceJson(options.upgradeRollbackEvidencePath);
+
+  assertReleaseGateEvidenceFinal(releaseGate);
+  if (dockerBuild) {
+    assertRehearsalEvidenceFinal("docker build rehearsal", dockerBuild);
+  }
+  assertRehearsalEvidenceFinal("postgres rehearsal", postgres);
+  assertReleaseImageEvidenceFinal(releaseImage);
 
   assertCheckerOutputFinal("release artifact", artifact, "siteflow-release-artifact-check", {
     requiredChecks: requiredReleaseArtifactCheckNames,
