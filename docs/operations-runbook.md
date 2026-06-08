@@ -1505,6 +1505,15 @@ Postgres, backup, observability, ingress, credential, or rollback commands.
 Treat it as command-contract and prerequisite rehearsal only; it is not target
 evidence and cannot satisfy the final promotion gate.
 
+Target runtime raw evidence must be completed from the actual target host before
+`release:target-runtime:evidence` can pass. At minimum, record the redacted
+Compose config command, observation source, compose project, no-build-fallback
+state, and API/worker image references pinned to the release digest; the startup
+command; service-health command and compose project; worker health, queue probe,
+and fresh heartbeat; API/worker container IDs and image IDs; restart smoke with
+worker health after restart; readiness; log sanity; and negative evidence that
+raw config, env, secrets, and unredacted logs were not archived.
+
 Do not copy bare angle-bracket placeholders into PowerShell commands. Replace placeholder values first, and prefer `--set-env KEY=ENV_NAME` for target topology values so run scripts show stable environment variable names rather than the values themselves. If you use `--set`, quote values that contain `=`, `:`, `/`, spaces, or shell-sensitive characters.
 
 The runner refuses to start when the pack is incomplete, when a pack command no longer matches the generated command semantics, or when `--confirm-target-environment` does not match the pack. It also blocks commands that still contain unresolved placeholders, missing required environment variable names, missing `npm` / `gh` executables on `PATH`, command output that matches secret patterns before writing captured stdout to an evidence file, or gap report snapshots that would archive sensitive diagnostic text. The run record stores command display strings, env requirement names, executable requirement status, replacement key names, `--set-env` key/env-name pairs, output paths, exit codes, byte counts, and gap snapshot paths; it does not store environment variable values, replacement values, raw stdout, or raw stderr.

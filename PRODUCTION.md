@@ -69,7 +69,7 @@ SITEFLOW_API_PROCESS_COUNT=<count> \
 SITEFLOW_INGRESS_COUNT=<count> \
 SITEFLOW_API_RATE_LIMIT_SCOPE=<edge|shared|global|distributed|process_local> \
 SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT=<edge|proxy|load_balancer|gateway|ingress|cdn|api> \
-npm run --silent release:evidence:target-run -- --pack <evidence-dir>/release-evidence-rehearsal-pack.json --confirm-target-environment production --plan-only --set-env direct-api-url=SITEFLOW_DIRECT_API_URL --set-env release-image-run-id=SITEFLOW_RELEASE_IMAGE_RUN_ID --set-env SITEFLOW_TRUST_PROXY=SITEFLOW_TRUST_PROXY --set-env api-instance-count=SITEFLOW_API_INSTANCE_COUNT --set-env api-process-count=SITEFLOW_API_PROCESS_COUNT --set-env ingress-count=SITEFLOW_INGRESS_COUNT --set-env api-rate-limit-scope=SITEFLOW_API_RATE_LIMIT_SCOPE --set-env api-rate-limit-enforcement-point=SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT --json
+npm run --silent release:evidence:target-run -- --pack <evidence-dir>/release-evidence-rehearsal-pack.json --confirm-target-environment production --set-env direct-api-url=SITEFLOW_DIRECT_API_URL --set-env release-image-run-id=SITEFLOW_RELEASE_IMAGE_RUN_ID --set-env SITEFLOW_TRUST_PROXY=SITEFLOW_TRUST_PROXY --set-env api-instance-count=SITEFLOW_API_INSTANCE_COUNT --set-env api-process-count=SITEFLOW_API_PROCESS_COUNT --set-env ingress-count=SITEFLOW_INGRESS_COUNT --set-env api-rate-limit-scope=SITEFLOW_API_RATE_LIMIT_SCOPE --set-env api-rate-limit-enforcement-point=SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT --json
 
 SITEFLOW_RUN_POSTGRES_INTEGRATION=1 TEST_DATABASE_URL=<target-or-disposable-postgres-url> npm run --silent rehearsal:postgres -- --json --commit-ref <sha> --repo <owner/repo> --branch main --target-environment production
 
@@ -98,9 +98,9 @@ npm run --silent release:evidence:compose -- --release-gate <release-gate.json> 
 npm run --silent release:evidence -- --evidence <release-evidence.json> --commit-ref <sha> --repo <owner/repo> --branch main --target-environment production --json
 ```
 
-Use `release:evidence:target-run --plan-only` with the same `--set` or
-`--set-env` replacements expected for the target run before executing target
-commands. A passing plan-only run only proves the generated command contract,
+For preflight only, add `--plan-only` to the same `release:evidence:target-run`
+command with the same `--set` or `--set-env` replacements expected for the
+target run. A passing plan-only run only proves the generated command contract,
 placeholder replacements, and required environment variable names look usable;
 it does not run Docker, Postgres, backup, observability, ingress, credential,
 or rollback commands and does not create production evidence.
@@ -117,6 +117,7 @@ Target evidence must prove at least:
 - Target-profile Docker build rehearsal or explicitly accepted trusted host-build exception.
 - Target-equivalent Postgres migration and queue rehearsal.
 - Source provider exact checkout, signed webhook delivery, safe remote URL, deploy-key and host-key posture, and no raw credential archival.
+- Target runtime evidence from the actual target host: sanitized Compose config with redacted command, observation source, compose project, no build fallback, and API/worker images pinned to the release digest; startup command; service health command and compose project; worker health, queue probe, and fresh heartbeat; API/worker container and image IDs; restart smoke worker health; readiness; and no raw config/env/log archival.
 - Real backup verification, off-host object-storage/provider-backed backup, fetch, restore drill into disposable targets, prune evidence, RPO/RTO policy, scheduler ownership, and alert metadata.
 - Readiness, metrics, alerts, dashboards, log retention, and backup automation evidence from the target observability stack.
 - Operator session, CSRF, token fallback, emergency cutoff, and no-raw-secret evidence.

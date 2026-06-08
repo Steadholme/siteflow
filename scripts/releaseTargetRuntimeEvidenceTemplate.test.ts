@@ -152,4 +152,18 @@ describe("releaseTargetRuntimeEvidenceTemplate", () => {
     expect(stdout).toBe("");
     expect(stderr).toContain(expectedMessage);
   });
+
+  it("describes the required target-host observations in usage output", async () => {
+    const writes: string[] = [];
+
+    const code = runReleaseTargetRuntimeEvidenceTemplateCli(["--help"], {
+      stdout: { write: (chunk: string) => { writes.push(chunk); return true; } },
+      stderr: { write: () => true }
+    });
+
+    await expect(code).resolves.toBe(0);
+    expect(writes.join("")).toContain("redacted Compose command/source/composeProject");
+    expect(writes.join("")).toContain("worker health/queue/heartbeat");
+    expect(writes.join("")).toContain("container/image ids");
+  });
 });

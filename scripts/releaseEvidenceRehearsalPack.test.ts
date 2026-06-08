@@ -194,6 +194,8 @@ describe("releaseEvidenceRehearsalPack", () => {
     expect(targetRuntimeStep.prerequisites.join("\n")).toContain("release:target-runtime:evidence:template");
     expect(targetRuntimeStep.prerequisites.join("\n")).toContain(pack.evidenceFiles.targetRuntimeRaw);
     expect(targetRuntimeStep.notes.join("\n")).toContain("status=blocked, dryRun=true, and template=true");
+    expect(targetRuntimeStep.notes.join("\n")).toContain("worker health/queue/heartbeat");
+    expect(targetRuntimeStep.notes.join("\n")).toContain("Compose API/worker image digests to match the release image digest");
     expect(pack.steps.find((step) => step.id === "non_session_credential_evidence")?.command.args).toEqual(
       expect.arrayContaining([
         "--target-environment",
@@ -273,6 +275,7 @@ describe("releaseEvidenceRehearsalPack", () => {
     expect(pack.blockedProductionClaims.join("\n")).toContain("does not execute GitHub");
     expect(pack.requiredManualInputs.join("\n")).toContain("source-provider:evidence:template");
     expect(pack.requiredManualInputs.join("\n")).toContain("release:target-runtime:evidence:template");
+    expect(pack.requiredManualInputs.join("\n")).toContain("API/worker images pinned to the release digest");
     expect(pack.requiredManualInputs.join("\n")).toContain("operator-access:evidence:template");
     expect(pack.requiredManualInputs.join("\n")).toContain("non-session-credential:evidence:template");
     expect(pack.requiredManualInputs.join("\n")).toContain("ingress:operator-evidence:template");

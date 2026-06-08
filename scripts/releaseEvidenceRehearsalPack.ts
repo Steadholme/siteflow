@@ -491,12 +491,12 @@ function buildSteps(
         "--json"
       ], files.targetRuntime),
       [
-        "Raw target runtime evidence has been collected from the actual target host after docker compose/systemd startup.",
+        "Raw target runtime evidence has been collected from the actual target host after docker compose/systemd startup, with Compose config, image binding, worker health, and restart observations completed.",
         `To start from a non-passing placeholder, run: ${targetRuntimeTemplate.display}`
       ],
       [
-        "The template command writes status=blocked, dryRun=true, and template=true raw evidence; replace every todo/null field with target-host Compose config, startup, service health, readiness, image binding, restart smoke, and log sanity observations before running this checker.",
-        "This checker does not run docker compose by itself; it validates the operator-captured target runtime evidence and blocks raw config/env/log archival."
+        "The template command writes status=blocked, dryRun=true, and template=true raw evidence; replace every todo/null field with target-host redacted Compose command/source/composeProject, startup command, service health command/composeProject, worker health/queue/heartbeat, readiness, API/worker release image digests, container/image ids, restart worker health, and log sanity observations before running this checker.",
+        "This checker does not run docker compose by itself; it validates the operator-captured target runtime evidence, requires Compose API/worker image digests to match the release image digest, and blocks raw config/env/log archival."
       ]
     ),
     step(
@@ -918,7 +918,7 @@ export function createReleaseEvidenceRehearsalPack(
       "target Docker worker profile",
       "release artifact evidence proving clean dist outputs, SHA-256 manifest, attached deployment artifact manifest, no canary/fixture/credential leakage, CLI bin topology, and production dependency audit",
       "release image workflow run id and GitHub artifact download permission for release-image-evidence.json",
-      "target runtime raw evidence prepared from release:target-runtime:evidence:template and completed with real target-host Compose config, startup, health, readiness, image binding, restart smoke, and log sanity observations",
+      "target runtime raw evidence prepared from release:target-runtime:evidence:template and completed with real target-host redacted Compose command/source/composeProject, no-build-fallback state, API/worker images pinned to the release digest, startup command, service health command/composeProject, worker health/queue/heartbeat, readiness, API/worker container and image ids, restart worker health, and log sanity observations",
       ...(dockerSocketProfileAccepted
         ? ["Docker socket trusted single-host profile explicitly accepted for this release pack"]
         : ["Docker socket trusted single-host profile not accepted by this pack; add --docker-socket-profile-accepted only after a release owner records the risk acceptance"]),

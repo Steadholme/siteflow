@@ -272,7 +272,7 @@ export function releaseTargetRuntimeEvidenceTemplateUsage() {
   return [
     "Usage: npm run --silent release:target-runtime:evidence:template -- --commit-ref <sha> --repo <owner/name> --branch <branch> --target-environment <env> --public-base-url <url> --operator-name <name> --release-ticket <id> --output <file> [--json]",
     "",
-    "Writes a blocked target runtime evidence template. Replace todo fields with target-host Compose, startup, health, readiness, image binding, restart, and log evidence before running release:target-runtime:evidence."
+    "Writes a blocked target runtime evidence template. Replace todo fields with target-host redacted Compose command/source/composeProject, API/worker release image digests, worker health/queue/heartbeat, container/image ids, restart worker health, readiness, and log evidence before running release:target-runtime:evidence."
   ].join("\n");
 }
 
