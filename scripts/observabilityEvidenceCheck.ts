@@ -26,6 +26,9 @@ export interface ObservabilityEvidenceSummary {
   status?: string;
   timestamp?: string;
   sourceApplied?: boolean;
+  authenticated?: boolean;
+  privateScrapeException?: boolean;
+  observedStatusCode?: number;
 }
 
 export interface ObservabilityEvidenceCheckResult {
@@ -75,6 +78,78 @@ interface CliIo {
 const defaultMaxAgeHours = 24;
 const defaultRestoreDrillCadenceHours = 168;
 const passStatuses = new Set(["pass", "passed", "ok", "healthy", "scraped", "delivered", "available"]);
+export const requiredObservabilityEvidenceCheckNames = [
+  "release_identity",
+  "target_environment",
+  "readiness_present",
+  "readiness_status",
+  "readiness_age",
+  "readiness_status_codes",
+  "readiness_traffic_removed",
+  "metrics_present",
+  "metrics_status",
+  "metrics_age",
+  "metrics_access_control",
+  "metrics_expected_names",
+  "backup_automation_run_present",
+  "backup_automation_run_identity",
+  "backup_automation_run_status",
+  "backup_automation_run_age",
+  "backup_automation_run_steps",
+  "backup_automation_checker_output",
+  "backup_automation_history_present",
+  "backup_automation_history_identity",
+  "backup_automation_history_latest_run",
+  "backup_automation_history_latest_status",
+  "backup_restore_drill_cadence_count",
+  "backup_restore_drill_cadence_gap",
+  "backup_history_checker_output",
+  "backup_scheduler_ownership_present",
+  "backup_scheduler_ownership_status",
+  "backup_scheduler_ownership_age",
+  "backup_scheduler_ownership_schema",
+  "backup_scheduler_ownership_source",
+  "backup_scheduler_ownership_target_environment",
+  "backup_scheduler_ownership_enabled",
+  "backup_scheduler_ownership_schedule",
+  "backup_scheduler_ownership_command",
+  "backup_scheduler_ownership_run_links",
+  "backup_scheduler_ownership_owner",
+  "observability_apply_proof_present",
+  "observability_apply_proof_status",
+  "observability_apply_proof_age",
+  "observability_apply_proof_schema",
+  "observability_apply_proof_source",
+  "observability_apply_proof_non_dry_run",
+  "observability_apply_proof_plan_schema",
+  "observability_apply_proof_assets",
+  "observability_target_stack_proof_present",
+  "observability_target_stack_proof_status",
+  "observability_target_stack_proof_age",
+  "observability_target_stack_proof_schema",
+  "observability_target_stack_proof_source",
+  "observability_target_stack_proof_non_dry_run",
+  "observability_target_stack_proof_release_identity",
+  "observability_target_stack_proof_target_environment",
+  "observability_target_stack_prometheus_rules",
+  "observability_target_stack_grafana_dashboard",
+  "observability_target_stack_alertmanager_receiver",
+  "alert_present",
+  "alert_status",
+  "alert_age",
+  "alert_delivered",
+  "dashboard_present",
+  "dashboard_status",
+  "dashboard_age",
+  "dashboard_reference",
+  "dashboard_owner",
+  "log_pipeline_present",
+  "log_pipeline_status",
+  "log_pipeline_age",
+  "log_retention",
+  "log_redaction_spot_check",
+  "no_sensitive_evidence_values"
+] as const;
 
 function isEntrypoint() {
   const entryPath = process.argv[1];
@@ -217,6 +292,41 @@ function summarizeEvidence(candidate: Record<string, unknown> | undefined) {
   };
 }
 
+function booleanSummaryValue(candidate: Record<string, unknown>, key: string) {
+  return typeof candidate[key] === "boolean" ? candidate[key] : undefined;
+}
+
+function numberSummaryValue(candidate: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    const value = candidate[key];
+
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+  }
+
+  return undefined;
+}
+
+function summarizeMetricsScrapeEvidence(candidate: Record<string, unknown> | undefined) {
+  const summary = summarizeEvidence(candidate);
+
+  if (!summary || !candidate) {
+    return summary;
+  }
+
+  const authenticated = booleanSummaryValue(candidate, "authenticated");
+  const privateScrapeException = booleanSummaryValue(candidate, "privateScrapeException");
+  const observedStatusCode = numberSummaryValue(candidate, ["observedStatusCode", "statusCode", "httpStatusCode"]);
+
+  return {
+    ...summary,
+    ...(authenticated !== undefined ? { authenticated } : {}),
+    ...(privateScrapeException !== undefined ? { privateScrapeException } : {}),
+    ...(observedStatusCode !== undefined ? { observedStatusCode } : {})
+  };
+}
+
 function addCheck(checks: ObservabilityEvidenceCheck[], name: string, condition: boolean, message: string) {
   checks.push({
     name,
@@ -290,6 +400,18 @@ function renderedAssetContent(rawEvidence: unknown, kind: string) {
   return stringValue(renderedAsset(rawEvidence, kind)?.content);
 }
 
+function renderedPrometheusAlertNames(rawEvidence: unknown) {
+  const content = renderedAssetContent(rawEvidence, "prometheus_rules");
+
+  if (!content) {
+    return [];
+  }
+
+  return [...content.matchAll(/^\s*(?:-\s*)?alert:\s*(?:"([^"]+)"|'([^']+)'|([^\s#]+))/gm)]
+    .map((match) => match[1] ?? match[2] ?? match[3])
+    .filter((value): value is string => Boolean(value));
+}
+
 function renderedTargetValue(rawEvidence: unknown, key: string) {
   const root = isObject(rawEvidence) ? rawEvidence : {};
   const candidates = [
@@ -313,10 +435,24 @@ function alertRuleInRenderedRules(rawEvidence: unknown, ruleName: string) {
   const content = renderedAssetContent(rawEvidence, "prometheus_rules");
 
   if (!content) {
-    return true;
+    return false;
   }
 
   return content.includes(`alert: ${ruleName}`) || content.includes(`alert: ${JSON.stringify(ruleName)}`);
+}
+
+function productionProofNotDryRun(candidate: Record<string, unknown> | undefined) {
+  const mode = statusValue(candidate?.mode) ?? statusValue(candidate?.applyMode) ?? statusValue(candidate?.evidenceMode);
+  const normalizedMode = mode?.replace(/[-\s]+/g, "_");
+
+  return Boolean(
+    candidate &&
+      candidate.dryRun !== true &&
+      candidate.template !== true &&
+      candidate.sourceApplied !== false &&
+      normalizedMode !== "dry_run" &&
+      normalizedMode !== "template"
+  );
 }
 
 function appliedAssetMap(applyProof: Record<string, unknown> | undefined) {
@@ -370,6 +506,7 @@ function targetStackPrometheusRulesPassed(proof: Record<string, unknown> | undef
   const prometheusRules = nestedObject(proof, "prometheusRules");
   const matchedAlertNames = arrayOfStrings(prometheusRules?.matchedAlertNames);
   const missingAlertNames = arrayOfStrings(prometheusRules?.missingAlertNames);
+  const expectedAlertNames = renderedPrometheusAlertNames(rawEvidence);
 
   return Boolean(
     prometheusRules &&
@@ -378,7 +515,8 @@ function targetStackPrometheusRulesPassed(proof: Record<string, unknown> | undef
       prometheusRules.rulesHealth === "ok" &&
       stringValue(prometheusRules.renderedAssetKind) === "prometheus_rules" &&
       sha256Value(prometheusRules.renderedAssetSha256) === renderedAssetSha(rawEvidence, "prometheus_rules") &&
-      matchedAlertNames.length > 0 &&
+      expectedAlertNames.length > 0 &&
+      expectedAlertNames.every((ruleName) => matchedAlertNames.includes(ruleName)) &&
       missingAlertNames.length === 0 &&
       matchedAlertNames.every((ruleName) => alertRuleInRenderedRules(rawEvidence, ruleName))
   );
@@ -771,7 +909,7 @@ export function evaluateObservabilityEvidence(
     checks,
     "metrics_expected_names",
     includesAllStrings(metricsScrape?.metricNames, requiredSiteFlowMetricNames),
-    "Metrics evidence must include the expected SiteFlow HTTP, queue, runtime, and backup metric names."
+    "Metrics evidence must include the expected SiteFlow HTTP, queue, runtime, storage, and backup metric names."
   );
 
   addCheck(checks, "backup_automation_run_present", Boolean(backupAutomationRun), "Backup automation run evidence must be present.");
@@ -966,6 +1104,12 @@ export function evaluateObservabilityEvidence(
   );
   addCheck(
     checks,
+    "observability_apply_proof_non_dry_run",
+    productionProofNotDryRun(observabilityApplyProof),
+    "Observability apply proof must come from a production apply, not a template or dry-run."
+  );
+  addCheck(
+    checks,
     "observability_apply_proof_plan_schema",
     nestedObject(observabilityApplyProof, "provisioningPlan")?.schemaVersion === "siteflow.observabilityProvisioning.v1",
     "Observability apply proof must reference a SiteFlow observability provisioning plan."
@@ -1003,6 +1147,12 @@ export function evaluateObservabilityEvidence(
     observabilityTargetStackProof?.evidenceSource === "target_stack_api" &&
       Boolean(stringValue(observabilityTargetStackProof?.operator) && stringValue(observabilityTargetStackProof?.ticket)),
     "Observability target-stack proof must come from target_stack_api and include operator and ticket."
+  );
+  addCheck(
+    checks,
+    "observability_target_stack_proof_non_dry_run",
+    productionProofNotDryRun(observabilityTargetStackProof),
+    "Observability target-stack proof must come from a real target stack query, not a template or dry-run."
   );
   addCheck(
     checks,
@@ -1128,7 +1278,7 @@ export function evaluateObservabilityEvidence(
       branch: evidenceBranch ?? null,
       targetEnvironment: evidenceTargetEnvironment ?? null,
       readinessProbe: summarizeEvidence(readinessProbe),
-      metricsScrape: summarizeEvidence(metricsScrape),
+      metricsScrape: summarizeMetricsScrapeEvidence(metricsScrape),
       backupAutomationRun: summarizeEvidence(backupAutomationRun),
       backupAutomationRunHistory: summarizeEvidence(backupAutomationRunHistory),
       backupSchedulerOwnership: summarizeEvidence(backupSchedulerOwnership),

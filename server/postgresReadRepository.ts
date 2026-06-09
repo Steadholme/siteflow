@@ -3144,6 +3144,7 @@ function releaseEvidenceMetadataFromArtifactManifest(
   const repository = typeof releaseEvidence?.repository === "string" ? releaseEvidence.repository : undefined;
   const branch = typeof releaseEvidence?.branch === "string" ? releaseEvidence.branch : undefined;
   const targetEnvironment = typeof releaseEvidence?.targetEnvironment === "string" ? releaseEvidence.targetEnvironment : undefined;
+  const payloadDigest = typeof releaseEvidence?.payloadDigest === "string" ? releaseEvidence.payloadDigest : undefined;
 
   if (
     releaseEvidence?.status !== "passed" ||
@@ -3165,6 +3166,7 @@ function releaseEvidenceMetadataFromArtifactManifest(
     repository,
     branch,
     targetEnvironment,
+    ...(payloadDigest ? { payloadDigest } : {}),
     ...(typeof releaseEvidence.releaseTicket === "string" ? { releaseTicket: releaseEvidence.releaseTicket } : {}),
     ...(typeof releaseEvidence.operatorName === "string" ? { operatorName: releaseEvidence.operatorName } : {})
   };
@@ -3182,6 +3184,7 @@ function releaseEvidenceAuditMetadata(evidence: ReleaseEvidenceMetadata | undefi
   return {
     evidencePath: evidence.evidencePath,
     checkedAt: evidence.checkedAt,
+    ...(evidence.payloadDigest ? { payloadDigest: evidence.payloadDigest } : {}),
     status: evidence.status,
     commitRef: evidence.commitRef,
     repository: evidence.repository,

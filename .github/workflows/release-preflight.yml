@@ -45,6 +45,24 @@ on:
         description: GitHub Actions run id that uploaded release-image-evidence for this exact commit.
         required: true
         type: string
+      release_image_digest:
+        description: Published release image digest expected for target API and worker containers.
+        required: true
+        type: string
+      source_provider_webhook_delivery_id:
+        description: Source-provider webhook delivery id whose signature was verified for this release.
+        required: true
+        type: string
+      source_provider_deploy_key_path:
+        description: Sanitized target deploy-key path used for private source checkout evidence.
+        required: true
+        default: /run/secrets/siteflow_git_ssh_key
+        type: string
+      source_provider_known_hosts_path:
+        description: Sanitized target known_hosts path used for SSH host-key evidence.
+        required: true
+        default: /etc/ssh/ssh_known_hosts
+        type: string
       trust_proxy_policy:
         description: Expected SITEFLOW_TRUST_PROXY policy for ingress evidence.
         required: true
@@ -74,6 +92,38 @@ on:
         description: API limiter enforcement point, for example edge, proxy, load_balancer, gateway, ingress, cdn, or api.
         required: true
         default: ingress
+        type: string
+      operator_access_project_id:
+        description: Project id used to prove project-scoped operator sessions can access an allowed project.
+        required: true
+        type: string
+      operator_access_denied_project_id:
+        description: Project id used to prove project-scoped operator sessions are denied outside their scope.
+        required: true
+        type: string
+      old_metrics_token_redacted_id:
+        description: Non-secret identifier for the retired metrics token used in credential rotation evidence.
+        required: true
+        type: string
+      new_metrics_token_redacted_id:
+        description: Non-secret identifier for the active metrics token used in credential rotation evidence.
+        required: true
+        type: string
+      old_root_api_token_redacted_id:
+        description: Non-secret identifier for the retired root API token used in credential rotation evidence.
+        required: true
+        type: string
+      new_root_api_token_redacted_id:
+        description: Non-secret identifier for the active root API token used in credential rotation evidence.
+        required: true
+        type: string
+      break_glass_source:
+        description: Non-secret break-glass source recorded in credential evidence.
+        required: true
+        type: string
+      break_glass_approver_count:
+        description: Number of approvers for the credential break-glass review.
+        required: true
         type: string
       build_image:
         description: Target worker Docker build image for release build rehearsal. Must be pinned with @sha256.
@@ -125,6 +175,7 @@ jobs:
           INPUT_REPO: ${{ inputs.repo }}
           INPUT_COMMIT_REF: ${{ inputs.commit_ref }}
           INPUT_BUILD_IMAGE: ${{ inputs.build_image }}
+          INPUT_RELEASE_IMAGE_DIGEST: ${{ inputs.release_image_digest }}
           INPUT_DOCKER_SOCKET_PROFILE_ACCEPTED: ${{ inputs.docker_socket_profile_accepted }}
           CHECKOUT_REPOSITORY: ${{ github.repository }}
         run: |
@@ -149,6 +200,11 @@ jobs:
               ;;
           esac
 
+          if ! [[ "$INPUT_RELEASE_IMAGE_DIGEST" =~ ^sha256:[a-fA-F0-9]{64}$ ]]; then
+            echo "release_image_digest must be a sha256 digest, for example sha256:<64 hex characters>." >&2
+            exit 1
+          fi
+
           if [ "$INPUT_DOCKER_SOCKET_PROFILE_ACCEPTED" != "true" ]; then
             echo "docker_socket_profile_accepted must be true to run target evidence with the trusted single-host Docker socket worker profile." >&2
             exit 1
@@ -168,6 +224,12 @@ jobs:
 
       - name: Assert release source tree policy
         run: npm run --silent release:source:check -- --json
+
+      - name: Release commit readiness plan
+        run: npm run --silent release:commit:plan -- --fail-on-blocked --json
+
+      - name: Release evidence pack contract
+        run: npm run --silent release:evidence:pack-contract -- --json
 
       - name: Build release tooling and app
         run: npm run build
@@ -285,16 +347,34 @@ jobs:
           SITEFLOW_BUILD_IMAGE_ALLOWLIST: ${{ inputs.build_image }}
           SITEFLOW_RUN_POSTGRES_INTEGRATION: "1"
           TEST_DATABASE_URL: ${{ secrets.SITEFLOW_TEST_DATABASE_URL }}
+          SITEFLOW_API_TOKEN: ${{ secrets.SITEFLOW_API_TOKEN }}
+          SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN: ${{ secrets.SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN }}
+          SITEFLOW_OLD_METRICS_TOKEN: ${{ secrets.SITEFLOW_OLD_METRICS_TOKEN }}
           SITEFLOW_METRICS_TOKEN: ${{ secrets.SITEFLOW_METRICS_TOKEN }}
+          SITEFLOW_OLD_API_TOKEN: ${{ secrets.SITEFLOW_OLD_API_TOKEN }}
           SITEFLOW_OBSERVABILITY_STACK_TOKEN: ${{ secrets.SITEFLOW_OBSERVABILITY_STACK_TOKEN }}
+          SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY: ${{ secrets.SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY }}
+          SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID: ${{ secrets.SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID }}
           SITEFLOW_DIRECT_API_URL: ${{ inputs.direct_api_url }}
+          SITEFLOW_RELEASE_IMAGE_DIGEST: ${{ inputs.release_image_digest }}
           SITEFLOW_RELEASE_IMAGE_RUN_ID: ${{ inputs.release_image_run_id }}
+          SITEFLOW_SOURCE_PROVIDER_WEBHOOK_DELIVERY_ID: ${{ inputs.source_provider_webhook_delivery_id }}
+          SITEFLOW_SOURCE_PROVIDER_DEPLOY_KEY_PATH: ${{ inputs.source_provider_deploy_key_path }}
+          SITEFLOW_SOURCE_PROVIDER_KNOWN_HOSTS_PATH: ${{ inputs.source_provider_known_hosts_path }}
           SITEFLOW_TRUST_PROXY: ${{ inputs.trust_proxy_policy }}
           SITEFLOW_API_INSTANCE_COUNT: ${{ inputs.api_instance_count }}
           SITEFLOW_API_PROCESS_COUNT: ${{ inputs.api_process_count }}
           SITEFLOW_INGRESS_COUNT: ${{ inputs.ingress_count }}
           SITEFLOW_API_RATE_LIMIT_SCOPE: ${{ inputs.api_rate_limit_scope }}
           SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT: ${{ inputs.api_rate_limit_enforcement_point }}
+          SITEFLOW_OPERATOR_ACCESS_PROJECT_ID: ${{ inputs.operator_access_project_id }}
+          SITEFLOW_OPERATOR_ACCESS_DENIED_PROJECT_ID: ${{ inputs.operator_access_denied_project_id }}
+          SITEFLOW_OLD_METRICS_TOKEN_REDACTED_ID: ${{ inputs.old_metrics_token_redacted_id }}
+          SITEFLOW_NEW_METRICS_TOKEN_REDACTED_ID: ${{ inputs.new_metrics_token_redacted_id }}
+          SITEFLOW_OLD_ROOT_API_TOKEN_REDACTED_ID: ${{ inputs.old_root_api_token_redacted_id }}
+          SITEFLOW_NEW_ROOT_API_TOKEN_REDACTED_ID: ${{ inputs.new_root_api_token_redacted_id }}
+          SITEFLOW_BREAK_GLASS_SOURCE: ${{ inputs.break_glass_source }}
+          SITEFLOW_BREAK_GLASS_APPROVER_COUNT: ${{ inputs.break_glass_approver_count }}
         run: |
           npm run --silent release:evidence:target-run -- \
             --pack "$SITEFLOW_PREFLIGHT_DIR/release-evidence-rehearsal-pack.json" \
@@ -302,38 +382,82 @@ jobs:
             --run-record "$SITEFLOW_PREFLIGHT_DIR/release-evidence-target-run.json" \
             --gap-report-dir "$SITEFLOW_PREFLIGHT_DIR/gap-reports" \
             --set-env direct-api-url=SITEFLOW_DIRECT_API_URL \
+            --set-env release-image-digest=SITEFLOW_RELEASE_IMAGE_DIGEST \
             --set-env release-image-run-id=SITEFLOW_RELEASE_IMAGE_RUN_ID \
+            --set-env webhook-delivery-id=SITEFLOW_SOURCE_PROVIDER_WEBHOOK_DELIVERY_ID \
+            --set-env deploy-key-path=SITEFLOW_SOURCE_PROVIDER_DEPLOY_KEY_PATH \
+            --set-env known-hosts-path=SITEFLOW_SOURCE_PROVIDER_KNOWN_HOSTS_PATH \
             --set-env SITEFLOW_TRUST_PROXY=SITEFLOW_TRUST_PROXY \
             --set-env api-instance-count=SITEFLOW_API_INSTANCE_COUNT \
             --set-env api-process-count=SITEFLOW_API_PROCESS_COUNT \
             --set-env ingress-count=SITEFLOW_INGRESS_COUNT \
             --set-env api-rate-limit-scope=SITEFLOW_API_RATE_LIMIT_SCOPE \
             --set-env api-rate-limit-enforcement-point=SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT \
+            --set-env operator-access-project-id=SITEFLOW_OPERATOR_ACCESS_PROJECT_ID \
+            --set-env operator-access-denied-project-id=SITEFLOW_OPERATOR_ACCESS_DENIED_PROJECT_ID \
+            --set-env old-metrics-token-redacted-id=SITEFLOW_OLD_METRICS_TOKEN_REDACTED_ID \
+            --set-env new-metrics-token-redacted-id=SITEFLOW_NEW_METRICS_TOKEN_REDACTED_ID \
+            --set-env old-root-api-token-redacted-id=SITEFLOW_OLD_ROOT_API_TOKEN_REDACTED_ID \
+            --set-env new-root-api-token-redacted-id=SITEFLOW_NEW_ROOT_API_TOKEN_REDACTED_ID \
+            --set-env break-glass-source=SITEFLOW_BREAK_GLASS_SOURCE \
+            --set-env break-glass-approver-count=SITEFLOW_BREAK_GLASS_APPROVER_COUNT \
             --json > "$SITEFLOW_PREFLIGHT_DIR/release-evidence-target-run.out.json"
 
       - name: Generate release evidence gap report
         if: always()
         env:
           SITEFLOW_DIRECT_API_URL: ${{ inputs.direct_api_url }}
+          SITEFLOW_RELEASE_IMAGE_DIGEST: ${{ inputs.release_image_digest }}
           SITEFLOW_RELEASE_IMAGE_RUN_ID: ${{ inputs.release_image_run_id }}
+          SITEFLOW_SOURCE_PROVIDER_WEBHOOK_DELIVERY_ID: ${{ inputs.source_provider_webhook_delivery_id }}
+          SITEFLOW_SOURCE_PROVIDER_DEPLOY_KEY_PATH: ${{ inputs.source_provider_deploy_key_path }}
+          SITEFLOW_SOURCE_PROVIDER_KNOWN_HOSTS_PATH: ${{ inputs.source_provider_known_hosts_path }}
           SITEFLOW_TRUST_PROXY: ${{ inputs.trust_proxy_policy }}
           SITEFLOW_API_INSTANCE_COUNT: ${{ inputs.api_instance_count }}
           SITEFLOW_API_PROCESS_COUNT: ${{ inputs.api_process_count }}
           SITEFLOW_INGRESS_COUNT: ${{ inputs.ingress_count }}
           SITEFLOW_API_RATE_LIMIT_SCOPE: ${{ inputs.api_rate_limit_scope }}
           SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT: ${{ inputs.api_rate_limit_enforcement_point }}
+          SITEFLOW_OPERATOR_ACCESS_PROJECT_ID: ${{ inputs.operator_access_project_id }}
+          SITEFLOW_OPERATOR_ACCESS_DENIED_PROJECT_ID: ${{ inputs.operator_access_denied_project_id }}
+          SITEFLOW_OLD_METRICS_TOKEN_REDACTED_ID: ${{ inputs.old_metrics_token_redacted_id }}
+          SITEFLOW_NEW_METRICS_TOKEN_REDACTED_ID: ${{ inputs.new_metrics_token_redacted_id }}
+          SITEFLOW_OLD_ROOT_API_TOKEN_REDACTED_ID: ${{ inputs.old_root_api_token_redacted_id }}
+          SITEFLOW_NEW_ROOT_API_TOKEN_REDACTED_ID: ${{ inputs.new_root_api_token_redacted_id }}
+          SITEFLOW_BREAK_GLASS_SOURCE: ${{ inputs.break_glass_source }}
+          SITEFLOW_BREAK_GLASS_APPROVER_COUNT: ${{ inputs.break_glass_approver_count }}
+          SITEFLOW_API_TOKEN: ${{ secrets.SITEFLOW_API_TOKEN }}
+          SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN: ${{ secrets.SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN }}
+          SITEFLOW_OLD_METRICS_TOKEN: ${{ secrets.SITEFLOW_OLD_METRICS_TOKEN }}
+          SITEFLOW_METRICS_TOKEN: ${{ secrets.SITEFLOW_METRICS_TOKEN }}
+          SITEFLOW_OLD_API_TOKEN: ${{ secrets.SITEFLOW_OLD_API_TOKEN }}
+          SITEFLOW_OBSERVABILITY_STACK_TOKEN: ${{ secrets.SITEFLOW_OBSERVABILITY_STACK_TOKEN }}
+          SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY: ${{ secrets.SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY }}
+          SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID: ${{ secrets.SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID }}
         run: |
           set +e
           npm run --silent release:evidence:gaps -- \
             --pack "$SITEFLOW_PREFLIGHT_DIR/release-evidence-rehearsal-pack.json" \
             --set-env direct-api-url=SITEFLOW_DIRECT_API_URL \
+            --set-env release-image-digest=SITEFLOW_RELEASE_IMAGE_DIGEST \
             --set-env release-image-run-id=SITEFLOW_RELEASE_IMAGE_RUN_ID \
+            --set-env webhook-delivery-id=SITEFLOW_SOURCE_PROVIDER_WEBHOOK_DELIVERY_ID \
+            --set-env deploy-key-path=SITEFLOW_SOURCE_PROVIDER_DEPLOY_KEY_PATH \
+            --set-env known-hosts-path=SITEFLOW_SOURCE_PROVIDER_KNOWN_HOSTS_PATH \
             --set-env SITEFLOW_TRUST_PROXY=SITEFLOW_TRUST_PROXY \
             --set-env api-instance-count=SITEFLOW_API_INSTANCE_COUNT \
             --set-env api-process-count=SITEFLOW_API_PROCESS_COUNT \
             --set-env ingress-count=SITEFLOW_INGRESS_COUNT \
             --set-env api-rate-limit-scope=SITEFLOW_API_RATE_LIMIT_SCOPE \
             --set-env api-rate-limit-enforcement-point=SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT \
+            --set-env operator-access-project-id=SITEFLOW_OPERATOR_ACCESS_PROJECT_ID \
+            --set-env operator-access-denied-project-id=SITEFLOW_OPERATOR_ACCESS_DENIED_PROJECT_ID \
+            --set-env old-metrics-token-redacted-id=SITEFLOW_OLD_METRICS_TOKEN_REDACTED_ID \
+            --set-env new-metrics-token-redacted-id=SITEFLOW_NEW_METRICS_TOKEN_REDACTED_ID \
+            --set-env old-root-api-token-redacted-id=SITEFLOW_OLD_ROOT_API_TOKEN_REDACTED_ID \
+            --set-env new-root-api-token-redacted-id=SITEFLOW_NEW_ROOT_API_TOKEN_REDACTED_ID \
+            --set-env break-glass-source=SITEFLOW_BREAK_GLASS_SOURCE \
+            --set-env break-glass-approver-count=SITEFLOW_BREAK_GLASS_APPROVER_COUNT \
             --json > "$SITEFLOW_PREFLIGHT_DIR/release-evidence-gaps.stdout.json" \
             2> "$SITEFLOW_PREFLIGHT_DIR/release-evidence-gaps.stderr.json"
           status=$?

@@ -1,12 +1,17 @@
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { requiredOffHostBackupEvidenceCheckNames } from "./backupEvidenceCheck.js";
 import { evidenceSecretFindingSummary, scanEvidenceForRawSecrets } from "./evidenceSecretScan.js";
 import { requiredIngressEvidenceCheckNames } from "./ingressEvidenceCheck.js";
 import { strictIsoTimestampValue } from "./isoTimestamp.js";
+import { requiredNonSessionCredentialEvidenceCheckNames } from "./nonSessionCredentialEvidenceCheck.js";
+import { requiredObservabilityEvidenceCheckNames } from "./observabilityEvidenceCheck.js";
+import { requiredOperatorAccessEvidenceCheckNames } from "./operatorAccessEvidenceCheck.js";
 import { requiredReleaseArtifactCheckNames } from "./releaseArtifactContracts.js";
 import { requiredSourceProviderEvidenceCheckNames } from "./sourceProviderEvidenceCheck.js";
 import { requiredTargetRuntimeEvidenceCheckNames } from "./releaseTargetRuntimeEvidenceCheck.js";
+import { requiredUpgradeRollbackDrillEvidenceCheckNames } from "./upgradeRollbackDrillEvidenceCheck.js";
 
 type EvidenceStatus = "passed" | "blocked";
 type CheckStatus = "pass" | "fail";
@@ -19,6 +24,9 @@ export interface ReleaseEvidenceBundleCheckOptions {
   targetEnvironment?: string;
   maxEvidenceAgeHours?: number;
   allowHostBuildException?: boolean;
+  allowMissingAttestation?: boolean;
+  attestationSigningKey?: string;
+  requiredAttestationKeyId?: string;
   now?: () => Date;
 }
 
@@ -33,9 +41,11 @@ export interface ReleaseEvidenceBundleResult {
   status: EvidenceStatus;
   checkedAt: string;
   evidencePath: string;
+  payloadDigest: string | null;
   thresholds: {
     maxEvidenceAgeHours: number;
     allowHostBuildException: boolean;
+    allowMissingAttestation?: boolean;
   };
   selectedEvidence: {
     releaseCommitRef: string | null;
@@ -69,6 +79,11 @@ interface ParsedArgs {
   help: boolean;
   maxEvidenceAgeHours: number;
   allowHostBuildException: boolean;
+  allowMissingAttestation: boolean;
+  attestationKeyEnv?: string;
+  attestationKeyFile?: string;
+  requiredAttestationKeyIdEnv?: string;
+  requiredAttestationKeyId?: string;
 }
 
 interface CliIo {
@@ -79,6 +94,10 @@ interface CliIo {
 const defaultMaxEvidenceAgeHours = 168;
 const expectedSchemaVersion = "siteflow.releaseEvidence.v1";
 const expectedBundleName = "siteflow-release-evidence-bundle";
+const expectedBundleAttestationType = "siteflow.releaseEvidenceBundleAttestation.v1";
+const expectedBundleAttestationIssuer = "siteflow-release-evidence-bundle-compose";
+const expectedBundleAttestationCanonicalization = "siteflow.releaseEvidenceBundlePayload.v1";
+const expectedBundleAttestationSignatureAlgorithm = "hmac-sha256";
 const sha256DigestPattern = /^sha256:[a-f0-9]{64}$/i;
 const sha256HexPattern = /^[a-f0-9]{64}$/i;
 const requiredPostgresRehearsalScopes = [
@@ -99,175 +118,10 @@ const apiInstanceCountKeys = ["apiInstanceCount", "apiInstances", "instanceCount
 const apiProcessCountKeys = ["apiProcessCount", "apiProcesses", "processCount", "processes"];
 const ingressCountKeys = ["ingressCount", "ingresses"];
 const topologyMultiFlagKeys = ["multiInstance", "multiProcess", "multiIngress"];
-const requiredObservabilityEvidenceChecks = [
-  "release_identity",
-  "target_environment",
-  "readiness_present",
-  "readiness_status",
-  "readiness_age",
-  "readiness_status_codes",
-  "readiness_traffic_removed",
-  "metrics_present",
-  "metrics_status",
-  "metrics_age",
-  "metrics_access_control",
-  "metrics_expected_names",
-  "backup_automation_run_present",
-  "backup_automation_run_identity",
-  "backup_automation_run_status",
-  "backup_automation_run_age",
-  "backup_automation_run_steps",
-  "backup_automation_checker_output",
-  "backup_automation_history_present",
-  "backup_automation_history_identity",
-  "backup_automation_history_latest_run",
-  "backup_automation_history_latest_status",
-  "backup_restore_drill_cadence_count",
-  "backup_restore_drill_cadence_gap",
-  "backup_history_checker_output",
-  "backup_scheduler_ownership_present",
-  "backup_scheduler_ownership_status",
-  "backup_scheduler_ownership_age",
-  "backup_scheduler_ownership_schema",
-  "backup_scheduler_ownership_source",
-  "backup_scheduler_ownership_target_environment",
-  "backup_scheduler_ownership_enabled",
-  "backup_scheduler_ownership_schedule",
-  "backup_scheduler_ownership_command",
-  "backup_scheduler_ownership_run_links",
-  "backup_scheduler_ownership_owner",
-  "observability_apply_proof_present",
-  "observability_apply_proof_status",
-  "observability_apply_proof_age",
-  "observability_apply_proof_schema",
-  "observability_apply_proof_source",
-  "observability_apply_proof_plan_schema",
-  "observability_apply_proof_assets",
-  "observability_target_stack_proof_present",
-  "observability_target_stack_proof_status",
-  "observability_target_stack_proof_age",
-  "observability_target_stack_proof_schema",
-  "observability_target_stack_proof_source",
-  "observability_target_stack_proof_release_identity",
-  "observability_target_stack_proof_target_environment",
-  "observability_target_stack_prometheus_rules",
-  "observability_target_stack_grafana_dashboard",
-  "observability_target_stack_alertmanager_receiver",
-  "alert_present",
-  "alert_status",
-  "alert_age",
-  "alert_delivered",
-  "dashboard_present",
-  "dashboard_status",
-  "dashboard_age",
-  "dashboard_reference",
-  "dashboard_owner",
-  "log_pipeline_present",
-  "log_pipeline_status",
-  "log_pipeline_age",
-  "log_retention",
-  "log_redaction_spot_check",
-  "no_sensitive_evidence_values"
-];
-const requiredOperatorAccessEvidenceChecks = [
-  "non_dry_run",
-  "not_template",
-  "status_final",
-  "release_identity",
-  "environment",
-  "public_base_url",
-  "session_create_present",
-  "session_create_status",
-  "session_cookie_flags",
-  "session_secret_not_returned",
-  "session_policy_present",
-  "session_policy_enforced",
-  "project_scope_present",
-  "project_scope_enforced",
-  "session_rotation_present",
-  "session_rotation_status",
-  "session_rotation_cookie_flags",
-  "session_rotation_secret_not_returned",
-  "session_rotation_csrf_enforced",
-  "session_rotation_old_cookie_rejected",
-  "session_revoke_present",
-  "session_revoke_status",
-  "csrf_present",
-  "csrf_enforced",
-  "bearer_precedence_present",
-  "bearer_precedence_enforced",
-  "actor_attribution_present",
-  "actor_attribution_enforced",
-  "browser_token_fallback_present",
-  "browser_token_fallback_posture",
-  "browser_token_fallback_exception_documented",
-  "browser_token_fallback_local_storage_disabled",
-  "browser_token_fallback_age",
-  "emergency_cutoff_present",
-  "emergency_cutoff_global",
-  "emergency_cutoff_project",
-  "emergency_cutoff_cookie_only_rejected",
-  "emergency_cutoff_low_scope_bearer",
-  "emergency_cutoff_old_cookie_rejected",
-  "negative_evidence_present",
-  "no_raw_secrets_stored",
-  "no_sensitive_evidence_values",
-  "operator",
-  "ticket"
-];
-const requiredNonSessionCredentialEvidenceChecks = [
-  "non_dry_run",
-  "not_template",
-  "status_final",
-  "release_identity",
-  "environment",
-  "operator",
-  "ticket",
-  "credentials_present",
-  "credential_types_supported",
-  "credential_owners_and_tickets",
-  "credential_status",
-  "credential_age",
-  "credential_redacted_identifiers",
-  "no_raw_credentials_archived",
-  "no_sensitive_evidence_values",
-  "old_credentials_rejected",
-  "new_credentials_accepted",
-  "credential_specific_evidence",
-  "break_glass_present",
-  "break_glass_status",
-  "break_glass_age",
-  "break_glass_controls",
-  "automation_not_claimed"
-];
+const requiredOperatorAccessEvidenceChecks = [...requiredOperatorAccessEvidenceCheckNames];
+const requiredNonSessionCredentialEvidenceChecks = [...requiredNonSessionCredentialEvidenceCheckNames];
 const requiredIngressEvidenceChecks = [...requiredIngressEvidenceCheckNames];
-const requiredUpgradeRollbackEvidenceChecks = [
-  "non_dry_run",
-  "not_template",
-  "status_final",
-  "no_sensitive_evidence_values",
-  "drill_time_order",
-  "target_environment",
-  "release_identity",
-  "version_pair",
-  "rollback_version",
-  "api_image_digests",
-  "worker_image_digests",
-  "service_rollback_digest",
-  "migration_versions",
-  "schema_rollback_compatibility",
-  "backup_evidence_passed",
-  "release_operations",
-  "route_upgrade",
-  "route_rollback_restores_previous_artifact",
-  "http_rollback_verification",
-  "readiness_evidence",
-  "metrics_evidence",
-  "logs_evidence",
-  "alert_evidence",
-  "operator",
-  "ticket"
-];
+const requiredUpgradeRollbackEvidenceChecks = [...requiredUpgradeRollbackDrillEvidenceCheckNames];
 
 function isEntrypoint() {
   const entryPath = process.argv[1];
@@ -280,6 +134,11 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function stringValue(value: unknown) {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+export function releaseEvidenceRequiredAttestationKeyIdFromEnv(env: Record<string, string | undefined> = process.env) {
+  return stringValue(env.SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID) ??
+    stringValue(env.SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_ID);
 }
 
 function statusValue(value: unknown) {
@@ -308,14 +167,312 @@ function nestedValue(candidate: Record<string, unknown> | undefined, path: strin
   return current;
 }
 
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return JSON.stringify(value) ?? "null";
+  }
+
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? JSON.stringify(value) ?? "null" : "null";
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => canonicalJson(entry === undefined ? null : entry)).join(",")}]`;
+  }
+
+  if (isObject(value)) {
+    return `{${Object.keys(value)
+      .filter((key) => value[key] !== undefined)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+
+  return "null";
+}
+
+function sha256Digest(value: string) {
+  return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+}
+
+function hmacSha256Signature(value: string, key: string) {
+  return `sha256:${createHmac("sha256", key).update(value, "utf8").digest("hex")}`;
+}
+
+function constantTimeEqual(left: string | undefined, right: string | undefined) {
+  if (!left || !right) {
+    return false;
+  }
+
+  const leftBuffer = Buffer.from(left, "utf8");
+  const rightBuffer = Buffer.from(right, "utf8");
+
+  return leftBuffer.byteLength === rightBuffer.byteLength && timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function releaseEvidenceBundlePayload(bundle: Record<string, unknown>) {
+  const { attestation: _attestation, ...payload } = bundle;
+
+  return payload;
+}
+
+export function releaseEvidenceBundlePayloadDigest(bundle: Record<string, unknown>) {
+  return sha256Digest(canonicalJson(releaseEvidenceBundlePayload(bundle)));
+}
+
+export function releaseEvidenceBundleAttestationKeyId(attestationSigningKey: string) {
+  return `sha256:${createHash("sha256").update(attestationSigningKey, "utf8").digest("hex").slice(0, 16)}`;
+}
+
+function releaseEvidenceBundleAttestationSigningPayload(attestation: Record<string, unknown>) {
+  const { signature: _signature, ...payload } = attestation;
+
+  return canonicalJson(payload);
+}
+
+interface ReleaseEvidenceBundleAttestationOptions {
+  attestationSigningKey?: string;
+  attestationSigningKeyId?: string;
+}
+
+export function releaseEvidenceBundleAttestation(
+  bundle: Record<string, unknown>,
+  attestedAt: string,
+  options: ReleaseEvidenceBundleAttestationOptions = {}
+) {
+  const release = nestedObject(bundle, "release");
+  const unsignedAttestation: Record<string, unknown> = {
+    type: expectedBundleAttestationType,
+    issuer: expectedBundleAttestationIssuer,
+    attestedAt,
+    payloadDigestAlgorithm: "sha256",
+    payloadDigest: releaseEvidenceBundlePayloadDigest(bundle),
+    canonicalization: expectedBundleAttestationCanonicalization,
+    subject: {
+      schemaVersion: stringValue(bundle.schemaVersion) ?? null,
+      name: stringValue(bundle.name) ?? null,
+      commitRef: stringValue(release?.commitRef) ?? stringValue(bundle.commitRef) ?? null,
+      repository: stringValue(release?.repository) ?? stringValue(bundle.repository) ?? null,
+      branch: stringValue(release?.branch) ?? stringValue(bundle.branch) ?? null,
+      targetEnvironment: bundleTargetEnvironment(bundle) ?? null
+    }
+  };
+
+  if (!options.attestationSigningKey) {
+    return unsignedAttestation;
+  }
+
+  const signedAttestation = {
+    ...unsignedAttestation,
+    signatureAlgorithm: expectedBundleAttestationSignatureAlgorithm,
+    signatureKeyId: options.attestationSigningKeyId ?? releaseEvidenceBundleAttestationKeyId(options.attestationSigningKey)
+  };
+
+  return {
+    ...signedAttestation,
+    signature: hmacSha256Signature(
+      releaseEvidenceBundleAttestationSigningPayload(signedAttestation),
+      options.attestationSigningKey
+    )
+  };
+}
+
+export function bundleWithReleaseEvidenceAttestation(
+  bundle: Record<string, unknown>,
+  attestedAt: string,
+  options: ReleaseEvidenceBundleAttestationOptions = {}
+) {
+  return {
+    ...bundle,
+    attestation: releaseEvidenceBundleAttestation(bundle, attestedAt, options)
+  };
+}
+
+export function releaseEvidenceBundleAttestationDigestVerified(bundle: Record<string, unknown>) {
+  return bundleAttestationDigestMatches(bundleAttestation(bundle), bundle);
+}
+
+export function releaseEvidenceBundleAttestationSignatureVerified(
+  bundle: Record<string, unknown>,
+  attestationSigningKey: string | undefined,
+  requiredAttestationKeyId?: string
+) {
+  const attestation = bundleAttestation(bundle);
+
+  return bundleAttestationDigestMatches(attestation, bundle) &&
+    bundleAttestationSignatureMatches(attestation, attestationSigningKey, requiredAttestationKeyId);
+}
+
 function selectedEvidenceSummaryPassed(selectedEvidence: Record<string, unknown> | undefined, key: string) {
   const summary = nestedObject(selectedEvidence, key);
-  const passingStatuses = new Set(["pass", "passed", "completed", "ok", "healthy", "scraped", "applied", "delivered", "available"]);
 
   return Boolean(
     summary &&
-      passingStatuses.has(statusValue(summary.status) ?? "") &&
+      defaultSelectedEvidenceSummaryStatuses.has(statusValue(summary.status) ?? "") &&
       timestampValue(summary.timestamp)
+  );
+}
+
+const defaultSelectedEvidenceSummaryStatuses = new Set(["pass", "passed", "completed", "ok", "healthy", "scraped", "applied", "delivered", "available"]);
+const revokedSelectedEvidenceSummaryStatuses = new Set([...defaultSelectedEvidenceSummaryStatuses, "revoked"]);
+const enforcedSelectedEvidenceSummaryStatuses = new Set([...defaultSelectedEvidenceSummaryStatuses, "enforced"]);
+const blockedSelectedEvidenceSummaryStatuses = new Set([...defaultSelectedEvidenceSummaryStatuses, "blocked"]);
+const limitedSelectedEvidenceSummaryStatuses = new Set([...defaultSelectedEvidenceSummaryStatuses, "limited"]);
+const verifiedSelectedEvidenceSummaryStatuses = new Set([...defaultSelectedEvidenceSummaryStatuses, "verified"]);
+const restoredSelectedEvidenceSummaryStatuses = new Set([...defaultSelectedEvidenceSummaryStatuses, "restored", "restore_drilled"]);
+const offloadedSelectedEvidenceSummaryStatuses = new Set([...defaultSelectedEvidenceSummaryStatuses, "offloaded"]);
+const fetchedSelectedEvidenceSummaryStatuses = new Set([...defaultSelectedEvidenceSummaryStatuses, "fetched"]);
+const prunedSelectedEvidenceSummaryStatuses = new Set([...defaultSelectedEvidenceSummaryStatuses, "pruned"]);
+const notRequiredSelectedEvidenceSummaryStatuses = new Set([...defaultSelectedEvidenceSummaryStatuses, "not_required"]);
+
+function selectedEvidenceSummaryMatches(
+  selectedEvidence: Record<string, unknown> | undefined,
+  key: string,
+  allowedStatuses: ReadonlySet<string> = defaultSelectedEvidenceSummaryStatuses
+) {
+  const summary = nestedObject(selectedEvidence, key);
+
+  return Boolean(
+    summary &&
+      allowedStatuses.has(statusValue(summary.status) ?? "") &&
+      timestampValue(summary.timestamp)
+  );
+}
+
+function operatorAccessSelectedEvidencePassed(selectedEvidence: Record<string, unknown> | undefined) {
+  return selectedEvidenceSummaryMatches(selectedEvidence, "sessionCreate") &&
+    selectedEvidenceSummaryMatches(selectedEvidence, "projectScope") &&
+    selectedEvidenceSummaryMatches(selectedEvidence, "sessionRotation") &&
+    selectedEvidenceSummaryMatches(selectedEvidence, "sessionRevoke", revokedSelectedEvidenceSummaryStatuses) &&
+    selectedEvidenceSummaryMatches(selectedEvidence, "csrf", enforcedSelectedEvidenceSummaryStatuses) &&
+    selectedEvidenceSummaryMatches(selectedEvidence, "bearerPrecedence") &&
+    selectedEvidenceSummaryMatches(selectedEvidence, "actorAttribution") &&
+    selectedEvidenceSummaryMatches(selectedEvidence, "browserTokenFallback") &&
+    selectedEvidenceSummaryMatches(selectedEvidence, "emergencyCutoff");
+}
+
+function nonSessionCredentialSelectedEvidencePassed(selectedEvidence: Record<string, unknown> | undefined) {
+  const credentialTypes = nestedValue(selectedEvidence, ["credentialTypes"]);
+
+  return Boolean(
+    Array.isArray(credentialTypes) &&
+      credentialTypes.length > 0 &&
+      credentialTypes.every((entry) => typeof entry === "string" && entry.trim()) &&
+      Number.isInteger(Number(nestedValue(selectedEvidence, ["credentialCount"]))) &&
+      Number(nestedValue(selectedEvidence, ["credentialCount"])) > 0 &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "breakGlass")
+  );
+}
+
+function ingressSelectedEvidencePassed(selectedEvidence: Record<string, unknown> | undefined) {
+  return selectedEvidenceSummaryMatches(selectedEvidence, "directApiPort", blockedSelectedEvidenceSummaryStatuses) &&
+    selectedEvidenceSummaryMatches(selectedEvidence, "forwardedHeaders") &&
+    selectedEvidenceSummaryMatches(selectedEvidence, "apiRateLimit", limitedSelectedEvidenceSummaryStatuses) &&
+    selectedEvidenceSummaryMatches(selectedEvidence, "unthrottledRoutes");
+}
+
+function backupSelectedEvidencePassed(selectedEvidence: Record<string, unknown> | undefined) {
+  const backupVerify = nestedObject(selectedEvidence, "backupVerify");
+  const restoreDrill = nestedObject(selectedEvidence, "restoreDrill");
+  const backupOffload = nestedObject(selectedEvidence, "backupOffload");
+  const backupFetch = nestedObject(selectedEvidence, "backupFetch");
+  const backupPrune = nestedObject(selectedEvidence, "backupPrune");
+  const offloadLocation = stringValue(backupOffload?.offHostLocation);
+  const fetchLocation = stringValue(backupFetch?.offHostLocation);
+
+  return Boolean(
+    selectedEvidenceSummaryMatches(selectedEvidence, "backupVerify", verifiedSelectedEvidenceSummaryStatuses) &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "restoreDrill", restoredSelectedEvidenceSummaryStatuses) &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "backupOffload", offloadedSelectedEvidenceSummaryStatuses) &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "backupFetch", fetchedSelectedEvidenceSummaryStatuses) &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "backupProviderSecurityAudit") &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "backupPrune", prunedSelectedEvidenceSummaryStatuses) &&
+      stringValue(backupVerify?.backupPath) &&
+      stringValue(backupVerify?.offHostLocation) &&
+      stringValue(backupVerify?.provider) &&
+      restoreDrill?.restoreDrill === true &&
+      offloadLocation &&
+      stringValue(backupOffload?.provider) &&
+      backupOffload?.encrypted === true &&
+      backupOffload?.providerKmsProof === true &&
+      backupOffload?.providerRetentionProof === true &&
+      Number(backupOffload?.providerRetentionDays) > 0 &&
+      stringValue(backupOffload?.providerRetentionMode) &&
+      stringValue(backupOffload?.retentionContract) &&
+      stringValue(backupFetch?.backupPath) &&
+      fetchLocation &&
+      fetchLocation === offloadLocation &&
+      stringValue(backupFetch?.provider) === stringValue(backupOffload?.provider) &&
+      backupPrune?.dryRun === false
+  );
+}
+
+function sourceProviderSelectedEvidencePassed(
+  selectedEvidence: Record<string, unknown> | undefined,
+  releaseCommitRef: string | undefined,
+  repository: string | undefined,
+  branch: string | undefined
+) {
+  const checkout = nestedObject(selectedEvidence, "checkout");
+  const signedWebhook = nestedObject(selectedEvidence, "signedWebhook");
+  const deployKey = nestedObject(selectedEvidence, "deployKey");
+  const hostKey = nestedObject(selectedEvidence, "hostKey");
+  const releaseProvenance = nestedObject(selectedEvidence, "releaseProvenance");
+
+  return Boolean(
+    stringValue(selectedEvidence?.environment) &&
+      stringValue(selectedEvidence?.commitRef) === releaseCommitRef &&
+      stringValue(selectedEvidence?.repository) === repository &&
+      stringValue(selectedEvidence?.branch) === branch &&
+      stringValue(selectedEvidence?.provider) &&
+      stringValue(selectedEvidence?.webhookDeliveryId) &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "checkout") &&
+      (stringValue(checkout?.commitRef) === releaseCommitRef || stringValue(checkout?.headSha) === releaseCommitRef) &&
+      checkout?.exactCommitVerified === true &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "signedWebhook") &&
+      stringValue(signedWebhook?.deliveryId) === stringValue(selectedEvidence?.webhookDeliveryId) &&
+      signedWebhook?.signatureVerified === true &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "deployKey", notRequiredSelectedEvidenceSummaryStatuses) &&
+      (statusValue(deployKey?.status) === "not_required" || deployKey?.mounted === true) &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "hostKey", notRequiredSelectedEvidenceSummaryStatuses) &&
+      (statusValue(hostKey?.status) === "not_required" || hostKey?.pinned === true) &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "releaseProvenance") &&
+      stringValue(releaseProvenance?.commitRef) === releaseCommitRef &&
+      stringValue(releaseProvenance?.repository) === repository &&
+      stringValue(releaseProvenance?.branch) === branch
+  );
+}
+
+function upgradeRollbackSelectedEvidencePassed(
+  selectedEvidence: Record<string, unknown> | undefined,
+  releaseCommitRef: string | undefined,
+  repository: string | undefined,
+  branch: string | undefined,
+  targetEnvironment: string | undefined
+) {
+  const fromVersion = stringValue(selectedEvidence?.fromVersion);
+  const toVersion = stringValue(selectedEvidence?.toVersion);
+  const rollbackVersion = stringValue(selectedEvidence?.rollbackVersion);
+  const upgradeOperationId = stringValue(selectedEvidence?.upgradeOperationId);
+  const rollbackOperationId = stringValue(selectedEvidence?.rollbackOperationId);
+
+  return Boolean(
+    stringValue(selectedEvidence?.commitRef) === releaseCommitRef &&
+      stringValue(selectedEvidence?.repository) === repository &&
+      stringValue(selectedEvidence?.branch) === branch &&
+      stringValue(selectedEvidence?.targetEnvironment) === targetEnvironment &&
+      fromVersion &&
+      toVersion &&
+      fromVersion !== toVersion &&
+      rollbackVersion === fromVersion &&
+      upgradeOperationId &&
+      rollbackOperationId &&
+      upgradeOperationId !== rollbackOperationId &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "backupEvidence") &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "routeUpgrade") &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "routeRollback") &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "readiness") &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "observability")
   );
 }
 
@@ -463,7 +620,7 @@ function upgradeRollbackAttachment(root: Record<string, unknown> | undefined) {
 }
 
 function releaseMetadata(root: Record<string, unknown> | undefined) {
-  return nestedObject(root, "release") ?? root;
+  return nestedObject(root, "release");
 }
 
 function releaseCommitValue(root: Record<string, unknown> | undefined) {
@@ -519,6 +676,12 @@ function releaseImageSourceCommitValue(evidence: Record<string, unknown> | undef
 
 function releaseImageSourceRepositoryValue(evidence: Record<string, unknown> | undefined) {
   return stringValue(nestedValue(evidence, ["source", "repository"]));
+}
+
+function releaseImageSourceRefValue(evidence: Record<string, unknown> | undefined) {
+  return stringValue(nestedValue(evidence, ["source", "refName"])) ??
+    stringValue(nestedValue(evidence, ["source", "ref"])) ??
+    stringValue(nestedValue(evidence, ["source", "branch"]));
 }
 
 function releaseImageDigestValue(evidence: Record<string, unknown> | undefined) {
@@ -608,10 +771,84 @@ function releaseImageAttestationPredicate(evidence: Record<string, unknown> | un
   return nestedObject(releaseImageAttestations(evidence), name);
 }
 
+function releaseImageAttestationFailedCheckCount(candidate: Record<string, unknown> | undefined) {
+  const failedChecks = candidate?.failedChecks;
+  const checks = candidate?.checks;
+  let count = 0;
+
+  if (Array.isArray(failedChecks)) {
+    count += failedChecks.length;
+  }
+
+  if (Array.isArray(checks)) {
+    count += checks.filter((check) => !isObject(check) || statusValue(check.status) !== "pass").length;
+  }
+
+  return count;
+}
+
+function releaseImageAttestationNoFailedChecksPassed(evidence: Record<string, unknown> | undefined) {
+  const attestations = releaseImageAttestations(evidence);
+  const provenance = releaseImageAttestationPredicate(evidence, "provenance");
+  const sbom = releaseImageAttestationPredicate(evidence, "sbom");
+
+  return Boolean(
+    attestations &&
+      releaseImageAttestationFailedCheckCount(attestations) === 0 &&
+      releaseImageAttestationFailedCheckCount(provenance) === 0 &&
+      releaseImageAttestationFailedCheckCount(sbom) === 0
+  );
+}
+
+function releaseImagePredicateSubjectDigests(predicate: Record<string, unknown> | undefined) {
+  const digests = new Set<string>();
+  const subjectDigest = stringValue(predicate?.subjectDigest);
+  const subjects = predicate?.subjects;
+
+  if (subjectDigest) {
+    digests.add(subjectDigest);
+  }
+
+  if (Array.isArray(subjects)) {
+    for (const subject of subjects) {
+      if (!isObject(subject)) {
+        continue;
+      }
+
+      const digest = nestedObject(subject, "digest");
+      const sha256 = stringValue(digest?.sha256);
+
+      if (sha256DigestPattern.test(sha256 ?? "")) {
+        digests.add(sha256!);
+      } else if (sha256HexPattern.test(sha256 ?? "")) {
+        digests.add(`sha256:${sha256}`);
+      }
+    }
+  }
+
+  return digests;
+}
+
+function releaseImagePredicateSubjectPassed(
+  evidence: Record<string, unknown> | undefined,
+  name: "provenance" | "sbom"
+) {
+  const imageDigest = releaseImageDigestValue(evidence);
+  const predicate = releaseImageAttestationPredicate(evidence, name);
+
+  return Boolean(
+    imageDigest &&
+      sha256DigestPattern.test(imageDigest) &&
+      releaseImagePredicateSubjectDigests(predicate).has(imageDigest)
+  );
+}
+
 function releaseImageAttestationSubjectPassed(evidence: Record<string, unknown> | undefined) {
   return Boolean(
     releaseImageDigestPassed(evidence) &&
-      releaseImageDigestValue(evidence) === stringValue(nestedValue(evidence, ["attestations", "subjectDigest"]))
+      releaseImageDigestValue(evidence) === stringValue(nestedValue(evidence, ["attestations", "subjectDigest"])) &&
+      releaseImagePredicateSubjectPassed(evidence, "provenance") &&
+      releaseImagePredicateSubjectPassed(evidence, "sbom")
   );
 }
 
@@ -628,6 +865,21 @@ function releaseImageProvenanceAttestationPassed(evidence: Record<string, unknow
   );
 }
 
+function releaseImageProvenanceStatementPassed(evidence: Record<string, unknown> | undefined) {
+  const provenance = releaseImageAttestationPredicate(evidence, "provenance");
+  const builder = nestedObject(provenance, "builder");
+  const materials = provenance?.materials;
+
+  return Boolean(
+    releaseImageProvenanceAttestationPassed(evidence) &&
+      releaseImagePredicateSubjectPassed(evidence, "provenance") &&
+      sha256DigestPattern.test(stringValue(provenance?.statementDigest) ?? "") &&
+      stringValue(builder?.id) &&
+      Array.isArray(materials) &&
+      materials.length > 0
+  );
+}
+
 function releaseImageSbomAttestationPassed(evidence: Record<string, unknown> | undefined) {
   const sbom = releaseImageAttestationPredicate(evidence, "sbom");
   const predicateType = stringValue(sbom?.predicateType);
@@ -638,6 +890,45 @@ function releaseImageSbomAttestationPassed(evidence: Record<string, unknown> | u
       predicateType &&
       (predicateType.startsWith("https://spdx.dev/") || predicateType.startsWith("https://cyclonedx.org/")) &&
       sha256DigestPattern.test(stringValue(sbom?.manifestDigest) ?? "")
+  );
+}
+
+function releaseImageSbomStatementPassed(evidence: Record<string, unknown> | undefined) {
+  const sbom = releaseImageAttestationPredicate(evidence, "sbom");
+
+  return Boolean(
+    releaseImageSbomAttestationPassed(evidence) &&
+      releaseImagePredicateSubjectPassed(evidence, "sbom") &&
+      sha256DigestPattern.test(stringValue(sbom?.statementDigest) ?? "")
+  );
+}
+
+function normalizeReleaseImageRef(value: string | undefined) {
+  return value?.replace(/^refs\/heads\//, "").replace(/^refs\/tags\//, "");
+}
+
+function releaseImageProvenanceSourceIdentityPassed(
+  evidence: Record<string, unknown> | undefined,
+  releaseCommitRef: string | undefined,
+  repository: string | undefined,
+  branch: string | undefined
+) {
+  const provenance = releaseImageAttestationPredicate(evidence, "provenance");
+  const source = nestedObject(provenance, "source");
+  const sourceCommitRef = stringValue(source?.commitRef) ?? stringValue(source?.commitSha);
+  const sourceRepository = stringValue(source?.repository);
+  const sourceRef = normalizeReleaseImageRef(
+    stringValue(source?.refName) ?? stringValue(source?.ref) ?? stringValue(source?.branch)
+  );
+  const releaseRef = normalizeReleaseImageRef(releaseImageSourceRefValue(evidence) ?? branch);
+
+  return Boolean(
+    releaseCommitRef &&
+      repository &&
+      releaseRef &&
+      sourceCommitRef === releaseCommitRef &&
+      sourceRepository?.toLowerCase() === repository.toLowerCase() &&
+      sourceRef === releaseRef
   );
 }
 
@@ -665,7 +956,7 @@ function checkArrayAllPassed(candidate: Record<string, unknown> | undefined) {
   return checks.length > 0 && checks.every((check) => isObject(check) && statusValue(check.status) === "pass");
 }
 
-function checkArrayIncludesPassedNames(candidate: Record<string, unknown> | undefined, requiredNames: string[]) {
+function checkArrayIncludesPassedNames(candidate: Record<string, unknown> | undefined, requiredNames: readonly string[]) {
   const checks = candidate?.checks;
 
   if (!Array.isArray(checks)) {
@@ -680,6 +971,33 @@ function checkArrayIncludesPassedNames(candidate: Record<string, unknown> | unde
   );
 
   return requiredNames.every((name) => passedNames.has(name));
+}
+
+const nonFinalEvidenceStatuses = new Set(["blocked", "todo", "manual_required", "dry_run", "failed", "fail"]);
+
+function nonFinalEvidenceFindings(entries: Array<{ label: string; evidence: Record<string, unknown> | undefined }>) {
+  return entries.flatMap(({ label, evidence }) => {
+    if (!evidence) {
+      return [];
+    }
+
+    const findings: string[] = [];
+    const status = statusValue(evidence.status);
+
+    if (evidence.template === true) {
+      findings.push(`${label}: template`);
+    }
+
+    if (evidence.dryRun === true) {
+      findings.push(`${label}: dryRun`);
+    }
+
+    if (status && nonFinalEvidenceStatuses.has(status)) {
+      findings.push(`${label}: status ${status}`);
+    }
+
+    return findings;
+  });
 }
 
 function requiredPrerequisitesPassed(candidate: Record<string, unknown> | undefined) {
@@ -742,12 +1060,33 @@ const allowedFunctionRuntimeIsolationValues = new Set([
   "isolate"
 ]);
 
+const allowedMetricsPrivateScrapeProtections = new Set([
+  "private_network",
+  "localhost_sidecar",
+  "reverse_proxy_allowlist"
+]);
+const requiredMetricsPrivateScrapeIngressChecks = [
+  "metrics_access_control_optional",
+  "metrics_access_control_age",
+  "metrics_access_control_private_scrape"
+];
+
 function runtimeIsolationIsAllowed(value: string | undefined) {
   return Boolean(value && allowedFunctionRuntimeIsolationValues.has(value));
 }
 
 function normalizedToken(value: unknown) {
   return stringValue(value)?.toLowerCase().replace(/[\s-]+/g, "_");
+}
+
+function booleanEvidenceValue(candidate: Record<string, unknown> | undefined, keys: string[]) {
+  for (const key of keys) {
+    if (typeof candidate?.[key] === "boolean") {
+      return candidate[key];
+    }
+  }
+
+  return undefined;
 }
 
 function numberValue(value: unknown) {
@@ -775,7 +1114,13 @@ function runtimeResourceControlsPass(runtimeEnv: Record<string, unknown> | undef
     runtimeControlStatusPass(runtimeEnv, "buildStepTimeoutStatus", "buildStepTimeoutMs") &&
     runtimeControlStatusPass(runtimeEnv, "gitTimeoutStatus", "gitTimeoutMs") &&
     statusValue(runtimeEnv?.buildNetworkStatus) === "pass" &&
-    stringValue(runtimeEnv?.buildNetwork)?.toLowerCase() === "none";
+    stringValue(runtimeEnv?.buildNetwork)?.toLowerCase() === "none" &&
+    statusValue(runtimeEnv?.workerUserStatus) === "pass" &&
+    Boolean(stringValue(runtimeEnv?.workerUser)) &&
+    stringValue(runtimeEnv?.workerUser)?.split(":")[0] !== "0" &&
+    statusValue(runtimeEnv?.dockerSocketGidStatus) === "pass" &&
+    Number.isSafeInteger(numberValue(runtimeEnv?.dockerSocketGid)) &&
+    Number(numberValue(runtimeEnv?.dockerSocketGid)) >= 0;
 }
 
 function firstNestedObject(candidate: Record<string, unknown> | undefined, paths: string[][]) {
@@ -806,6 +1151,72 @@ function ingressApiRateLimitEvidence(ingress: Record<string, unknown> | undefine
     ["selectedEvidence", "rateLimit"],
     ["rateLimit"]
   ]);
+}
+
+function ingressMetricsAccessControlEvidence(ingress: Record<string, unknown> | undefined) {
+  return firstNestedObject(ingress, [
+    ["selectedEvidence", "metricsAccessControl"],
+    ["selectedEvidence", "metricsPrivateScrape"],
+    ["metricsAccessControl"],
+    ["metricsPrivateScrape"]
+  ]);
+}
+
+function observabilityMetricsScrapeEvidence(observability: Record<string, unknown> | undefined) {
+  return firstNestedObject(observability, [
+    ["selectedEvidence", "metricsScrape"],
+    ["selectedEvidence", "metrics"],
+    ["metricsScrape"],
+    ["metrics"]
+  ]);
+}
+
+function metricsPrivateScrapeExceptionActive(runtimeEnv: Record<string, unknown> | undefined) {
+  return runtimeEnv?.unauthenticatedMetricsAllowed === true &&
+    (
+      runtimeEnv.metricsTokenConfigured !== true ||
+        statusValue(runtimeEnv.metricsTokenStrengthStatus) === "skipped"
+    );
+}
+
+function metricsPrivateScrapeProtectionAllowed(candidate: Record<string, unknown> | undefined) {
+  const protection = normalizedToken(candidate?.protection) ??
+    normalizedToken(candidate?.accessControl) ??
+    normalizedToken(candidate?.networkProtection);
+
+  return Boolean(protection && allowedMetricsPrivateScrapeProtections.has(protection));
+}
+
+function metricsScrapePath(candidate: Record<string, unknown> | undefined) {
+  return stringValue(candidate?.scrapePath) ?? stringValue(candidate?.path) ?? stringValue(candidate?.endpoint);
+}
+
+function metricsPublicAccessBlocked(candidate: Record<string, unknown> | undefined) {
+  return booleanEvidenceValue(candidate, [
+    "publicAccessBlocked",
+    "noPublicUnauthenticatedAccess",
+    "publicUnauthenticatedAccessBlocked"
+  ]) === true;
+}
+
+function metricsPrivateScrapeExceptionBound(
+  runtimeEnv: Record<string, unknown> | undefined,
+  observability: Record<string, unknown> | undefined,
+  ingress: Record<string, unknown> | undefined
+) {
+  if (!metricsPrivateScrapeExceptionActive(runtimeEnv)) {
+    return true;
+  }
+
+  const metricsScrape = observabilityMetricsScrapeEvidence(observability);
+  const metricsAccessControl = ingressMetricsAccessControlEvidence(ingress);
+
+  return metricsScrape?.privateScrapeException === true &&
+    metricsAccessControl?.privateScrapeException === true &&
+    metricsScrapePath(metricsAccessControl) === "/metrics" &&
+    metricsPrivateScrapeProtectionAllowed(metricsAccessControl) &&
+    metricsPublicAccessBlocked(metricsAccessControl) &&
+    checkArrayIncludesPassedNames(ingress, requiredMetricsPrivateScrapeIngressChecks);
 }
 
 function topologyPositiveIntegerCount(topology: Record<string, unknown>, keys: string[]) {
@@ -1102,8 +1513,6 @@ function selectedCommitRef(
   return (
     options.commitRef ??
     releaseCommitValue(root) ??
-    stringValue(root?.commitRef) ??
-    stringValue(root?.commitSha) ??
     stringValue(promotion?.commitRef) ??
     stringValue(nestedValue(promotion, ["commitStatus", "commitRef"]))
   );
@@ -1119,7 +1528,6 @@ function selectedRepository(
   return (
     options.repo ??
     stringValue(release?.repository) ??
-    stringValue(root?.repository) ??
     stringValue(promotion?.repository) ??
     stringValue(nestedValue(promotion, ["commitStatus", "repository"])) ??
     stringValue(nestedValue(promotion, ["branchProtection", "repository"]))
@@ -1136,7 +1544,6 @@ function selectedBranch(
   return (
     options.branch ??
     stringValue(release?.branch) ??
-    stringValue(root?.branch) ??
     stringValue(promotion?.branch) ??
     stringValue(nestedValue(promotion, ["branchProtection", "branch"]))
   );
@@ -1151,9 +1558,92 @@ function hostBuildExceptionAccepted(root: Record<string, unknown> | undefined, o
 }
 
 function dockerSocketProfileAccepted(root: Record<string, unknown> | undefined) {
+  return nestedValue(root, ["release", "dockerSocketProfileAccepted"]) === true;
+}
+
+function bundleAttestation(root: Record<string, unknown> | undefined) {
+  return nestedObject(root, "attestation");
+}
+
+function bundleAttestationSubjectMatches(
+  attestation: Record<string, unknown> | undefined,
+  root: Record<string, unknown> | undefined,
+  releaseCommitRef: string | undefined,
+  repository: string | undefined,
+  branch: string | undefined,
+  targetEnvironment: string | undefined
+) {
+  const subject = nestedObject(attestation, "subject");
+
   return Boolean(
-    root?.dockerSocketProfileAccepted === true ||
-      nestedValue(root, ["release", "dockerSocketProfileAccepted"]) === true
+    subject &&
+      stringValue(subject.schemaVersion) === stringValue(root?.schemaVersion) &&
+      stringValue(subject.name) === stringValue(root?.name) &&
+      stringValue(subject.commitRef) === releaseCommitRef &&
+      stringValue(subject.repository) === repository &&
+      stringValue(subject.branch) === branch &&
+      stringValue(subject.targetEnvironment) === targetEnvironment
+  );
+}
+
+function bundleAttestationTrusted(
+  attestation: Record<string, unknown> | undefined,
+  root: Record<string, unknown> | undefined,
+  releaseCommitRef: string | undefined,
+  repository: string | undefined,
+  branch: string | undefined,
+  targetEnvironment: string | undefined
+) {
+  return Boolean(
+    attestation &&
+      stringValue(attestation.type) === expectedBundleAttestationType &&
+      stringValue(attestation.issuer) === expectedBundleAttestationIssuer &&
+      stringValue(attestation.payloadDigestAlgorithm) === "sha256" &&
+      sha256DigestPattern.test(stringValue(attestation.payloadDigest) ?? "") &&
+      stringValue(attestation.canonicalization) === expectedBundleAttestationCanonicalization &&
+      timestampValue(attestation.attestedAt) &&
+      bundleAttestationSubjectMatches(attestation, root, releaseCommitRef, repository, branch, targetEnvironment)
+  );
+}
+
+function bundleAttestationDigestMatches(
+  attestation: Record<string, unknown> | undefined,
+  root: Record<string, unknown> | undefined
+) {
+  return Boolean(
+    attestation &&
+      root &&
+      stringValue(attestation.payloadDigest) === releaseEvidenceBundlePayloadDigest(root)
+  );
+}
+
+function bundleAttestationSignatureMatches(
+  attestation: Record<string, unknown> | undefined,
+  attestationSigningKey: string | undefined,
+  requiredAttestationKeyId: string | undefined
+) {
+  if (
+    !attestation ||
+      !attestationSigningKey ||
+      stringValue(attestation.signatureAlgorithm) !== expectedBundleAttestationSignatureAlgorithm
+  ) {
+    return false;
+  }
+
+  const signatureKeyId = stringValue(attestation.signatureKeyId);
+  const signature = stringValue(attestation.signature);
+
+  if (!signatureKeyId || !signature || !sha256DigestPattern.test(signature)) {
+    return false;
+  }
+
+  if (requiredAttestationKeyId && signatureKeyId !== requiredAttestationKeyId) {
+    return false;
+  }
+
+  return constantTimeEqual(
+    signature,
+    hmacSha256Signature(releaseEvidenceBundleAttestationSigningPayload(attestation), attestationSigningKey)
   );
 }
 
@@ -1195,6 +1685,7 @@ export function evaluateReleaseEvidenceBundle(
     "maxEvidenceAgeHours"
   );
   const root = evidenceRootObject(rawEvidence);
+  const payloadDigest = root ? releaseEvidenceBundlePayloadDigest(root) : null;
   const bundleCheckedAt = timestampValue(root?.checkedAt);
   const releaseGateAttachmentEvidence = releaseGateAttachment(root);
   const dockerBuildAttachmentEvidence = dockerBuildRehearsalAttachment(root);
@@ -1211,6 +1702,7 @@ export function evaluateReleaseEvidenceBundle(
   const upgradeRollbackAttachmentEvidence = upgradeRollbackAttachment(root);
   const releaseGate = releaseGateAttachmentEvidence.evidence;
   const promotion = promotionEvidence(releaseGate);
+  const release = releaseMetadata(root);
   const dockerBuild = dockerBuildAttachmentEvidence.evidence;
   const postgres = postgresAttachmentEvidence.evidence;
   const artifact = artifactAttachmentEvidence.evidence;
@@ -1221,22 +1713,28 @@ export function evaluateReleaseEvidenceBundle(
   const backup = backupAttachmentEvidence.evidence;
   const observability = observabilityAttachmentEvidence.evidence;
   const operatorAccess = operatorAccessAttachmentEvidence.evidence;
+  const operatorAccessSelectedEvidence = nestedObject(operatorAccess, "selectedEvidence");
   const nonSessionCredential = nonSessionCredentialAttachmentEvidence.evidence;
+  const nonSessionCredentialSelectedEvidence = nestedObject(nonSessionCredential, "selectedEvidence");
   const ingress = ingressAttachmentEvidence.evidence;
+  const ingressSelectedEvidence = nestedObject(ingress, "selectedEvidence");
   const upgradeRollback = upgradeRollbackAttachmentEvidence.evidence;
   const ingressTopologyRateLimit = ingressTopologyRateLimitEvidencePassed(ingress);
   const releaseCommitRef = selectedCommitRef(root, promotion, options);
   const repository = selectedRepository(root, promotion, options);
   const branch = selectedBranch(root, promotion, options);
   const rootTargetEnvironment = stringValue(root?.targetEnvironment);
-  const releaseTargetEnvironment = stringValue(nestedValue(root, ["release", "targetEnvironment"]));
+  const releaseTargetEnvironment = stringValue(release?.targetEnvironment);
   const expectedTargetEnvironment = stringValue(options.targetEnvironment);
+  const attestationTargetEnvironment = expectedTargetEnvironment ?? rootTargetEnvironment ?? releaseTargetEnvironment;
+  const releaseBundleAttestation = bundleAttestation(root);
+  const releaseBundleAttestationPresent = Boolean(releaseBundleAttestation);
+  const releaseBundleAttestationRequired = attestationTargetEnvironment === "production" && !options.allowMissingAttestation;
+  const releaseBundleAttestationSignatureRequired = attestationTargetEnvironment === "production" && releaseBundleAttestationPresent;
   const secretFindings = scanEvidenceForRawSecrets(rawEvidence);
   const commitRefs = uniqueStrings([
     releaseCommitRef,
     releaseCommitValue(root),
-    stringValue(root?.commitRef),
-    stringValue(root?.commitSha),
     stringValue(promotion?.commitRef),
     stringValue(nestedValue(promotion, ["commitStatus", "commitRef"])),
     releaseGateAttachmentEvidence.releaseCommit,
@@ -1267,7 +1765,6 @@ export function evaluateReleaseEvidenceBundle(
   const repositories = uniqueStrings([
     repository,
     releaseRepositoryValue(root),
-    stringValue(root?.repository),
     stringValue(promotion?.repository),
     stringValue(nestedValue(promotion, ["commitStatus", "repository"])),
     stringValue(nestedValue(promotion, ["branchProtection", "repository"])),
@@ -1286,7 +1783,6 @@ export function evaluateReleaseEvidenceBundle(
   const branches = uniqueStrings([
     branch,
     releaseBranchValue(root),
-    stringValue(root?.branch),
     stringValue(promotion?.branch),
     stringValue(nestedValue(promotion, ["branchProtection", "branch"])),
     evidenceBranchValue(dockerBuild),
@@ -1301,7 +1797,7 @@ export function evaluateReleaseEvidenceBundle(
     evidenceBranchValue(upgradeRollback)
   ]);
   const requiredStatusCheck = stringValue(promotion?.requiredStatusCheck);
-  const releaseRequiredStatusCheck = stringValue(releaseMetadata(root)?.requiredStatusCheck) ?? requiredStatusCheck;
+  const releaseRequiredStatusCheck = stringValue(release?.requiredStatusCheck);
   const protectedChecks = nestedValue(promotion, ["branchProtection", "requiredStatusChecks"]);
   const protectedBranchCommit = nestedObject(promotion, "protectedBranchCommit");
   const runtimeEnv = nestedObject(promotion, "runtimeEnv");
@@ -1324,6 +1820,35 @@ export function evaluateReleaseEvidenceBundle(
   const ingressCheckedAt = timestampValue(ingress?.checkedAt);
   const upgradeRollbackCheckedAt = timestampValue(upgradeRollback?.checkedAt);
   const dashboardTimestamp = timestampValue(nestedValue(observability, ["selectedEvidence", "dashboard", "timestamp"]));
+  const releaseBundleAttestationIsTrusted = bundleAttestationTrusted(
+    releaseBundleAttestation,
+    root,
+    releaseCommitRef,
+    repository,
+    branch,
+    rootTargetEnvironment
+  );
+  const releaseBundleAttestationDigestMatches = bundleAttestationDigestMatches(releaseBundleAttestation, root);
+  const releaseBundleAttestationSignatureMatches = bundleAttestationSignatureMatches(
+    releaseBundleAttestation,
+    options.attestationSigningKey,
+    options.requiredAttestationKeyId
+  );
+  const nonFinalAttachmentFindings = nonFinalEvidenceFindings([
+    { label: "release-gate", evidence: releaseGate },
+    { label: "docker build rehearsal", evidence: dockerBuild },
+    { label: "postgres rehearsal", evidence: postgres },
+    { label: "release artifact", evidence: artifact },
+    { label: "release image", evidence: releaseImage },
+    { label: "target runtime", evidence: targetRuntime },
+    { label: "source provider", evidence: sourceProvider },
+    { label: "backup", evidence: backup },
+    { label: "observability", evidence: observability },
+    { label: "operator access", evidence: operatorAccess },
+    { label: "non-session credential", evidence: nonSessionCredential },
+    { label: "ingress", evidence: ingress },
+    { label: "upgrade/rollback drill", evidence: upgradeRollback }
+  ]);
   const checks: ReleaseEvidenceBundleCheck[] = [];
 
   addCheck(checks, "bundle_shape", Boolean(root), "Release evidence bundle must be a JSON object.");
@@ -1341,11 +1866,34 @@ export function evaluateReleaseEvidenceBundle(
   );
   addCheck(
     checks,
+    "release_metadata",
+    Boolean(
+      release &&
+        stringValue(release.commitRef) &&
+        stringValue(release.repository) &&
+        stringValue(release.branch) &&
+        stringValue(release.requiredStatusCheck) &&
+        stringValue(release.targetEnvironment) &&
+        stringValue(release.operatorName) &&
+        (stringValue(release.releaseTicket) || stringValue(release.ticketId))
+    ),
+    "Release evidence bundle must include canonical release metadata with commitRef, repository, branch, requiredStatusCheck, targetEnvironment, operatorName, and releaseTicket."
+  );
+  addCheck(
+    checks,
     "bundle_no_sensitive_evidence_values",
     secretFindings.length === 0,
     secretFindings.length === 0
       ? "Release evidence bundle must not include raw secret-like values."
       : `Release evidence bundle includes raw secret-like values: ${evidenceSecretFindingSummary(secretFindings)}.`
+  );
+  addCheck(
+    checks,
+    "bundle_attachments_final_evidence",
+    nonFinalAttachmentFindings.length === 0,
+    nonFinalAttachmentFindings.length === 0
+      ? "Release evidence bundle attachments must be final target evidence."
+      : `Release evidence bundle attachments must not include template, dry-run, blocked, failed, or todo evidence: ${nonFinalAttachmentFindings.join(", ")}.`
   );
   addCheck(
     checks,
@@ -1364,6 +1912,30 @@ export function evaluateReleaseEvidenceBundle(
     expectedTargetEnvironment
       ? `Release evidence bundle targetEnvironment must be ${expectedTargetEnvironment}.`
       : "Release evidence bundle must include targetEnvironment and any release targetEnvironment must match it."
+  );
+  addCheck(
+    checks,
+    "bundle_attestation_required",
+    !releaseBundleAttestationRequired || releaseBundleAttestationPresent,
+    "Production release evidence bundle must include compose-generated attestation metadata unless --allow-missing-attestation is explicitly accepted."
+  );
+  addCheck(
+    checks,
+    "bundle_attestation_trusted",
+    !releaseBundleAttestationPresent || releaseBundleAttestationIsTrusted,
+    "Release evidence bundle attestation must be generated by siteflow-release-evidence-bundle-compose and bind schema, release identity, and target environment."
+  );
+  addCheck(
+    checks,
+    "bundle_attestation_digest",
+    !releaseBundleAttestationPresent || releaseBundleAttestationDigestMatches,
+    "Release evidence bundle attestation payloadDigest must match the current canonical bundle payload without attestation."
+  );
+  addCheck(
+    checks,
+    "bundle_attestation_signature",
+    !releaseBundleAttestationSignatureRequired || releaseBundleAttestationSignatureMatches,
+    "Production release evidence bundle attestation must include a valid hmac-sha256 signature verified with the configured signing key."
   );
   addCheck(
     checks,
@@ -1392,6 +1964,12 @@ export function evaluateReleaseEvidenceBundle(
     "release_gate_passed",
     statusValue(releaseGate?.status) === "pass" && statusValue(promotion?.gateStatus) === "pass",
     "Release gate status and promotionEvidence.gateStatus must both be pass."
+  );
+  addCheck(
+    checks,
+    "release_gate_checks_passed",
+    checkArrayAllPassed(releaseGate),
+    "Release gate evidence must include non-empty checks and all release gate check rows must pass."
   );
   addCheck(checks, "promotion_mode", promotion?.promotion === true, "Release gate evidence must be from promotion mode.");
   addCheck(
@@ -1818,7 +2396,13 @@ export function evaluateReleaseEvidenceBundle(
     checks,
     "release_image_attestation_subject",
     releaseImageAttestationSubjectPassed(releaseImage),
-    "Release image attestation evidence must be inspected from the registry and bound to the published image digest."
+    "Release image provenance and SBOM attestation subjects must be inspected from the registry and bound to the published image digest."
+  );
+  addCheck(
+    checks,
+    "release_image_attestation_no_failed_checks",
+    releaseImageAttestationNoFailedChecksPassed(releaseImage),
+    "Release image attestation evidence must not contain unresolved or failed provenance/SBOM inspection checks."
   );
   addCheck(
     checks,
@@ -1828,9 +2412,27 @@ export function evaluateReleaseEvidenceBundle(
   );
   addCheck(
     checks,
+    "release_image_provenance_statement",
+    releaseImageProvenanceStatementPassed(releaseImage),
+    "Release image provenance evidence must include an inspected in-toto statement digest, published-image subject digest, builder identity, and materials."
+  );
+  addCheck(
+    checks,
+    "release_image_provenance_source_identity",
+    releaseImageProvenanceSourceIdentityPassed(releaseImage, releaseCommitRef, repository, branch),
+    "Release image provenance source repository, commit, and ref must match the release image identity."
+  );
+  addCheck(
+    checks,
     "release_image_sbom_attestation",
     releaseImageSbomAttestationPassed(releaseImage),
     "Release image evidence must include a present SPDX or CycloneDX SBOM attestation manifest digest."
+  );
+  addCheck(
+    checks,
+    "release_image_sbom_statement",
+    releaseImageSbomStatementPassed(releaseImage),
+    "Release image SBOM evidence must include an inspected attestation statement digest bound to the published image digest."
   );
   addCheck(
     checks,
@@ -1876,7 +2478,9 @@ export function evaluateReleaseEvidenceBundle(
         stringValue(nestedValue(targetRuntime, ["selectedEvidence", "commitRef"])) &&
         stringValue(nestedValue(targetRuntime, ["selectedEvidence", "repository"])) &&
         stringValue(nestedValue(targetRuntime, ["selectedEvidence", "branch"])) &&
+        selectedEvidenceSummaryPassed(targetRuntimeSelectedEvidence, "targetIdentity") &&
         selectedEvidenceSummaryPassed(targetRuntimeSelectedEvidence, "composeConfig") &&
+        selectedEvidenceSummaryPassed(targetRuntimeSelectedEvidence, "workerRuntimePosture") &&
         selectedEvidenceSummaryPassed(targetRuntimeSelectedEvidence, "startup") &&
         selectedEvidenceSummaryPassed(targetRuntimeSelectedEvidence, "serviceHealth") &&
         selectedEvidenceSummaryPassed(targetRuntimeSelectedEvidence, "readiness") &&
@@ -1884,7 +2488,7 @@ export function evaluateReleaseEvidenceBundle(
         selectedEvidenceSummaryPassed(targetRuntimeSelectedEvidence, "restartSmoke") &&
         selectedEvidenceSummaryPassed(targetRuntimeSelectedEvidence, "logSanity")
     ),
-    "Target runtime evidence output must include selected target, release, and timestamped summaries for Compose config, startup, health, readiness, image binding, restart, and log sanity evidence."
+    "Target runtime evidence output must include selected target, release, and timestamped summaries for target identity, Compose config, worker runtime posture, startup, health, readiness, image binding, restart, and log sanity evidence."
   );
   addCheck(
     checks,
@@ -1909,7 +2513,7 @@ export function evaluateReleaseEvidenceBundle(
     checks,
     "target_runtime_required_checks",
     checkArrayIncludesPassedNames(targetRuntime, requiredTargetRuntimeEvidenceCheckNames),
-    "Target runtime evidence output must include passed checks for Compose config, startup, service health, readiness, image binding, restart smoke, log sanity, redaction, operator, and ticket evidence."
+    "Target runtime evidence output must include passed checks for target identity, Compose config, startup, service health, readiness, image binding, restart smoke, log sanity, redaction, operator, and ticket evidence."
   );
   addCheck(
     checks,
@@ -1949,15 +2553,8 @@ export function evaluateReleaseEvidenceBundle(
   addCheck(
     checks,
     "source_provider_selected_evidence",
-    Boolean(
-      stringValue(nestedValue(sourceProvider, ["selectedEvidence", "environment"])) &&
-        stringValue(nestedValue(sourceProvider, ["selectedEvidence", "commitRef"])) &&
-        stringValue(nestedValue(sourceProvider, ["selectedEvidence", "repository"])) &&
-        stringValue(nestedValue(sourceProvider, ["selectedEvidence", "branch"])) &&
-        stringValue(nestedValue(sourceProvider, ["selectedEvidence", "provider"])) &&
-        stringValue(nestedValue(sourceProvider, ["selectedEvidence", "webhookDeliveryId"]))
-    ),
-    "Source provider evidence output must include selected environment, release identity, provider, and signed webhook delivery evidence."
+    sourceProviderSelectedEvidencePassed(nestedObject(sourceProvider, "selectedEvidence"), releaseCommitRef, repository, branch),
+    "Source provider evidence output must include selected environment, release identity, provider, and timestamped checkout, signed webhook, deploy-key, host-key, and provenance summaries."
   );
   addCheck(
     checks,
@@ -1996,6 +2593,31 @@ export function evaluateReleaseEvidenceBundle(
   );
   addCheck(
     checks,
+    "backup_name",
+    backup?.name === "siteflow-backup-evidence-check",
+    "Backup evidence output must be from siteflow-backup-evidence-check."
+  );
+  addCheck(
+    checks,
+    "backup_release_identity",
+    Boolean(
+      releaseCommitRef &&
+        repository &&
+        branch &&
+        evidenceCommitValue(backup) === releaseCommitRef &&
+        evidenceRepositoryValue(backup) === repository &&
+        evidenceBranchValue(backup) === branch
+    ),
+    "Backup evidence output must be bound to the release commit, repository, and branch."
+  );
+  addCheck(
+    checks,
+    "backup_target_environment",
+    Boolean(rootTargetEnvironment && evidenceTargetEnvironmentValue(backup) === rootTargetEnvironment),
+    "Backup evidence targetEnvironment must match the release bundle targetEnvironment."
+  );
+  addCheck(
+    checks,
     "backup_off_host_required",
     nestedValue(backup, ["thresholds", "requireOffHost"]) === true,
     "Backup evidence must have been checked with requireOffHost: true."
@@ -2003,13 +2625,8 @@ export function evaluateReleaseEvidenceBundle(
   addCheck(
     checks,
     "backup_selected_evidence",
-    Boolean(nestedObject(nestedObject(backup, "selectedEvidence"), "backupVerify") &&
-      nestedObject(nestedObject(backup, "selectedEvidence"), "restoreDrill") &&
-      nestedObject(nestedObject(backup, "selectedEvidence"), "backupOffload") &&
-      nestedObject(nestedObject(backup, "selectedEvidence"), "backupFetch") &&
-      nestedObject(nestedObject(backup, "selectedEvidence"), "backupProviderSecurityAudit") &&
-      nestedObject(nestedObject(backup, "selectedEvidence"), "backupPrune")),
-    "Backup evidence output must include selected backup verify, restore-drill, offload, fetch, provider security audit, and prune evidence."
+    backupSelectedEvidencePassed(nestedObject(backup, "selectedEvidence")),
+    "Backup evidence output must include timestamped selected backup verify, restore-drill, offload, fetch, provider security audit, and non-dry-run prune summaries."
   );
   addCheck(
     checks,
@@ -2039,6 +2656,12 @@ export function evaluateReleaseEvidenceBundle(
     "observability_passed",
     statusValue(observability?.status) === "passed" && observability?.exitCode === 0 && checkArrayAllPassed(observability),
     "Observability evidence checker output must be passed with all checks passing."
+  );
+  addCheck(
+    checks,
+    "observability_name",
+    observability?.name === "siteflow-observability-evidence-check",
+    "Observability evidence output must be from siteflow-observability-evidence-check."
   );
   addCheck(
     checks,
@@ -2079,7 +2702,7 @@ export function evaluateReleaseEvidenceBundle(
   addCheck(
     checks,
     "observability_required_checks",
-    checkArrayIncludesPassedNames(observability, requiredObservabilityEvidenceChecks),
+    checkArrayIncludesPassedNames(observability, requiredObservabilityEvidenceCheckNames),
     "Observability evidence output must include passed checks for readiness, metrics, backup automation history, scheduler ownership, apply proof, alert, dashboard, and log redaction evidence."
   );
   addCheck(
@@ -2126,17 +2749,9 @@ export function evaluateReleaseEvidenceBundle(
         stringValue(nestedValue(operatorAccess, ["selectedEvidence", "commitRef"])) &&
         stringValue(nestedValue(operatorAccess, ["selectedEvidence", "repository"])) &&
         stringValue(nestedValue(operatorAccess, ["selectedEvidence", "branch"])) &&
-        nestedObject(nestedObject(operatorAccess, "selectedEvidence"), "sessionCreate") &&
-        nestedObject(nestedObject(operatorAccess, "selectedEvidence"), "projectScope") &&
-        nestedObject(nestedObject(operatorAccess, "selectedEvidence"), "sessionRotation") &&
-        nestedObject(nestedObject(operatorAccess, "selectedEvidence"), "sessionRevoke") &&
-        nestedObject(nestedObject(operatorAccess, "selectedEvidence"), "csrf") &&
-        nestedObject(nestedObject(operatorAccess, "selectedEvidence"), "bearerPrecedence") &&
-        nestedObject(nestedObject(operatorAccess, "selectedEvidence"), "actorAttribution") &&
-        nestedObject(nestedObject(operatorAccess, "selectedEvidence"), "browserTokenFallback") &&
-        nestedObject(nestedObject(operatorAccess, "selectedEvidence"), "emergencyCutoff")
+        operatorAccessSelectedEvidencePassed(operatorAccessSelectedEvidence)
     ),
-    "Operator access evidence output must include selected target, release, session creation, rotation, scope, CSRF, Bearer precedence, actor, browser token fallback, and emergency cutoff evidence."
+    "Operator access evidence output must include selected target/release metadata and passed timestamped session, scope, CSRF, Bearer precedence, actor, browser token fallback, and emergency cutoff summaries."
   );
   addCheck(
     checks,
@@ -2187,11 +2802,9 @@ export function evaluateReleaseEvidenceBundle(
         stringValue(nestedValue(nonSessionCredential, ["selectedEvidence", "commitRef"])) &&
         stringValue(nestedValue(nonSessionCredential, ["selectedEvidence", "repository"])) &&
         stringValue(nestedValue(nonSessionCredential, ["selectedEvidence", "branch"])) &&
-        Array.isArray(nestedValue(nonSessionCredential, ["selectedEvidence", "credentialTypes"])) &&
-        Number(nestedValue(nonSessionCredential, ["selectedEvidence", "credentialCount"])) > 0 &&
-        nestedObject(nestedObject(nonSessionCredential, "selectedEvidence"), "breakGlass")
+        nonSessionCredentialSelectedEvidencePassed(nonSessionCredentialSelectedEvidence)
     ),
-    "Non-session credential evidence output must include selected target, release, credential types/count, and break-glass evidence."
+    "Non-session credential evidence output must include selected target/release metadata, credential types/count, and passed timestamped break-glass summary."
   );
   addCheck(
     checks,
@@ -2242,14 +2855,11 @@ export function evaluateReleaseEvidenceBundle(
         stringValue(nestedValue(ingress, ["selectedEvidence", "publicBaseUrl"])) &&
         stringValue(nestedValue(ingress, ["selectedEvidence", "commitRef"])) &&
         stringValue(nestedValue(ingress, ["selectedEvidence", "repository"])) &&
-        stringValue(nestedValue(ingress, ["selectedEvidence", "branch"])) &&
+      stringValue(nestedValue(ingress, ["selectedEvidence", "branch"])) &&
         stringValue(nestedValue(ingress, ["selectedEvidence", "trustProxyPolicy"])) &&
-        nestedObject(nestedObject(ingress, "selectedEvidence"), "directApiPort") &&
-        nestedObject(nestedObject(ingress, "selectedEvidence"), "forwardedHeaders") &&
-        nestedObject(nestedObject(ingress, "selectedEvidence"), "apiRateLimit") &&
-        nestedObject(nestedObject(ingress, "selectedEvidence"), "unthrottledRoutes")
+        ingressSelectedEvidencePassed(ingressSelectedEvidence)
     ),
-    "Ingress evidence output must include selected target, release, proxy, direct-port, forwarded-header, rate-limit, and non-API route evidence."
+    "Ingress evidence output must include selected target/release metadata and passed timestamped proxy, direct-port, forwarded-header, rate-limit, and non-API route summaries."
   );
   addCheck(
     checks,
@@ -2280,6 +2890,12 @@ export function evaluateReleaseEvidenceBundle(
     "ingress_age",
     freshTimestamp(timestampValue(ingress?.checkedAt), now, maxEvidenceAgeHours),
     `Ingress evidence check output must be no older than ${maxEvidenceAgeHours} hours.`
+  );
+  addCheck(
+    checks,
+    "metrics_private_scrape_exception_bound",
+    metricsPrivateScrapeExceptionBound(runtimeEnv, observability, ingress),
+    "Runtime private-scrape metrics exceptions must be backed by observability privateScrapeException evidence and ingress metricsAccessControl proof for a non-public /metrics scrape path."
   );
 
   addCheck(checks, "upgrade_rollback_present", Boolean(upgradeRollback), "Upgrade/rollback drill evidence checker output must be present.");
@@ -2313,15 +2929,8 @@ export function evaluateReleaseEvidenceBundle(
   addCheck(
     checks,
     "upgrade_rollback_selected_evidence",
-    Boolean(
-      stringValue(nestedValue(upgradeRollback, ["selectedEvidence", "targetEnvironment"])) &&
-      stringValue(nestedValue(upgradeRollback, ["selectedEvidence", "fromVersion"])) &&
-        stringValue(nestedValue(upgradeRollback, ["selectedEvidence", "toVersion"])) &&
-        stringValue(nestedValue(upgradeRollback, ["selectedEvidence", "rollbackVersion"])) &&
-        stringValue(nestedValue(upgradeRollback, ["selectedEvidence", "upgradeOperationId"])) &&
-        stringValue(nestedValue(upgradeRollback, ["selectedEvidence", "rollbackOperationId"]))
-    ),
-    "Upgrade/rollback drill evidence output must include selected target environment, version pair, and operation ids."
+    upgradeRollbackSelectedEvidencePassed(nestedObject(upgradeRollback, "selectedEvidence"), releaseCommitRef, repository, branch, rootTargetEnvironment),
+    "Upgrade/rollback drill evidence output must include selected target environment, version pair, distinct operation ids, and timestamped backup, route, readiness, and observability summaries."
   );
   addCheck(
     checks,
@@ -2339,18 +2948,13 @@ export function evaluateReleaseEvidenceBundle(
   addCheck(
     checks,
     "operator",
-    Boolean(stringValue(root?.operatorName) ?? stringValue(nestedValue(root, ["release", "operatorName"]))),
+    Boolean(stringValue(release?.operatorName)),
     "Release evidence bundle must include the release operator name."
   );
   addCheck(
     checks,
     "ticket",
-    Boolean(
-      stringValue(root?.releaseTicket) ??
-        stringValue(root?.ticketId) ??
-        stringValue(nestedValue(root, ["release", "ticketId"])) ??
-        stringValue(nestedValue(root, ["release", "releaseTicket"]))
-    ),
+    Boolean(stringValue(release?.ticketId) ?? stringValue(release?.releaseTicket)),
     "Release evidence bundle must include a release or incident ticket id."
   );
 
@@ -2361,9 +2965,11 @@ export function evaluateReleaseEvidenceBundle(
     status: passed ? "passed" : "blocked",
     checkedAt: now.toISOString(),
     evidencePath: options.evidencePath,
+    payloadDigest,
     thresholds: {
       maxEvidenceAgeHours,
-      allowHostBuildException: Boolean(options.allowHostBuildException)
+      allowHostBuildException: Boolean(options.allowHostBuildException),
+      ...(options.allowMissingAttestation ? { allowMissingAttestation: true } : {})
     },
     selectedEvidence: {
       releaseCommitRef: releaseCommitRef ?? null,
@@ -2401,7 +3007,8 @@ export function parseReleaseEvidenceBundleArgs(args: string[]): ParsedArgs {
     json: false,
     help: false,
     maxEvidenceAgeHours: defaultMaxEvidenceAgeHours,
-    allowHostBuildException: false
+    allowHostBuildException: false,
+    allowMissingAttestation: false
   };
 
   for (let index = 0; index < args.length; index += 1) {
@@ -2421,6 +3028,16 @@ export function parseReleaseEvidenceBundleArgs(args: string[]): ParsedArgs {
       parsed.maxEvidenceAgeHours = Number(args[++index]);
     } else if (arg === "--allow-host-build-exception") {
       parsed.allowHostBuildException = true;
+    } else if (arg === "--allow-missing-attestation") {
+      parsed.allowMissingAttestation = true;
+    } else if (arg === "--attestation-key-env") {
+      parsed.attestationKeyEnv = args[++index];
+    } else if (arg === "--attestation-key-file") {
+      parsed.attestationKeyFile = args[++index];
+    } else if (arg === "--required-attestation-key-id-env" || arg === "--attestation-key-id-env") {
+      parsed.requiredAttestationKeyIdEnv = args[++index];
+    } else if (arg === "--required-attestation-key-id" || arg === "--attestation-key-id") {
+      parsed.requiredAttestationKeyId = args[++index];
     } else if (arg === "--json") {
       parsed.json = true;
     } else if (arg === "--help" || arg === "-h") {
@@ -2451,9 +3068,45 @@ export function releaseEvidenceBundleUsage() {
     "  --target-environment <name>       Require the target environment label.",
     `  --max-evidence-age-hours <hours>  Maximum age for rehearsal/checker outputs. Default: ${defaultMaxEvidenceAgeHours}.`,
     "  --allow-host-build-exception      Accept a recorded production host-build trust exception.",
+    "  --allow-missing-attestation       Explicitly allow a production bundle without compose-generated attestation metadata.",
+    "  --attestation-key-env <name>      Read the release evidence attestation HMAC key from an environment variable.",
+    "  --attestation-key-file <file>     Read the release evidence attestation HMAC key from a file.",
+    "  --attestation-key-id-env <name>   Read the required non-secret signing key id from an environment variable.",
+    "  --attestation-key-id <id>         Require the signed attestation key id.",
     "  --json                           Emit a single JSON result.",
     "  --help                           Show this help."
   ].join("\n");
+}
+
+function envSecretValue(envName: string | undefined) {
+  const value = envName ? process.env[envName]?.trim() : undefined;
+
+  return value || undefined;
+}
+
+async function fileSecretValue(filePath: string | undefined) {
+  if (!filePath) {
+    return undefined;
+  }
+
+  const value = (await readFile(filePath, "utf8")).replace(/[\r\n]+$/g, "");
+
+  return value.trim() ? value : undefined;
+}
+
+async function resolveAttestationSigningKey(
+  parsed: ParsedArgs,
+  baseOptions: Partial<ReleaseEvidenceBundleCheckOptions>
+) {
+  const envKey = envSecretValue(parsed.attestationKeyEnv) ??
+    envSecretValue("SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY");
+
+  if (baseOptions.attestationSigningKey ?? envKey) {
+    return baseOptions.attestationSigningKey ?? envKey;
+  }
+
+  return await fileSecretValue(parsed.attestationKeyFile) ??
+    await fileSecretValue(process.env.SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE);
 }
 
 function writeHumanResult(result: ReleaseEvidenceBundleResult, io: CliIo) {
@@ -2489,6 +3142,11 @@ export async function runReleaseEvidenceBundleCheckCli(
   }
 
   try {
+    const attestationSigningKey = await resolveAttestationSigningKey(parsed, baseOptions);
+    const requiredAttestationKeyId = parsed.requiredAttestationKeyId ??
+      envSecretValue(parsed.requiredAttestationKeyIdEnv) ??
+      baseOptions.requiredAttestationKeyId ??
+      releaseEvidenceRequiredAttestationKeyIdFromEnv();
     const result = await runReleaseEvidenceBundleCheck({
       ...baseOptions,
       evidencePath: parsed.evidencePath!,
@@ -2497,7 +3155,10 @@ export async function runReleaseEvidenceBundleCheckCli(
       branch: parsed.branch,
       targetEnvironment: parsed.targetEnvironment,
       maxEvidenceAgeHours: parsed.maxEvidenceAgeHours,
-      allowHostBuildException: parsed.allowHostBuildException
+      allowHostBuildException: parsed.allowHostBuildException,
+      allowMissingAttestation: parsed.allowMissingAttestation,
+      attestationSigningKey,
+      requiredAttestationKeyId
     });
 
     if (parsed.json) {
@@ -2513,9 +3174,11 @@ export async function runReleaseEvidenceBundleCheckCli(
       status: "blocked",
       checkedAt: (baseOptions.now?.() ?? new Date()).toISOString(),
       evidencePath: parsed.evidencePath!,
+      payloadDigest: null,
       thresholds: {
         maxEvidenceAgeHours: parsed.maxEvidenceAgeHours,
-        allowHostBuildException: parsed.allowHostBuildException
+        allowHostBuildException: parsed.allowHostBuildException,
+        ...(parsed.allowMissingAttestation ? { allowMissingAttestation: true } : {})
       },
       selectedEvidence: {
         releaseCommitRef: null,

@@ -11,10 +11,21 @@ import { ReleaseConsolePage } from "./ReleaseConsolePage";
 import { RollbackConsolePage } from "./RollbackConsolePage";
 import { releaseRoutes } from "./releaseRoutes";
 
+const releaseEvidenceIdentity = {
+  commitRef: "abc123def456",
+  repository: "acme/siteflow",
+  branch: "main",
+  targetEnvironment: "production",
+  channel: "production",
+  deploymentId: "dep-healthy"
+};
 const releaseEvidenceBundle = {
   schemaVersion: "siteflow.releaseEvidence.v1",
   name: "siteflow-release-evidence-bundle",
-  targetEnvironment: "production"
+  targetEnvironment: releaseEvidenceIdentity.targetEnvironment,
+  channel: releaseEvidenceIdentity.channel,
+  deploymentId: releaseEvidenceIdentity.deploymentId,
+  release: releaseEvidenceIdentity
 };
 const releaseEvidenceCheck = {
   name: "siteflow-release-evidence-bundle-check",
@@ -23,9 +34,12 @@ const releaseEvidenceCheck = {
   evidencePath: "evidence/release-evidence.json",
   exitCode: 0,
   selectedEvidence: {
-    releaseCommitRef: "abc123def456",
-    repository: "acme/siteflow",
-    branch: "main",
+    releaseCommitRef: releaseEvidenceIdentity.commitRef,
+    repository: releaseEvidenceIdentity.repository,
+    branch: releaseEvidenceIdentity.branch,
+    targetEnvironment: releaseEvidenceIdentity.targetEnvironment,
+    channel: releaseEvidenceIdentity.channel,
+    deploymentId: releaseEvidenceIdentity.deploymentId,
     releaseGateStatus: "pass",
     dockerBuildRehearsalStatus: "passed",
     postgresRehearsalStatus: "passed",
@@ -47,10 +61,28 @@ const releaseEvidenceCheck = {
     }
   ]
 };
-const releaseEvidenceBundleText = JSON.stringify({
-  bundle: releaseEvidenceBundle,
-  check: releaseEvidenceCheck
-});
+
+function releaseEvidenceText({
+  bundle = releaseEvidenceBundle,
+  check = releaseEvidenceCheck
+}: {
+  bundle?: Record<string, unknown>;
+  check?: Record<string, unknown>;
+} = {}) {
+  return JSON.stringify({ bundle, check });
+}
+
+const releaseEvidenceBundleText = releaseEvidenceText();
+
+function releaseEvidenceCheckWithSelectedEvidence(selectedEvidence: Partial<typeof releaseEvidenceCheck.selectedEvidence>) {
+  return {
+    ...releaseEvidenceCheck,
+    selectedEvidence: {
+      ...releaseEvidenceCheck.selectedEvidence,
+      ...selectedEvidence
+    }
+  };
+}
 
 class RecordingReleaseClient extends FixtureSiteFlowClient {
   promoteCommands: PromoteDeploymentCommand[] = [];
@@ -209,6 +241,31 @@ describe("ReleaseConsolePage", () => {
         bundle: releaseEvidenceBundle
       }
     });
+  });
+
+  it.each([
+    ["release commit", releaseEvidenceCheckWithSelectedEvidence({ releaseCommitRef: "old-release-commit" }), "release commit"],
+    ["repository", releaseEvidenceCheckWithSelectedEvidence({ repository: "acme/stale-dashboard" }), "repository"],
+    ["branch", releaseEvidenceCheckWithSelectedEvidence({ branch: "release/old" }), "branch"],
+    ["target environment", releaseEvidenceCheckWithSelectedEvidence({ targetEnvironment: "staging" }), "target environment"],
+    ["channel", releaseEvidenceCheckWithSelectedEvidence({ channel: "staging" }), "channel"],
+    ["deployment", releaseEvidenceCheckWithSelectedEvidence({ deploymentId: "dep-stale" }), "deployment"]
+  ])("keeps production promotion disabled when checker selectedEvidence has mismatched %s", async (_label, check, mismatch) => {
+    renderReleasePage("healthy", "Ship verified dashboard build.");
+
+    const promoteButton = await screen.findByRole("button", {
+      name: /promote production from dep-acme-20260514-088 to dep-healthy and queue route apply/i
+    });
+
+    fireEvent.change(screen.getByLabelText("Release evidence path"), {
+      target: { value: "evidence/release-evidence.json" }
+    });
+    fireEvent.change(screen.getByLabelText("Release evidence bundle JSON"), {
+      target: { value: releaseEvidenceText({ check }) }
+    });
+
+    expect(screen.getAllByText(`Release evidence checker selected evidence must match bundle ${mismatch}.`).length).toBeGreaterThan(0);
+    expect(promoteButton).toBeDisabled();
   });
 
   it("keeps stale candidates disabled even with an audit reason", async () => {

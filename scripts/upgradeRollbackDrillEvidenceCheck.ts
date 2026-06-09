@@ -40,10 +40,45 @@ export interface UpgradeRollbackDrillEvidenceCheckResult {
     rollbackVersion: string | null;
     upgradeOperationId: string | null;
     rollbackOperationId: string | null;
+    backupEvidence: Record<string, unknown>;
+    routeUpgrade: Record<string, unknown>;
+    routeRollback: Record<string, unknown>;
+    readiness: Record<string, unknown>;
+    observability: Record<string, unknown>;
   };
   checks: UpgradeRollbackDrillEvidenceCheck[];
   exitCode: number;
 }
+
+export const requiredUpgradeRollbackDrillEvidenceCheckNames = [
+  "non_dry_run",
+  "not_template",
+  "status_final",
+  "no_sensitive_evidence_values",
+  "drill_age",
+  "drill_time_order",
+  "target_environment",
+  "release_identity",
+  "target_facts",
+  "version_pair",
+  "rollback_version",
+  "api_image_digests",
+  "worker_image_digests",
+  "service_rollback_digest",
+  "migration_versions",
+  "schema_rollback_compatibility",
+  "backup_evidence_passed",
+  "release_operations",
+  "route_upgrade",
+  "route_rollback_restores_previous_artifact",
+  "http_rollback_verification",
+  "readiness_evidence",
+  "metrics_evidence",
+  "logs_evidence",
+  "alert_evidence",
+  "operator",
+  "ticket"
+] as const;
 
 interface ParsedArgs {
   evidencePath?: string;
@@ -64,6 +99,7 @@ interface CliIo {
 const defaultMaxAgeHours = 168;
 const expectedSchemaVersion = "siteflow.upgradeRollbackDrill.v1";
 const expectedName = "siteflow-upgrade-rollback-drill";
+const sha256HexPattern = /^[a-f0-9]{64}$/i;
 
 function isEntrypoint() {
   const entryPath = process.argv[1];
@@ -134,6 +170,126 @@ function addCheck(checks: UpgradeRollbackDrillEvidenceCheck[], name: string, con
     status: condition ? "pass" : "fail",
     message
   });
+}
+
+const defaultSelectedEvidenceSummaryStatuses = new Set(["pass", "passed", "completed", "ok", "healthy", "scraped", "applied", "delivered", "available"]);
+const verifiedSelectedEvidenceSummaryStatuses = new Set([...defaultSelectedEvidenceSummaryStatuses, "verified"]);
+const restoredSelectedEvidenceSummaryStatuses = new Set([...defaultSelectedEvidenceSummaryStatuses, "restored", "restore_drilled"]);
+const offloadedSelectedEvidenceSummaryStatuses = new Set([...defaultSelectedEvidenceSummaryStatuses, "offloaded"]);
+const fetchedSelectedEvidenceSummaryStatuses = new Set([...defaultSelectedEvidenceSummaryStatuses, "fetched"]);
+const prunedSelectedEvidenceSummaryStatuses = new Set([...defaultSelectedEvidenceSummaryStatuses, "pruned"]);
+
+function selectedEvidenceSummaryMatches(
+  selectedEvidence: Record<string, unknown> | undefined,
+  key: string,
+  allowedStatuses: ReadonlySet<string> = defaultSelectedEvidenceSummaryStatuses
+) {
+  const summary = nestedObject(selectedEvidence, key);
+
+  return Boolean(
+    summary &&
+      allowedStatuses.has(statusValue(summary.status) ?? "") &&
+      timestampValue(summary.timestamp)
+  );
+}
+
+function backupSelectedEvidencePassed(selectedEvidence: Record<string, unknown> | undefined) {
+  const backupVerify = nestedObject(selectedEvidence, "backupVerify");
+  const restoreDrill = nestedObject(selectedEvidence, "restoreDrill");
+  const backupOffload = nestedObject(selectedEvidence, "backupOffload");
+  const backupFetch = nestedObject(selectedEvidence, "backupFetch");
+  const backupPrune = nestedObject(selectedEvidence, "backupPrune");
+  const offloadLocation = stringValue(backupOffload?.offHostLocation);
+  const fetchLocation = stringValue(backupFetch?.offHostLocation);
+  const offloadTreeSha256 = stringValue(backupOffload?.treeSha256);
+  const fetchTreeSha256 = stringValue(backupFetch?.treeSha256);
+  const offloadObjectCount = Number(backupOffload?.objectCount);
+  const fetchObjectCount = Number(backupFetch?.objectCount);
+  const offloadTotalBytes = Number(backupOffload?.totalBytes);
+  const fetchTotalBytes = Number(backupFetch?.totalBytes);
+
+  return Boolean(
+    selectedEvidenceSummaryMatches(selectedEvidence, "backupVerify", verifiedSelectedEvidenceSummaryStatuses) &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "restoreDrill", restoredSelectedEvidenceSummaryStatuses) &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "backupOffload", offloadedSelectedEvidenceSummaryStatuses) &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "backupFetch", fetchedSelectedEvidenceSummaryStatuses) &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "backupProviderSecurityAudit") &&
+      selectedEvidenceSummaryMatches(selectedEvidence, "backupPrune", prunedSelectedEvidenceSummaryStatuses) &&
+      stringValue(backupVerify?.backupPath) &&
+      stringValue(backupVerify?.offHostLocation) &&
+      stringValue(backupVerify?.provider) &&
+      restoreDrill?.restoreDrill === true &&
+      stringValue(restoreDrill?.backupPath) &&
+      stringValue(restoreDrill?.backupPath) === stringValue(backupFetch?.backupPath) &&
+      offloadLocation &&
+      stringValue(backupOffload?.provider) &&
+      backupOffload?.encrypted === true &&
+      backupOffload?.providerKmsProof === true &&
+      backupOffload?.providerRetentionProof === true &&
+      Number(backupOffload?.providerRetentionDays) > 0 &&
+      stringValue(backupOffload?.providerRetentionMode) &&
+      stringValue(backupOffload?.retentionContract) &&
+      stringValue(backupFetch?.backupPath) &&
+      fetchLocation &&
+      fetchLocation === offloadLocation &&
+      stringValue(backupFetch?.provider) === stringValue(backupOffload?.provider) &&
+      sha256HexPattern.test(offloadTreeSha256 ?? "") &&
+      offloadTreeSha256 === fetchTreeSha256 &&
+      Number.isInteger(offloadObjectCount) &&
+      offloadObjectCount > 0 &&
+      offloadObjectCount === fetchObjectCount &&
+      Number.isFinite(offloadTotalBytes) &&
+      offloadTotalBytes > 0 &&
+      offloadTotalBytes === fetchTotalBytes &&
+      backupPrune?.dryRun === false
+  );
+}
+
+function backupReleaseCommit(evidence: Record<string, unknown> | undefined) {
+  return stringValue(evidence?.commitRef) ??
+    stringValue(evidence?.commitSha) ??
+    stringValue(nestedValue(evidence, ["release", "commitRef"])) ??
+    stringValue(nestedValue(evidence, ["release", "commitSha"])) ??
+    stringValue(nestedValue(evidence, ["selectedEvidence", "commitRef"])) ??
+    stringValue(nestedValue(evidence, ["selectedEvidence", "releaseCommitRef"]));
+}
+
+function backupReleaseRepository(evidence: Record<string, unknown> | undefined) {
+  return stringValue(evidence?.repository) ??
+    stringValue(evidence?.repo) ??
+    stringValue(nestedValue(evidence, ["release", "repository"])) ??
+    stringValue(nestedValue(evidence, ["release", "repo"])) ??
+    stringValue(nestedValue(evidence, ["selectedEvidence", "repository"]));
+}
+
+function backupReleaseBranch(evidence: Record<string, unknown> | undefined) {
+  return stringValue(evidence?.branch) ??
+    stringValue(nestedValue(evidence, ["release", "branch"])) ??
+    stringValue(nestedValue(evidence, ["selectedEvidence", "branch"]));
+}
+
+function backupTargetEnvironment(evidence: Record<string, unknown> | undefined) {
+  return stringValue(evidence?.targetEnvironment) ??
+    stringValue(nestedValue(evidence, ["release", "targetEnvironment"])) ??
+    stringValue(nestedValue(evidence, ["selectedEvidence", "targetEnvironment"])) ??
+    stringValue(nestedValue(evidence, ["selectedEvidence", "environment"]));
+}
+
+function backupReleaseIdentityMatches(evidence: Record<string, unknown> | undefined, root: Record<string, unknown> | undefined) {
+  return Boolean(
+    backupReleaseCommit(evidence) === releaseCommit(root) &&
+      backupReleaseRepository(evidence) === releaseRepository(root) &&
+      backupReleaseBranch(evidence) === releaseBranch(root) &&
+      backupTargetEnvironment(evidence) === targetEnvironment(root)
+  );
+}
+
+function selectedSummary(passed: boolean, timestamp: string | undefined, details: Record<string, unknown> = {}) {
+  return {
+    status: passed ? "passed" : "blocked",
+    timestamp: timestamp ?? null,
+    ...details
+  };
 }
 
 function releaseMetadata(root: Record<string, unknown> | undefined) {
@@ -217,7 +373,7 @@ function artifactChecksum(value: unknown) {
     return undefined;
   }
 
-  return /^sha256:[a-f0-9]{16,64}$/i.test(checksum) || /^[a-f0-9]{64}$/i.test(checksum) ? checksum : undefined;
+  return /^sha256:[a-f0-9]{64}$/i.test(checksum) || /^[a-f0-9]{64}$/i.test(checksum) ? checksum : undefined;
 }
 
 function routePhase(root: Record<string, unknown> | undefined, phase: "before" | "after" | "rollback") {
@@ -259,6 +415,60 @@ function targetEnvironment(root: Record<string, unknown> | undefined) {
   return stringValue(root?.targetEnvironment) ?? stringValue(releaseMetadata(root)?.targetEnvironment);
 }
 
+function targetObject(root: Record<string, unknown> | undefined) {
+  return nestedObject(root, "target");
+}
+
+function targetEnvironmentName(target: Record<string, unknown> | undefined) {
+  return stringValue(target?.environment) ?? stringValue(target?.targetEnvironment);
+}
+
+function targetReleaseObject(target: Record<string, unknown> | undefined) {
+  return nestedObject(target, "release") ?? target;
+}
+
+function targetReleaseCommit(target: Record<string, unknown> | undefined) {
+  const release = targetReleaseObject(target);
+
+  return stringValue(release?.commitRef) ?? stringValue(release?.commitSha);
+}
+
+function targetReleaseRepository(target: Record<string, unknown> | undefined) {
+  return stringValue(targetReleaseObject(target)?.repository);
+}
+
+function targetReleaseBranch(target: Record<string, unknown> | undefined) {
+  return stringValue(targetReleaseObject(target)?.branch);
+}
+
+function targetVersionValue(target: Record<string, unknown> | undefined, key: "fromVersion" | "toVersion" | "rollbackVersion") {
+  const release = targetReleaseObject(target);
+
+  return stringValue(target?.[key]) ?? stringValue(release?.[key]) ?? stringValue(nestedValue(target, ["versions", key]));
+}
+
+function targetFactsMatch(root: Record<string, unknown> | undefined) {
+  const target = targetObject(root);
+  const targetCommitRef = targetReleaseCommit(target);
+  const targetRepository = targetReleaseRepository(target);
+  const targetBranch = targetReleaseBranch(target);
+
+  return Boolean(
+    target &&
+      targetEnvironmentName(target) &&
+      targetEnvironmentName(target) === targetEnvironment(root) &&
+      targetCommitRef &&
+      targetCommitRef === releaseCommit(root) &&
+      targetRepository &&
+      targetRepository === releaseRepository(root) &&
+      targetBranch &&
+      targetBranch === releaseBranch(root) &&
+      targetVersionValue(target, "fromVersion") === versionValue(root, "fromVersion") &&
+      targetVersionValue(target, "toVersion") === versionValue(root, "toVersion") &&
+      targetVersionValue(target, "rollbackVersion") === versionValue(root, "rollbackVersion")
+  );
+}
+
 function targetEnvironmentMatches(root: Record<string, unknown> | undefined, options: UpgradeRollbackDrillEvidenceCheckOptions) {
   const rootTarget = stringValue(root?.targetEnvironment);
   const releaseTarget = stringValue(releaseMetadata(root)?.targetEnvironment);
@@ -277,11 +487,12 @@ function migrationVersion(root: Record<string, unknown> | undefined, phase: "bef
     stringValue(nestedValue(root, ["migrationVersions", phase]));
 }
 
-function backupEvidencePassed(root: Record<string, unknown> | undefined) {
+function backupEvidencePassed(root: Record<string, unknown> | undefined, now: Date, maxAgeHours: number) {
   const backup = nestedObject(root, "backupEvidence") ?? nestedObject(nestedObject(root, "attachments"), "backupEvidence");
   const evidence = isObject(backup?.evidence) ? backup.evidence : backup;
   const selectedEvidence = nestedObject(evidence, "selectedEvidence");
   const checks = evidence?.checks;
+  const checkedAt = timestampValue(evidence?.checkedAt) ?? timestampValue(evidence?.completedAt);
   const allChecksPassed = Array.isArray(checks) &&
     checks.length > 0 &&
     checks.every((check) => isObject(check) && statusValue(check.status) === "pass");
@@ -300,15 +511,12 @@ function backupEvidencePassed(root: Record<string, unknown> | undefined) {
       evidence.name === "siteflow-backup-evidence-check" &&
       statusValue(evidence.status) === "passed" &&
       evidence.exitCode === 0 &&
+      freshTimestamp(checkedAt, now, maxAgeHours) &&
       nestedValue(evidence, ["thresholds", "requireOffHost"]) === true &&
       allChecksPassed &&
       requiredOffHostChecksPassed &&
-      nestedObject(selectedEvidence, "backupVerify") &&
-      nestedObject(selectedEvidence, "restoreDrill") &&
-      nestedObject(selectedEvidence, "backupOffload") &&
-      nestedObject(selectedEvidence, "backupFetch") &&
-      nestedObject(selectedEvidence, "backupProviderSecurityAudit") &&
-      nestedObject(selectedEvidence, "backupPrune")
+      backupReleaseIdentityMatches(evidence, root) &&
+      backupSelectedEvidencePassed(selectedEvidence)
   );
 }
 
@@ -326,13 +534,18 @@ function readinessPassed(root: Record<string, unknown> | undefined, phase: "befo
 function httpRollbackVerified(root: Record<string, unknown> | undefined) {
   const rollback = nestedObject(nestedObject(root, "httpVerification"), "rollback") ??
     nestedObject(root, "rollbackHttpVerification");
+  const rollbackDeployment = routeDeploymentId(root, "rollback");
+  const rollbackArtifact = routeArtifactChecksum(root, "rollback");
+  const verificationArtifact = artifactChecksum(rollback?.artifactChecksum);
 
   return Boolean(
     rollback &&
       statusValue(rollback.status) === "passed" &&
       rollback.statusCode === 200 &&
-      stringValue(rollback.deploymentId) === routeDeploymentId(root, "rollback") &&
-      artifactChecksum(rollback.artifactChecksum) === routeArtifactChecksum(root, "rollback")
+      stringValue(rollback.deploymentId) === rollbackDeployment &&
+      rollbackArtifact &&
+      verificationArtifact &&
+      verificationArtifact === rollbackArtifact
   );
 }
 
@@ -436,6 +649,14 @@ export function evaluateUpgradeRollbackDrillEvidence(
   const observability = observabilityEvidencePassed(root);
   const secretFindings = scanEvidenceForRawSecrets(rawEvidence);
   const checks: UpgradeRollbackDrillEvidenceCheck[] = [];
+  const backupEvidenceOk = backupEvidencePassed(root, now, maxAgeHours);
+  const routeUpgradeOk = Boolean(beforeDeployment && afterDeployment && beforeDeployment !== afterDeployment && beforeArtifact && afterArtifact && beforeArtifact !== afterArtifact);
+  const routeRollbackOk = Boolean(beforeDeployment && rollbackDeployment && beforeDeployment === rollbackDeployment && beforeArtifact && rollbackArtifact && beforeArtifact === rollbackArtifact);
+  const readinessOk = readinessPassed(root, "before") &&
+    readinessPassed(root, "after") &&
+    readinessPassed(root, "rollback") &&
+    nestedValue(root, ["readiness", "trafficRemovedDuringUpgrade"]) === true;
+  const observabilityOk = observability.metrics && observability.logs && observability.alerts;
 
   addCheck(checks, "evidence_shape", Boolean(root), "Upgrade/rollback drill evidence must be a JSON object.");
   addCheck(checks, "schema_version", root?.schemaVersion === expectedSchemaVersion, `schemaVersion must be ${expectedSchemaVersion}.`);
@@ -482,6 +703,12 @@ export function evaluateUpgradeRollbackDrillEvidence(
     "Drill evidence must show the application rollback returned to fromVersion."
   );
   addCheck(checks, "release_identity", releaseIdentityMatches(root, options), "Drill evidence must be bound to the requested release commit, repository, and branch.");
+  addCheck(
+    checks,
+    "target_facts",
+    targetFactsMatch(root),
+    "Drill evidence must include target environment, release identity, and version facts matching the final evidence."
+  );
   addCheck(checks, "api_image_digests", Boolean(apiBefore && apiAfter && apiRollback), "API before/after/rollback image digests must be present and sha256-pinned.");
   addCheck(checks, "worker_image_digests", Boolean(workerBefore && workerAfter && workerRollback), "Worker before/after/rollback image digests must be present and sha256-pinned.");
   addCheck(
@@ -506,8 +733,8 @@ export function evaluateUpgradeRollbackDrillEvidence(
   addCheck(
     checks,
     "backup_evidence_passed",
-    backupEvidencePassed(root),
-    "Drill evidence must include passed backup evidence checked with requireOffHost, fetch, provider audit, and prune proof."
+    backupEvidenceOk,
+    "Drill evidence must include fresh passed backup evidence checked with requireOffHost, fetch, provider audit, and prune proof."
   );
   addCheck(
     checks,
@@ -520,13 +747,13 @@ export function evaluateUpgradeRollbackDrillEvidence(
   addCheck(
     checks,
     "route_upgrade",
-    Boolean(beforeDeployment && afterDeployment && beforeDeployment !== afterDeployment && beforeArtifact && afterArtifact && beforeArtifact !== afterArtifact),
+    routeUpgradeOk,
     "Route evidence must show the upgrade moved to a distinct deployment and artifact checksum."
   );
   addCheck(
     checks,
     "route_rollback_restores_previous_artifact",
-    Boolean(beforeDeployment && rollbackDeployment && beforeDeployment === rollbackDeployment && beforeArtifact && rollbackArtifact && beforeArtifact === rollbackArtifact),
+    routeRollbackOk,
     "Route evidence must show rollback restored the previous deployment and artifact checksum."
   );
   addCheck(
@@ -538,10 +765,7 @@ export function evaluateUpgradeRollbackDrillEvidence(
   addCheck(
     checks,
     "readiness_evidence",
-    readinessPassed(root, "before") &&
-      readinessPassed(root, "after") &&
-      readinessPassed(root, "rollback") &&
-      nestedValue(root, ["readiness", "trafficRemovedDuringUpgrade"]) === true,
+    readinessOk,
     "Readiness evidence must show before/after/rollback ready probes and traffic removal during upgrade."
   );
   addCheck(
@@ -584,7 +808,28 @@ export function evaluateUpgradeRollbackDrillEvidence(
       toVersion: toVersion ?? null,
       rollbackVersion: rollbackVersion ?? null,
       upgradeOperationId: upgradeOperationId ?? null,
-      rollbackOperationId: rollbackOperationId ?? null
+      rollbackOperationId: rollbackOperationId ?? null,
+      backupEvidence: selectedSummary(backupEvidenceOk, timestampValue(nestedValue(root, ["backupEvidence", "checkedAt"])) ?? timestampValue(nestedValue(root, ["attachments", "backupEvidence", "collectedAt"])) ?? completedAt),
+      routeUpgrade: selectedSummary(routeUpgradeOk, upgradeCompletedAt ?? completedAt, {
+        fromDeploymentId: beforeDeployment ?? null,
+        toDeploymentId: afterDeployment ?? null,
+        fromArtifactChecksum: beforeArtifact ?? null,
+        toArtifactChecksum: afterArtifact ?? null
+      }),
+      routeRollback: selectedSummary(routeRollbackOk, rollbackCompletedAt ?? completedAt, {
+        deploymentId: rollbackDeployment ?? null,
+        artifactChecksum: rollbackArtifact ?? null,
+        restoredDeploymentId: beforeDeployment ?? null,
+        restoredArtifactChecksum: beforeArtifact ?? null
+      }),
+      readiness: selectedSummary(readinessOk, completedAt, {
+        trafficRemovedDuringUpgrade: nestedValue(root, ["readiness", "trafficRemovedDuringUpgrade"]) === true
+      }),
+      observability: selectedSummary(observabilityOk, completedAt, {
+        metrics: observability.metrics,
+        logs: observability.logs,
+        alerts: observability.alerts
+      })
     },
     checks,
     exitCode: passed ? 0 : 1
@@ -723,7 +968,12 @@ export async function runUpgradeRollbackDrillEvidenceCheckCli(
         toVersion: null,
         rollbackVersion: null,
         upgradeOperationId: null,
-        rollbackOperationId: null
+        rollbackOperationId: null,
+        backupEvidence: { status: "blocked", timestamp: null },
+        routeUpgrade: { status: "blocked", timestamp: null },
+        routeRollback: { status: "blocked", timestamp: null },
+        readiness: { status: "blocked", timestamp: null },
+        observability: { status: "blocked", timestamp: null }
       },
       checks: [
         {

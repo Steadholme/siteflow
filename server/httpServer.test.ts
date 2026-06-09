@@ -106,8 +106,9 @@ import type { PrebuiltDeployCommand, PrebuiltDeployResult } from "../src/lib/api
 import { normalizeAnalyticsEventInput } from "../src/lib/analytics";
 import { siteflowFixtures } from "../src/lib/fixtures/siteflow.fixtures";
 import { SITEFLOW_SECRET_CANARY } from "../src/lib/redaction";
+import { bundleWithReleaseEvidenceAttestation, releaseEvidenceBundleAttestationKeyId } from "../scripts/releaseEvidenceBundleCheck";
 import { createSiteFlowServer, type DrainFetch, type FunctionModuleLoader, type ReleaseEvidenceEvaluator, type SiteFlowReadinessCheck, type SiteFlowRequestLogEntry, type SiteFlowRuntimeMetricsCollector, type SiteFlowTrustedProxyPolicy } from "./httpServer";
-import { createDefaultRequestLogger, createProductionMetricsCollector, createStdoutRequestLogger, defaultAllowSameProcessFunctionRuntime, defaultOperatorSessionIdleTimeoutSeconds, defaultSecureCookies, defaultTrustProxy, gitWebhookSecretsFromEnv, requireProductionApiToken, requireProductionMetricsToken, resolveDatabaseUrl } from "./index";
+import { createDefaultRequestLogger, createProductionMetricsCollector, createStdoutRequestLogger, defaultAllowSameProcessFunctionRuntime, defaultOperatorSessionIdleTimeoutSeconds, defaultSecureCookies, defaultTrustProxy, gitWebhookSecretsFromEnv, requireProductionApiToken, requireProductionGitWebhookSecrets, requireProductionMetricsToken, resolveDatabaseUrl } from "./index";
 import { SiteFlowNotFoundError, type ArtifactRoute, type OperatorSessionCreateResult, type OperatorSessionRotateResult, type RecordLogDrainDeliveryCommand, type SiteFlowAuthPrincipal, type SiteFlowReadRepository } from "./readRepository";
 
 async function rawHttpGet(
@@ -166,6 +167,7 @@ function releaseEvidenceMetadata(overrides: Record<string, unknown> = {}) {
     evidencePath: "evidence/release-evidence.json",
     checkedAt: new Date().toISOString(),
     status: "passed" as const,
+    payloadDigest: `sha256:${"d".repeat(64)}`,
     commitRef: "abc123def4567890",
     repository: "acme/siteflow",
     branch: "main",
@@ -176,11 +178,14 @@ function releaseEvidenceMetadata(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function releaseEvidenceBundle(overrides: Record<string, unknown> = {}) {
-  return {
+const releaseEvidenceAttestationSigningKey = "release-evidence-test-signing-key-with-enough-entropy";
+
+function releaseEvidenceBundle(overrides: Record<string, unknown> = {}, signingKey = releaseEvidenceAttestationSigningKey) {
+  const checkedAt = new Date().toISOString();
+  const bundle = {
     schemaVersion: "siteflow.releaseEvidence.v1",
     name: "siteflow-release-evidence-bundle",
-    checkedAt: new Date().toISOString(),
+    checkedAt,
     targetEnvironment: "production",
     release: {
       commitRef: "abc123def4567890",
@@ -192,6 +197,8 @@ function releaseEvidenceBundle(overrides: Record<string, unknown> = {}) {
     },
     ...overrides
   };
+
+  return bundleWithReleaseEvidenceAttestation(bundle, checkedAt, signingKey ? { attestationSigningKey: signingKey } : {});
 }
 
 function releaseEvidenceRequest(overrides: Record<string, unknown> = {}) {
@@ -211,6 +218,7 @@ function passingReleaseEvidenceEvaluator(calls: Array<{ rawEvidence: unknown; ev
       status: "passed",
       checkedAt: new Date().toISOString(),
       evidencePath: options.evidencePath,
+      payloadDigest: `sha256:${"d".repeat(64)}`,
       thresholds: {
         maxEvidenceAgeHours: 168,
         allowHostBuildException: false
@@ -1698,6 +1706,8 @@ async function withServer<T>(
     secureCookies?: boolean;
     trustProxy?: SiteFlowTrustedProxyPolicy;
     releaseEvidenceEvaluator?: ReleaseEvidenceEvaluator;
+    releaseEvidenceAttestationSigningKey?: string;
+    releaseEvidenceRequiredAttestationKeyId?: string;
     productionRuntime?: boolean;
     allowSameProcessFunctionRuntime?: boolean;
   } = {}
@@ -1723,6 +1733,8 @@ async function withServer<T>(
     secureCookies: options.secureCookies,
     trustProxy: options.trustProxy ?? true,
     releaseEvidenceEvaluator: options.releaseEvidenceEvaluator,
+    releaseEvidenceAttestationSigningKey: options.releaseEvidenceAttestationSigningKey ?? releaseEvidenceAttestationSigningKey,
+    releaseEvidenceRequiredAttestationKeyId: options.releaseEvidenceRequiredAttestationKeyId,
     productionRuntime: options.productionRuntime,
     allowSameProcessFunctionRuntime: options.allowSameProcessFunctionRuntime
   });
@@ -3297,9 +3309,15 @@ describe("SiteFlow control-plane HTTP server", () => {
     await withServer(
       repository,
       async (baseUrl) => {
-        const headers = {
-          authorization: "Bearer admin-token",
+        const sessionHeaders = {
+          cookie: "siteflow_session=session-admin-token",
+          "x-siteflow-csrf": "same-origin",
           "content-type": "application/json"
+        };
+        const spoofedActor = {
+          id: "client-spoofed-actor",
+          name: "Client spoofed actor",
+          role: "system"
         };
         const listResponse = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/routing-rules?kind=redirect`, {
           headers: {
@@ -3319,14 +3337,15 @@ describe("SiteFlow control-plane HTTP server", () => {
 
         const upsertResponse = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/routing-rules`, {
           method: "PUT",
-          headers,
+          headers: sessionHeaders,
           body: JSON.stringify({
             name: "Legacy docs",
             kind: "redirect",
             source: "/legacy-docs",
             destination: "/docs",
             statusCode: 308,
-            priority: 5
+            priority: 5,
+            actor: spoofedActor
           })
         });
         const upserted = await upsertResponse.json();
@@ -3345,9 +3364,10 @@ describe("SiteFlow control-plane HTTP server", () => {
 
         const disableResponse = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/routing-rules/route_docs`, {
           method: "DELETE",
-          headers,
+          headers: sessionHeaders,
           body: JSON.stringify({
-            reason: "Moved to app config."
+            reason: "Moved to app config.",
+            actor: spoofedActor
           })
         });
         const disabled = await disableResponse.json();
@@ -3376,11 +3396,23 @@ describe("SiteFlow control-plane HTTP server", () => {
       destination: "/docs",
       statusCode: 308
     });
+    expect(received.upsert?.actor).toEqual({
+      id: "session-operator",
+      name: "Session Operator",
+      role: "operator"
+    });
+    expect(received.upsert?.actor?.id).not.toBe("client-spoofed-actor");
     expect(received.disable).toMatchObject({
       projectId: "project-acme-dashboard",
       ruleId: "route_docs",
       reason: "Moved to app config."
     });
+    expect(received.disable?.actor).toEqual({
+      id: "session-operator",
+      name: "Session Operator",
+      role: "operator"
+    });
+    expect(received.disable?.actor?.id).not.toBe("client-spoofed-actor");
   });
 
   it("creates, lists, disables, and runs cron jobs through project routes", async () => {
@@ -4234,6 +4266,176 @@ describe("SiteFlow control-plane HTTP server", () => {
     expect(promoteCalls).toBe(0);
   });
 
+  it("rejects production promotion commands with a passed bundle that is missing attestation metadata", async () => {
+    let promoteCalls = 0;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      promoteDeployment: async (command: PromoteDeploymentCommand): Promise<CommandResultReadModel> => {
+        promoteCalls += 1;
+        return fixtureRepository().promoteDeployment(command);
+      }
+    };
+    const bundle = releaseEvidenceBundle();
+
+    delete (bundle as Record<string, unknown>).attestation;
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/release/production/promote`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
+        body: JSON.stringify({
+          projectId: "project-acme-dashboard",
+          channel: "production",
+          targetDeploymentId: "dep-healthy",
+          actor: { id: "actor-1", name: "Ops", role: "operator" },
+          reason: "ship",
+          idempotencyKey: "idem-missing-attestation",
+          releaseEvidence: {
+            evidencePath: "evidence/release-evidence.json",
+            bundle
+          }
+        })
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(400);
+      expect(body.message).toContain("attestation");
+    }, { apiToken: "deploy-token", releaseEvidenceEvaluator: passingReleaseEvidenceEvaluator() });
+
+    expect(promoteCalls).toBe(0);
+  });
+
+  it("rejects production promotion commands when the server has no release evidence signing key", async () => {
+    let promoteCalls = 0;
+    const evaluatorCalls: Array<{ rawEvidence: unknown; evidencePath: string }> = [];
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      promoteDeployment: async (command: PromoteDeploymentCommand): Promise<CommandResultReadModel> => {
+        promoteCalls += 1;
+        return fixtureRepository().promoteDeployment(command);
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/release/production/promote`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
+        body: JSON.stringify({
+          projectId: "project-acme-dashboard",
+          channel: "production",
+          targetDeploymentId: "dep-healthy",
+          actor: { id: "actor-1", name: "Ops", role: "operator" },
+          reason: "ship",
+          idempotencyKey: "idem-missing-signing-key",
+          releaseEvidence: releaseEvidenceRequest()
+        })
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(400);
+      expect(body.message).toContain("SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY");
+    }, {
+      apiToken: "deploy-token",
+      releaseEvidenceAttestationSigningKey: "",
+      releaseEvidenceEvaluator: passingReleaseEvidenceEvaluator(evaluatorCalls)
+    });
+
+    expect(evaluatorCalls).toHaveLength(0);
+    expect(promoteCalls).toBe(0);
+  });
+
+  it("rejects production promotion commands with a signed bundle that does not verify", async () => {
+    let promoteCalls = 0;
+    const evaluatorCalls: Array<{ rawEvidence: unknown; evidencePath: string }> = [];
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      promoteDeployment: async (command: PromoteDeploymentCommand): Promise<CommandResultReadModel> => {
+        promoteCalls += 1;
+        return fixtureRepository().promoteDeployment(command);
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/release/production/promote`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
+        body: JSON.stringify({
+          projectId: "project-acme-dashboard",
+          channel: "production",
+          targetDeploymentId: "dep-healthy",
+          actor: { id: "actor-1", name: "Ops", role: "operator" },
+          reason: "ship",
+          idempotencyKey: "idem-bad-signature",
+          releaseEvidence: {
+            evidencePath: "evidence/release-evidence.json",
+            bundle: releaseEvidenceBundle({}, "different-release-evidence-signing-key")
+          }
+        })
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(400);
+      expect(body.message).toContain("valid signature");
+    }, {
+      apiToken: "deploy-token",
+      releaseEvidenceEvaluator: passingReleaseEvidenceEvaluator(evaluatorCalls)
+    });
+
+    expect(evaluatorCalls).toHaveLength(0);
+    expect(promoteCalls).toBe(0);
+  });
+
+  it("rejects production promotion commands when the signed bundle key id is not the required key id", async () => {
+    let promoteCalls = 0;
+    const evaluatorCalls: Array<{ rawEvidence: unknown; evidencePath: string }> = [];
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      promoteDeployment: async (command: PromoteDeploymentCommand): Promise<CommandResultReadModel> => {
+        promoteCalls += 1;
+        return fixtureRepository().promoteDeployment(command);
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/release/production/promote`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer deploy-token"
+        },
+        body: JSON.stringify({
+          projectId: "project-acme-dashboard",
+          channel: "production",
+          targetDeploymentId: "dep-healthy",
+          actor: { id: "actor-1", name: "Ops", role: "operator" },
+          reason: "ship",
+          idempotencyKey: "idem-wrong-key-id",
+          releaseEvidence: releaseEvidenceRequest()
+        })
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(400);
+      expect(body.message).toContain("valid signature");
+    }, {
+      apiToken: "deploy-token",
+      releaseEvidenceRequiredAttestationKeyId: releaseEvidenceBundleAttestationKeyId("different-release-evidence-signing-key"),
+      releaseEvidenceEvaluator: passingReleaseEvidenceEvaluator(evaluatorCalls)
+    });
+
+    expect(evaluatorCalls).toHaveLength(0);
+    expect(promoteCalls).toBe(0);
+  });
+
   it("accepts production promotion commands through the HTTP API with a checked release evidence bundle", async () => {
     const evaluatorCalls: Array<{ rawEvidence: unknown; evidencePath: string }> = [];
 
@@ -4258,7 +4460,11 @@ describe("SiteFlow control-plane HTTP server", () => {
 
       expect(response.status).toBe(202);
       expect(body.status).toBe("accepted");
-    }, { apiToken: "deploy-token", releaseEvidenceEvaluator: passingReleaseEvidenceEvaluator(evaluatorCalls) });
+    }, {
+      apiToken: "deploy-token",
+      releaseEvidenceRequiredAttestationKeyId: releaseEvidenceBundleAttestationKeyId(releaseEvidenceAttestationSigningKey),
+      releaseEvidenceEvaluator: passingReleaseEvidenceEvaluator(evaluatorCalls)
+    });
 
     expect(evaluatorCalls).toHaveLength(1);
     expect(evaluatorCalls[0]).toMatchObject({
@@ -4437,6 +4643,7 @@ describe("SiteFlow control-plane HTTP server", () => {
       releaseEvidence: expect.objectContaining({
         evidencePath: "evidence/release-evidence.json",
         status: "passed",
+        payloadDigest: `sha256:${"d".repeat(64)}`,
         commitRef: "abc123def4567890",
         repository: "acme/siteflow",
         branch: "main",
@@ -6377,10 +6584,10 @@ describe("SiteFlow control-plane HTTP server", () => {
       const genericSecretPath = path.join(tempDir, "generic-webhook-secret");
       await writeFile(apiTokenPath, "0123456789abcdef0123456789abcdef\n", "utf8");
       await writeFile(metricsTokenPath, "abcdef0123456789abcdef0123456789\n", "utf8");
-      await writeFile(githubSecretPath, "github-file-secret\n", "utf8");
-      await writeFile(gitlabSecretPath, "gitlab-file-secret\n", "utf8");
-      await writeFile(giteaSecretPath, "gitea-file-secret\n", "utf8");
-      await writeFile(genericSecretPath, "generic-file-secret\n", "utf8");
+      await writeFile(githubSecretPath, "github-file-secret-0123456789abcdef\n", "utf8");
+      await writeFile(gitlabSecretPath, "gitlab-file-secret-0123456789abcdef\n", "utf8");
+      await writeFile(giteaSecretPath, "gitea-file-secret-0123456789abcdef\n", "utf8");
+      await writeFile(genericSecretPath, "generic-file-secret-0123456789abcdef\n", "utf8");
 
       expect(() =>
         requireProductionApiToken({
@@ -6400,11 +6607,45 @@ describe("SiteFlow control-plane HTTP server", () => {
         SITEFLOW_GITEA_WEBHOOK_SECRET_FILE: giteaSecretPath,
         SITEFLOW_GENERIC_WEBHOOK_SECRET_FILE: genericSecretPath
       })).toEqual({
-        github: "github-file-secret",
-        gitlab: "gitlab-file-secret",
-        gitea: "gitea-file-secret",
-        generic: "generic-file-secret"
+        github: "github-file-secret-0123456789abcdef",
+        gitlab: "gitlab-file-secret-0123456789abcdef",
+        gitea: "gitea-file-secret-0123456789abcdef",
+        generic: "generic-file-secret-0123456789abcdef"
       });
+      expect(() =>
+        requireProductionGitWebhookSecrets({
+          SITEFLOW_ENV: "production",
+          SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE: githubSecretPath,
+          SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE: gitlabSecretPath,
+          SITEFLOW_GITEA_WEBHOOK_SECRET_FILE: giteaSecretPath,
+          SITEFLOW_GENERIC_WEBHOOK_SECRET_FILE: genericSecretPath
+        })
+      ).not.toThrow();
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects weak production webhook secret files without exposing file contents", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "siteflow-server-webhook-secret-file-"));
+
+    try {
+      const weakSecretPath = path.join(tempDir, "github-webhook-secret");
+      await writeFile(weakSecretPath, "weak-github-webhook-secret\n", "utf8");
+
+      let message = "";
+
+      try {
+        requireProductionGitWebhookSecrets({
+          SITEFLOW_ENV: "production",
+          SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE: weakSecretPath
+        });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+
+      expect(message).toContain("SITEFLOW_GITHUB_WEBHOOK_SECRET");
+      expect(message).not.toContain("weak-github-webhook-secret");
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
@@ -6666,6 +6907,11 @@ describe("SiteFlow control-plane HTTP server", () => {
         expect(metricsText).toContain("siteflow_build_job_oldest_queued_age_seconds 360");
         expect(metricsText).toContain("siteflow_build_job_oldest_running_heartbeat_age_seconds 45");
         expect(metricsText).toContain("siteflow_runtime_metrics_collection_error 0");
+        expect(metricsText).toContain("siteflow_storage_artifact_free_bytes 2048");
+        expect(metricsText).toContain("siteflow_storage_evidence_free_bytes 4096");
+        expect(metricsText).toContain("siteflow_storage_temp_free_bytes 1024");
+        expect(metricsText).toContain("siteflow_storage_missing_paths 0");
+        expect(metricsText).toContain("siteflow_storage_metrics_collection_error 0");
         expect(metricsText).toContain("siteflow_backup_automation_last_success_age_seconds -1");
         expect(metricsText).toContain("siteflow_backup_restore_drill_last_success_age_seconds -1");
         expect(metricsText).toContain("siteflow_backup_offload_last_run_failed 0");
@@ -6677,7 +6923,12 @@ describe("SiteFlow control-plane HTTP server", () => {
           runningBuildJobs: 2,
           staleBuildJobs: 1,
           oldestQueuedBuildAgeSeconds: 360,
-          oldestRunningBuildHeartbeatAgeSeconds: 45
+          oldestRunningBuildHeartbeatAgeSeconds: 45,
+          storageArtifactFreeBytes: 2048,
+          storageEvidenceFreeBytes: 4096,
+          storageTempFreeBytes: 1024,
+          storageMissingPaths: 0,
+          storageMetricsCollectionError: 0
         })
       }
     );
@@ -6769,12 +7020,97 @@ describe("SiteFlow control-plane HTTP server", () => {
       staleBuildJobs: 1,
       oldestQueuedBuildAgeSeconds: 720,
       oldestRunningBuildHeartbeatAgeSeconds: 90,
+      storageTempFreeBytes: expect.any(Number),
       backupAutomationLastSuccessAgeSeconds: -1,
       backupMetricsCollectionError: 1
     });
     expect(queries[0]).toContain("FROM siteflow_build_jobs");
     expect(queries[0]).toContain("locked_until");
     expect(queries[0]).toContain("heartbeat_at");
+  });
+
+  it("maps configured storage paths into runtime storage metrics", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-storage-runtime-metrics-"));
+
+    try {
+      const artifactRoot = path.join(root, "artifacts");
+      const evidenceRoot = path.join(root, "evidence");
+      const tempRoot = path.join(root, "tmp");
+
+      await mkdir(artifactRoot, { recursive: true });
+      await mkdir(evidenceRoot, { recursive: true });
+      await mkdir(tempRoot, { recursive: true });
+
+      const collector = createProductionMetricsCollector(
+        {
+          query: async () => ({
+            rows: [
+              {
+                queued_build_jobs: 0,
+                running_build_jobs: 0,
+                stale_build_jobs: 0,
+                oldest_queued_age_seconds: 0,
+                oldest_running_heartbeat_age_seconds: 0
+              }
+            ]
+          })
+        },
+        {
+          artifactRoot,
+          evidenceRoot,
+          tempRoot
+        }
+      );
+      const metrics = await collector();
+
+      expect(metrics.storageArtifactFreeBytes).toEqual(expect.any(Number));
+      expect(metrics.storageEvidenceFreeBytes).toEqual(expect.any(Number));
+      expect(metrics.storageTempFreeBytes).toEqual(expect.any(Number));
+      expect(metrics.storageArtifactFreeBytes).toBeGreaterThanOrEqual(0);
+      expect(metrics.storageEvidenceFreeBytes).toBeGreaterThanOrEqual(0);
+      expect(metrics.storageTempFreeBytes).toBeGreaterThanOrEqual(0);
+      expect(metrics.storageMissingPaths).toBe(0);
+      expect(metrics.storageMetricsCollectionError).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports storage metric collection errors for unreadable or missing paths", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-storage-runtime-missing-"));
+
+    try {
+      const collector = createProductionMetricsCollector(
+        {
+          query: async () => ({
+            rows: [
+              {
+                queued_build_jobs: 0,
+                running_build_jobs: 0,
+                stale_build_jobs: 0,
+                oldest_queued_age_seconds: 0,
+                oldest_running_heartbeat_age_seconds: 0
+              }
+            ]
+          })
+        },
+        {
+          artifactRoot: path.join(root, "missing-artifacts"),
+          evidenceRoot: path.join(root, "missing-evidence"),
+          tempRoot: path.join(root, "missing-temp")
+        }
+      );
+
+      await expect(collector()).resolves.toMatchObject({
+        storageArtifactFreeBytes: -1,
+        storageEvidenceFreeBytes: -1,
+        storageTempFreeBytes: -1,
+        storageMissingPaths: 3,
+        storageMetricsCollectionError: 1
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("maps backup automation run records into runtime backup metrics", async () => {

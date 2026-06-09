@@ -45,6 +45,12 @@ jobs:
       - name: Release source tree check
         run: npm run --silent release:source:check -- --json
 
+      - name: Release commit readiness plan
+        run: npm run --silent release:commit:plan -- --fail-on-blocked --json
+
+      - name: Release evidence pack contract
+        run: npm run --silent release:evidence:pack-contract -- --json
+
       - name: Run tests
         run: npm test -- --run
 
@@ -105,14 +111,24 @@ jobs:
         env:
           IMAGE_NAME: ${{ steps.image.outputs.name }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_REF: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           node <<'NODE'
           const { execFileSync } = require("node:child_process");
+          const { createHash } = require("node:crypto");
           const { writeFileSync } = require("node:fs");
 
           const imageName = process.env.IMAGE_NAME;
           const imageDigest = process.env.IMAGE_DIGEST;
+          const releaseRepository = process.env.REPOSITORY;
+          const releaseCommitRef = process.env.COMMIT_REF;
+          const releaseRefName = process.env.REF_NAME;
           const imageRef = `${imageName}@${imageDigest}`;
+          const sha256DigestPattern = /^sha256:[a-f0-9]{64}$/i;
+          const sha256HexPattern = /^[a-f0-9]{64}$/i;
 
           function inspectRaw(ref) {
             return JSON.parse(execFileSync("docker", ["buildx", "imagetools", "inspect", "--raw", ref], {
@@ -125,60 +141,401 @@ jobs:
             return Array.isArray(root?.manifests) ? root.manifests : [];
           }
 
-          const index = inspectRaw(imageRef);
-          const attestationDescriptors = descriptorsFromIndex(index).filter((descriptor) => {
-            const annotations = descriptor?.annotations ?? {};
-            return annotations["vnd.docker.reference.type"] === "attestation-manifest" &&
-              typeof descriptor.digest === "string" &&
-              descriptor.digest.startsWith("sha256:");
-          });
-
-          const inspected = attestationDescriptors.map((descriptor) => {
-            const manifest = inspectRaw(`${imageName}@${descriptor.digest}`);
-            const predicateTypes = (Array.isArray(manifest.layers) ? manifest.layers : [])
-              .map((layer) => layer?.annotations?.["in-toto.io/predicate-type"])
-              .filter((predicateType) => typeof predicateType === "string" && predicateType);
+          function parseImageReference(name) {
+            const withoutScheme = name.replace(/^https?:\/\//, "");
+            const parts = withoutScheme.split("/");
+            if (parts.length < 2) {
+              throw new Error(`Image name ${name} does not include a registry/repository path.`);
+            }
             return {
-              digest: descriptor.digest,
-              predicateTypes
+              registry: parts[0],
+              repository: parts.slice(1).join("/")
             };
-          });
-
-          const provenance = inspected.find((entry) =>
-            entry.predicateTypes.some((predicateType) => predicateType.startsWith("https://slsa.dev/provenance/"))
-          );
-          const sbom = inspected.find((entry) =>
-            entry.predicateTypes.some((predicateType) =>
-              predicateType.startsWith("https://spdx.dev/") || predicateType.startsWith("https://cyclonedx.org/")
-            )
-          );
-
-          if (!provenance || !sbom) {
-            throw new Error("Published image is missing registry SLSA provenance or SBOM attestation manifests.");
           }
 
-          const evidence = {
-            mode: "registry",
-            subjectDigest: imageDigest,
-            inspector: "docker buildx imagetools inspect --raw",
-            inspectedAt: new Date().toISOString(),
-            provenance: {
-              requested: true,
-              present: true,
-              predicateType: provenance.predicateTypes.find((predicateType) => predicateType.startsWith("https://slsa.dev/provenance/")),
-              manifestDigest: provenance.digest
-            },
-            sbom: {
-              requested: true,
-              present: true,
-              predicateType: sbom.predicateTypes.find((predicateType) =>
-                predicateType.startsWith("https://spdx.dev/") || predicateType.startsWith("https://cyclonedx.org/")
-              ),
-              manifestDigest: sbom.digest
+          function parseBearerChallenge(challenge) {
+            const values = {};
+            for (const part of challenge.replace(/^Bearer\s+/i, "").split(/,\s*/)) {
+              const match = part.match(/^([^=]+)="?([^"]+)"?$/);
+              if (match) {
+                values[match[1]] = match[2];
+              }
             }
-          };
+            return values;
+          }
 
-          writeFileSync("release-image-attestations.json", `${JSON.stringify(evidence, null, 2)}\n`);
+          const authTokens = new Map();
+
+          async function registryFetch(url, headers = {}) {
+            const cacheKey = `${url.origin}${url.pathname}`;
+            const cachedToken = authTokens.get(cacheKey);
+            const firstHeaders = cachedToken
+              ? { ...headers, Authorization: `Bearer ${cachedToken}` }
+              : headers;
+            let response = await fetch(url, { headers: firstHeaders });
+
+            if (response.status !== 401) {
+              return response;
+            }
+
+            const challenge = response.headers.get("www-authenticate") ?? "";
+            const auth = parseBearerChallenge(challenge);
+            if (!auth.realm) {
+              return response;
+            }
+
+            const tokenUrl = new URL(auth.realm);
+            if (auth.service) {
+              tokenUrl.searchParams.set("service", auth.service);
+            }
+            if (auth.scope) {
+              tokenUrl.searchParams.set("scope", auth.scope);
+            }
+
+            const tokenHeaders = {};
+            if (process.env.GITHUB_ACTOR && process.env.GITHUB_TOKEN) {
+              tokenHeaders.Authorization = `Basic ${Buffer.from(`${process.env.GITHUB_ACTOR}:${process.env.GITHUB_TOKEN}`).toString("base64")}`;
+            }
+
+            const tokenResponse = await fetch(tokenUrl, { headers: tokenHeaders });
+            if (!tokenResponse.ok) {
+              return response;
+            }
+
+            const tokenBody = await tokenResponse.json();
+            const token = tokenBody.token ?? tokenBody.access_token;
+            if (!token) {
+              return response;
+            }
+
+            authTokens.set(cacheKey, token);
+            response = await fetch(url, {
+              headers: {
+                ...headers,
+                Authorization: `Bearer ${token}`
+              }
+            });
+
+            return response;
+          }
+
+          async function fetchRegistryBlob(parsedImage, digest) {
+            const url = new URL(`https://${parsedImage.registry}/v2/${parsedImage.repository}/blobs/${digest}`);
+            const response = await registryFetch(url, {
+              Accept: [
+                "application/vnd.in-toto+json",
+                "application/vnd.dsse.envelope.v1+json",
+                "application/octet-stream"
+              ].join(", ")
+            });
+
+            if (!response.ok) {
+              throw new Error(`registry blob fetch failed for ${digest}: ${response.status} ${response.statusText}`);
+            }
+
+            return Buffer.from(await response.arrayBuffer());
+          }
+
+          function digestForBuffer(buffer) {
+            return `sha256:${createHash("sha256").update(buffer).digest("hex")}`;
+          }
+
+          function normalizeSha256(value) {
+            if (typeof value !== "string" || !value.trim()) {
+              return undefined;
+            }
+
+            const normalized = value.trim();
+            if (sha256DigestPattern.test(normalized)) {
+              return normalized;
+            }
+            if (sha256HexPattern.test(normalized)) {
+              return `sha256:${normalized}`;
+            }
+            return undefined;
+          }
+
+          function decodeStatement(raw) {
+            const parsed = JSON.parse(raw.toString("utf8"));
+            if (parsed && typeof parsed.payload === "string") {
+              return JSON.parse(Buffer.from(parsed.payload, "base64").toString("utf8"));
+            }
+            return parsed;
+          }
+
+          function normalizeRepositoryFromUri(uri) {
+            if (typeof uri !== "string") {
+              return undefined;
+            }
+
+            const cleaned = uri.replace(/^git\+/, "");
+            const match = cleaned.match(/github\.com[:/]([^/#?@]+)\/([^/#?@]+?)(?:\.git)?(?:[?#@]|$)/i);
+            if (!match) {
+              return undefined;
+            }
+
+            return `${match[1]}/${match[2]}`;
+          }
+
+          function refNameFromUri(uri) {
+            if (typeof uri !== "string") {
+              return undefined;
+            }
+
+            const refMatch = uri.match(/refs\/(?:heads|tags)\/([^?#]+)/);
+            if (refMatch) {
+              return refMatch[1];
+            }
+
+            return undefined;
+          }
+
+          function digestCommit(digest) {
+            if (!digest || typeof digest !== "object") {
+              return undefined;
+            }
+
+            return digest.gitCommit ?? digest.git_commit ?? digest.sha1;
+          }
+
+          function normalizeSubject(subject) {
+            if (!subject || typeof subject !== "object") {
+              return undefined;
+            }
+
+            const digest = subject.digest && typeof subject.digest === "object" ? subject.digest : {};
+            const sha256 = normalizeSha256(digest.sha256);
+            if (!sha256) {
+              return undefined;
+            }
+
+            return {
+              name: typeof subject.name === "string" ? subject.name : undefined,
+              digest: {
+                sha256: sha256.replace(/^sha256:/, "")
+              }
+            };
+          }
+
+          function subjectDigests(statement) {
+            return (Array.isArray(statement?.subject) ? statement.subject : [])
+              .map(normalizeSubject)
+              .filter(Boolean);
+          }
+
+          function materialCandidates(statement) {
+            const predicate = statement?.predicate && typeof statement.predicate === "object"
+              ? statement.predicate
+              : {};
+            const buildDefinition = predicate.buildDefinition && typeof predicate.buildDefinition === "object"
+              ? predicate.buildDefinition
+              : {};
+            const externalParameters = buildDefinition.externalParameters && typeof buildDefinition.externalParameters === "object"
+              ? buildDefinition.externalParameters
+              : {};
+            const candidates = [];
+
+            if (externalParameters.source) {
+              candidates.push(typeof externalParameters.source === "string"
+                ? { uri: externalParameters.source }
+                : externalParameters.source);
+            }
+            if (predicate.invocation?.configSource) {
+              candidates.push(predicate.invocation.configSource);
+            }
+            if (Array.isArray(buildDefinition.resolvedDependencies)) {
+              candidates.push(...buildDefinition.resolvedDependencies);
+            }
+            if (Array.isArray(predicate.materials)) {
+              candidates.push(...predicate.materials);
+            }
+
+            return candidates.filter((candidate) => candidate && typeof candidate === "object");
+          }
+
+          function normalizeMaterials(statement) {
+            return materialCandidates(statement).map((material) => {
+              const uri = typeof material.uri === "string" ? material.uri : undefined;
+              const digest = material.digest && typeof material.digest === "object" ? material.digest : {};
+              return {
+                ...(uri ? { uri } : {}),
+                ...(normalizeRepositoryFromUri(uri) ? { repository: normalizeRepositoryFromUri(uri) } : {}),
+                ...(refNameFromUri(uri) ? { refName: refNameFromUri(uri) } : {}),
+                ...(Object.keys(digest).length ? { digest } : {})
+              };
+            }).filter((material) => material.uri || material.repository || material.digest);
+          }
+
+          function sourceFromStatement(statement) {
+            const materials = normalizeMaterials(statement);
+            const matchingMaterial = materials.find((material) =>
+              material.repository?.toLowerCase() === releaseRepository.toLowerCase()
+            ) ?? materials.find((material) => material.repository);
+            const commitRef = digestCommit(matchingMaterial?.digest);
+
+            return {
+              ...(matchingMaterial?.repository ? { repository: matchingMaterial.repository } : {}),
+              ...(commitRef ? { commitRef } : {}),
+              ...(matchingMaterial?.refName ? { refName: matchingMaterial.refName } : {})
+            };
+          }
+
+          function builderFromStatement(statement) {
+            const predicate = statement?.predicate && typeof statement.predicate === "object"
+              ? statement.predicate
+              : {};
+            const id = predicate.runDetails?.builder?.id ?? predicate.builder?.id;
+
+            return typeof id === "string" && id ? { id } : undefined;
+          }
+
+          function addFailedCheck(container, name, message) {
+            container.failedChecks = Array.isArray(container.failedChecks) ? container.failedChecks : [];
+            container.failedChecks.push({ name, message });
+          }
+
+          async function inspectAttestationLayer(parsedImage, descriptor, layer) {
+            const predicateType = layer?.annotations?.["in-toto.io/predicate-type"];
+            const attestation = {
+              requested: true,
+              present: true,
+              predicateType,
+              manifestDigest: descriptor.digest
+            };
+
+            const descriptorSubjectDigest = normalizeSha256(descriptor?.annotations?.["vnd.docker.reference.digest"]);
+            if (descriptorSubjectDigest) {
+              attestation.subjectDigest = descriptorSubjectDigest;
+            }
+
+            try {
+              const raw = await fetchRegistryBlob(parsedImage, layer.digest);
+              const statement = decodeStatement(raw);
+              const statementPredicateType = typeof statement?.predicateType === "string"
+                ? statement.predicateType
+                : undefined;
+              const subjects = subjectDigests(statement);
+              const statementSubjectDigest = normalizeSha256(subjects[0]?.digest?.sha256);
+
+              attestation.statementDigest = digestForBuffer(raw);
+              if (statementPredicateType) {
+                attestation.predicateType = statementPredicateType;
+              }
+              if (subjects.length) {
+                attestation.subjects = subjects;
+              }
+              if (statementSubjectDigest) {
+                attestation.subjectDigest = statementSubjectDigest;
+              }
+
+              if (!attestation.subjectDigest || attestation.subjectDigest !== imageDigest) {
+                addFailedCheck(
+                  attestation,
+                  "attestation_subject_digest_mismatch",
+                  "The inspected attestation statement subject digest does not match the published image digest."
+                );
+              }
+
+              if (predicateType?.startsWith("https://slsa.dev/provenance/") || statementPredicateType?.startsWith("https://slsa.dev/provenance/")) {
+                const source = sourceFromStatement(statement);
+                const builder = builderFromStatement(statement);
+                const materials = normalizeMaterials(statement);
+
+                attestation.source = source;
+                if (builder) {
+                  attestation.builder = builder;
+                }
+                if (materials.length) {
+                  attestation.materials = materials;
+                }
+
+                if (source.repository?.toLowerCase() !== releaseRepository.toLowerCase()) {
+                  addFailedCheck(attestation, "provenance_repository_unverified", "The provenance statement does not bind the expected repository.");
+                }
+                if (source.commitRef !== releaseCommitRef) {
+                  addFailedCheck(attestation, "provenance_commit_unverified", "The provenance statement does not bind the expected commit.");
+                }
+                if (source.refName !== releaseRefName) {
+                  addFailedCheck(attestation, "provenance_ref_unverified", "The provenance statement does not bind the expected ref.");
+                }
+                if (!builder?.id) {
+                  addFailedCheck(attestation, "provenance_builder_unverified", "The provenance statement does not expose a builder identity.");
+                }
+                if (!materials.length) {
+                  addFailedCheck(attestation, "provenance_materials_unverified", "The provenance statement does not expose materials.");
+                }
+              }
+            } catch (error) {
+              addFailedCheck(
+                attestation,
+                "attestation_statement_unavailable",
+                error instanceof Error ? error.message : "The attestation statement could not be inspected."
+              );
+            }
+
+            return attestation;
+          }
+
+          async function main() {
+            const parsedImage = parseImageReference(imageName);
+            const index = inspectRaw(imageRef);
+            const attestationDescriptors = descriptorsFromIndex(index).filter((descriptor) => {
+              const annotations = descriptor?.annotations ?? {};
+              return annotations["vnd.docker.reference.type"] === "attestation-manifest" &&
+                typeof descriptor.digest === "string" &&
+                descriptor.digest.startsWith("sha256:");
+            });
+
+            const inspected = [];
+            const evidence = {
+              mode: "registry",
+              subjectDigest: imageDigest,
+              inspector: "docker buildx imagetools inspect --raw + registry blob fetch",
+              inspectedAt: new Date().toISOString()
+            };
+
+            for (const descriptor of attestationDescriptors) {
+              const manifest = inspectRaw(`${imageName}@${descriptor.digest}`);
+              const layers = Array.isArray(manifest.layers) ? manifest.layers : [];
+
+              for (const layer of layers) {
+                const predicateType = layer?.annotations?.["in-toto.io/predicate-type"];
+                if (typeof predicateType !== "string" || !predicateType) {
+                  continue;
+                }
+                inspected.push(await inspectAttestationLayer(parsedImage, descriptor, layer));
+              }
+            }
+
+            evidence.provenance = inspected.find((entry) =>
+              typeof entry.predicateType === "string" &&
+                entry.predicateType.startsWith("https://slsa.dev/provenance/")
+            ) ?? {
+              requested: true,
+              present: false,
+              failedChecks: [{ name: "provenance_attestation_missing", message: "No SLSA provenance attestation was found in the registry index." }]
+            };
+
+            evidence.sbom = inspected.find((entry) =>
+              typeof entry.predicateType === "string" &&
+                (entry.predicateType.startsWith("https://spdx.dev/") || entry.predicateType.startsWith("https://cyclonedx.org/"))
+            ) ?? {
+              requested: true,
+              present: false,
+              failedChecks: [{ name: "sbom_attestation_missing", message: "No SPDX or CycloneDX SBOM attestation was found in the registry index." }]
+            };
+
+            if (!attestationDescriptors.length) {
+              evidence.failedChecks = [{ name: "attestation_manifest_missing", message: "The registry index does not include attestation manifests." }];
+            }
+
+            writeFileSync("release-image-attestations.json", `${JSON.stringify(evidence, null, 2)}\n`);
+          }
+
+          main().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
           NODE
 
       - name: Write image evidence
@@ -226,6 +583,24 @@ jobs:
           name: release-image-evidence
           path: release-image-evidence.json
           if-no-files-found: error
+
+      - name: Gate image attestation evidence
+        run: |
+          node <<'NODE'
+          const { readFileSync } = require("node:fs");
+          const evidence = JSON.parse(readFileSync("release-image-evidence.json", "utf8"));
+          const attestations = evidence.attestations ?? {};
+          const failed = [
+            ...(Array.isArray(attestations.failedChecks) ? attestations.failedChecks : []),
+            ...(Array.isArray(attestations.provenance?.failedChecks) ? attestations.provenance.failedChecks : []),
+            ...(Array.isArray(attestations.sbom?.failedChecks) ? attestations.sbom.failedChecks : [])
+          ];
+
+          if (failed.length || attestations.provenance?.present !== true || attestations.sbom?.present !== true) {
+            console.error(JSON.stringify({ failedChecks: failed }, null, 2));
+            throw new Error("Published image provenance/SBOM attestation evidence is incomplete.");
+          }
+          NODE
 
       - name: Write digest summary
         run: |

@@ -18,6 +18,7 @@ function baseOptions(overrides: Partial<Parameters<typeof createReleaseEvidenceR
     publicBaseUrl: "https://siteflow.example.com",
     operatorName: "release-operator",
     releaseTicket: "REL-2026-0608",
+    observabilityTargetStackApiUrl: "https://observability.example.com/siteflow-proof",
     outputDir: "evidence/release-abc123def456",
     now,
     ...overrides
@@ -38,6 +39,7 @@ describe("releaseEvidenceRehearsalPack", () => {
         commitRef: "abc123def4567890",
         repository: "acme/siteflow",
         branch: "main",
+        sourceProvider: "github",
         targetEnvironment: "production",
         requiredStatusCheck: "Install, test, and build",
         publicBaseUrl: "https://siteflow.example.com"
@@ -77,11 +79,18 @@ describe("releaseEvidenceRehearsalPack", () => {
         "--upgrade-rollback-evidence",
         pack.evidenceFiles.upgradeRollback,
         "--target-environment",
-        "production"
+        "production",
+        "--attestation-key-id-env",
+        "SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID"
       ])
     );
+    expect(pack.finalCommands.compose.env).toEqual(expect.arrayContaining([
+      "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY",
+      "SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID"
+    ]));
     expect(pack.finalCommands.compose.args).not.toContain("--docker-socket-profile-accepted");
     expect(pack.requiredManualInputs.join("\n")).toContain("Docker socket trusted single-host profile not accepted");
+    expect(pack.requiredManualInputs.join("\n")).toContain("SITEFLOW_DOCKER_SOCKET_GID");
     expect(pack.finalCommands.check.args).toEqual(
       expect.arrayContaining([
         "--evidence",
@@ -93,15 +102,29 @@ describe("releaseEvidenceRehearsalPack", () => {
         "--branch",
         "main",
         "--target-environment",
-        "production"
+        "production",
+        "--attestation-key-id-env",
+        "SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID"
       ])
     );
+    expect(pack.finalCommands.check.env).toEqual(expect.arrayContaining([
+      "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY",
+      "SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID"
+    ]));
     expect(pack.steps.find((step) => step.id === "backup_evidence")?.command.args).toEqual(
       expect.arrayContaining([
         "--backup-fetch",
         pack.evidenceFiles.backupFetch,
         "--provider-security-audit",
-        pack.evidenceFiles.backupProviderSecurityAudit
+        pack.evidenceFiles.backupProviderSecurityAudit,
+        "--commit-ref",
+        "abc123def4567890",
+        "--repo",
+        "acme/siteflow",
+        "--branch",
+        "main",
+        "--target-environment",
+        "production"
       ])
     );
     expect(pack.steps.find((step) => step.id === "upgrade_rollback_evidence")?.command.args).toEqual(
@@ -119,7 +142,9 @@ describe("releaseEvidenceRehearsalPack", () => {
         "release:artifacts:evidence",
         "--manifest",
         pack.evidenceFiles.releaseArtifactManifest,
-        "--deployment-artifact-manifest",
+        "--deployment-detail",
+        "<candidate-deployment-detail-path>",
+        "--write-deployment-artifact-manifest",
         pack.evidenceFiles.deploymentArtifactManifest,
         "--commit-ref",
         "abc123def4567890",
@@ -132,6 +157,11 @@ describe("releaseEvidenceRehearsalPack", () => {
         "--json"
       ])
     );
+    expect(pack.steps.find((step) => step.id === "release_artifact_evidence")?.command.args)
+      .not.toContain("--deployment-artifact-manifest");
+    const releaseArtifactStep = pack.steps.find((step) => step.id === "release_artifact_evidence")!;
+    expect(releaseArtifactStep.prerequisites.join("\n")).toContain("candidate deployment detail");
+    expect(releaseArtifactStep.notes.join("\n")).toContain("not uploaded as release evidence");
     expect(pack.steps.find((step) => step.id === "release_image_evidence")?.command).toMatchObject({
       executable: "gh",
       args: [
@@ -147,19 +177,58 @@ describe("releaseEvidenceRehearsalPack", () => {
     });
     expect(pack.steps.find((step) => step.id === "operator_access_evidence")?.command.args).toEqual(
       expect.arrayContaining([
+        "operator-access:evidence:collect",
+        "--base-url",
+        "https://siteflow.example.com",
+        "--commit-ref",
+        "abc123def4567890",
+        "--repo",
+        "acme/siteflow",
+        "--branch",
+        "main",
         "--target-environment",
-        "production"
+        "production",
+        "--operator-name",
+        "release-operator",
+        "--release-ticket",
+        "REL-2026-0608",
+        "--admin-token-env",
+        "SITEFLOW_API_TOKEN",
+        "--low-scope-token-env",
+        "SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN",
+        "--project-id",
+        "<operator-access-project-id>",
+        "--denied-project-id",
+        "<operator-access-denied-project-id>",
+        "--execute-project-cutoff",
+        "--execute-global-cutoff",
+        "--i-understand-this-revokes-active-operator-sessions",
+        "--browser-token-fallback-disabled",
+        "--local-storage-fallback-disabled",
+        "--output",
+        pack.evidenceFiles.operatorAccessRaw,
+        "--check-output",
+        pack.evidenceFiles.operatorAccess
       ])
     );
+    expect(pack.steps.find((step) => step.id === "operator_access_evidence")?.command.env).toEqual([
+      "SITEFLOW_API_TOKEN",
+      "SITEFLOW_API_TOKEN_FILE",
+      "SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN",
+      "SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN_FILE"
+    ]);
     const operatorAccessStep = pack.steps.find((step) => step.id === "operator_access_evidence")!;
     expect(operatorAccessStep.prerequisites.join("\n")).toContain("operator-access:evidence:template");
     expect(operatorAccessStep.prerequisites.join("\n")).toContain(pack.evidenceFiles.operatorAccessRaw);
-    expect(operatorAccessStep.notes.join("\n")).toContain("status=blocked, dryRun=true, and template=true");
+    expect(operatorAccessStep.prerequisites.join("\n")).toContain("temporary routing rule");
+    expect(operatorAccessStep.prerequisites.join("\n")).toContain("cleanup failure blocks");
+    expect(operatorAccessStep.notes.join("\n")).toContain("collector writes both the raw operator-access evidence");
+    expect(operatorAccessStep.notes.join("\n")).toContain("blocked manual fallback");
     expect(pack.steps.find((step) => step.id === "source_provider_evidence")?.command.args).toEqual(
       expect.arrayContaining([
-        "source-provider:evidence",
-        "--evidence",
-        pack.evidenceFiles.sourceProviderRaw,
+        "source-provider:evidence:collect",
+        "--provider",
+        "github",
         "--commit-ref",
         "abc123def4567890",
         "--repo",
@@ -167,19 +236,38 @@ describe("releaseEvidenceRehearsalPack", () => {
         "--branch",
         "main",
         "--target-environment",
-        "production"
+        "production",
+        "--operator-name",
+        "release-operator",
+        "--release-ticket",
+        "REL-2026-0608",
+        "--webhook-delivery-id",
+        "<webhook-delivery-id>",
+        "--webhook-signature-verified",
+        "--webhook-secret-configured",
+        "--deploy-key-path",
+        "<deploy-key-path>",
+        "--deploy-key-mounted",
+        "--host-key-pinned",
+        "--known-hosts-path",
+        "<known-hosts-path>",
+        "--output",
+        pack.evidenceFiles.sourceProviderRaw,
+        "--check-output",
+        pack.evidenceFiles.sourceProvider
       ])
     );
+    expect(pack.steps.find((step) => step.id === "source_provider_evidence")?.command.env).toEqual(["GITHUB_TOKEN"]);
     const sourceProviderStep = pack.steps.find((step) => step.id === "source_provider_evidence")!;
     expect(sourceProviderStep.prerequisites.join("\n")).toContain("source-provider:evidence:template");
     expect(sourceProviderStep.prerequisites.join("\n")).toContain(pack.evidenceFiles.sourceProviderRaw);
-    expect(sourceProviderStep.prerequisites.join("\n")).toContain("--provider '<source-provider>'");
+    expect(sourceProviderStep.prerequisites.join("\n")).toContain("real delivery id");
+    expect(sourceProviderStep.prerequisites.join("\n")).toContain("--provider github");
+    expect(sourceProviderStep.notes.join("\n")).toContain("collector writes both the raw source-provider evidence");
     expect(sourceProviderStep.notes.join("\n")).toContain("status=blocked, dryRun=true, and template=true");
     expect(pack.steps.find((step) => step.id === "target_runtime_evidence")?.command.args).toEqual(
       expect.arrayContaining([
-        "release:target-runtime:evidence",
-        "--evidence",
-        pack.evidenceFiles.targetRuntimeRaw,
+        "release:target-runtime:evidence:collect",
         "--commit-ref",
         "abc123def4567890",
         "--repo",
@@ -187,25 +275,95 @@ describe("releaseEvidenceRehearsalPack", () => {
         "--branch",
         "main",
         "--target-environment",
-        "production"
+        "production",
+        "--env-file",
+        "evidence/target.env",
+        "--public-base-url",
+        "https://siteflow.example.com",
+        "--expected-digest",
+        "<release-image-digest>",
+        "--operator-name",
+        "release-operator",
+        "--release-ticket",
+        "REL-2026-0608",
+        "--output",
+        pack.evidenceFiles.targetRuntimeRaw,
+        "--check-output",
+        pack.evidenceFiles.targetRuntime
       ])
     );
     const targetRuntimeStep = pack.steps.find((step) => step.id === "target_runtime_evidence")!;
     expect(targetRuntimeStep.prerequisites.join("\n")).toContain("release:target-runtime:evidence:template");
     expect(targetRuntimeStep.prerequisites.join("\n")).toContain(pack.evidenceFiles.targetRuntimeRaw);
-    expect(targetRuntimeStep.notes.join("\n")).toContain("status=blocked, dryRun=true, and template=true");
-    expect(targetRuntimeStep.notes.join("\n")).toContain("worker health/queue/heartbeat");
-    expect(targetRuntimeStep.notes.join("\n")).toContain("Compose API/worker image digests to match the release image digest");
+    expect(targetRuntimeStep.prerequisites.join("\n")).toContain("actual target host");
+    expect(targetRuntimeStep.prerequisites.join("\n")).toContain("SITEFLOW_DOCKER_SOCKET_GID");
+    expect(targetRuntimeStep.prerequisites.join("\n")).toContain("release image evidence artifact");
+    expect(targetRuntimeStep.notes.join("\n")).toContain("collector writes both the raw target-runtime evidence");
+    expect(targetRuntimeStep.notes.join("\n")).toContain("worker healthcheck");
+    expect(targetRuntimeStep.notes.join("\n")).toContain("blocked manual fallback");
     expect(pack.steps.find((step) => step.id === "non_session_credential_evidence")?.command.args).toEqual(
       expect.arrayContaining([
+        "non-session-credential:evidence:collect",
+        "--base-url",
+        "https://siteflow.example.com",
+        "--commit-ref",
+        "abc123def4567890",
+        "--repo",
+        "acme/siteflow",
+        "--branch",
+        "main",
         "--target-environment",
-        "production"
+        "production",
+        "--operator-name",
+        "release-operator",
+        "--release-ticket",
+        "REL-2026-0608",
+        "--old-metrics-token-env",
+        "SITEFLOW_OLD_METRICS_TOKEN",
+        "--new-metrics-token-env",
+        "SITEFLOW_METRICS_TOKEN",
+        "--old-api-token-env",
+        "SITEFLOW_OLD_API_TOKEN",
+        "--new-api-token-env",
+        "SITEFLOW_API_TOKEN",
+        "--old-redacted-identifier",
+        "<old-metrics-token-redacted-id>",
+        "--new-redacted-identifier",
+        "<new-metrics-token-redacted-id>",
+        "--old-api-redacted-identifier",
+        "<old-root-api-token-redacted-id>",
+        "--new-api-redacted-identifier",
+        "<new-root-api-token-redacted-id>",
+        "--break-glass-source",
+        "<break-glass-source>",
+        "--break-glass-approver-count",
+        "<break-glass-approver-count>",
+        "--break-glass-reviewed",
+        "--break-glass-time-bounded",
+        "--break-glass-revocation-planned",
+        "--output",
+        pack.evidenceFiles.nonSessionCredentialRaw,
+        "--check-output",
+        pack.evidenceFiles.nonSessionCredential
       ])
     );
+    expect(pack.steps.find((step) => step.id === "non_session_credential_evidence")?.command.env).toEqual([
+      "SITEFLOW_OLD_METRICS_TOKEN",
+      "SITEFLOW_OLD_METRICS_TOKEN_FILE",
+      "SITEFLOW_METRICS_TOKEN",
+      "SITEFLOW_METRICS_TOKEN_FILE",
+      "SITEFLOW_OLD_API_TOKEN",
+      "SITEFLOW_OLD_API_TOKEN_FILE",
+      "SITEFLOW_API_TOKEN",
+      "SITEFLOW_API_TOKEN_FILE"
+    ]);
     const nonSessionCredentialStep = pack.steps.find((step) => step.id === "non_session_credential_evidence")!;
     expect(nonSessionCredentialStep.prerequisites.join("\n")).toContain("non-session-credential:evidence:template");
     expect(nonSessionCredentialStep.prerequisites.join("\n")).toContain(pack.evidenceFiles.nonSessionCredentialRaw);
-    expect(nonSessionCredentialStep.notes.join("\n")).toContain("status=blocked, dryRun=true, and template=true");
+    expect(nonSessionCredentialStep.prerequisites.join("\n")).toContain("root API token");
+    expect(nonSessionCredentialStep.prerequisites.join("\n")).toContain("/api/auth/verify");
+    expect(nonSessionCredentialStep.notes.join("\n")).toContain("collector writes both the raw non-session credential evidence");
+    expect(nonSessionCredentialStep.notes.join("\n")).toContain("blocked manual fallback");
     expect(pack.steps.find((step) => step.id === "observability_evidence")?.command.args).toEqual(
       expect.arrayContaining([
         "observability:evidence:collect",
@@ -225,19 +383,31 @@ describe("releaseEvidenceRehearsalPack", () => {
         "main",
         "--target-environment",
         "production",
+        "--target-stack-api-url",
+        "https://observability.example.com/siteflow-proof",
+        "--operator-name",
+        "release-operator",
+        "--release-ticket",
+        "REL-2026-0608",
         "--check-output",
         pack.evidenceFiles.observability
       ])
     );
-    expect(pack.steps.find((step) => step.id === "observability_evidence")?.prerequisites).toEqual(
+    const observabilityStep = pack.steps.find((step) => step.id === "observability_evidence")!;
+    expect(observabilityStep.prerequisites).toEqual(
       expect.arrayContaining([
         expect.stringContaining("Backup scheduler ownership"),
+        expect.stringContaining("observability:operator-evidence:template"),
         expect.stringContaining("observabilityTargetStackProof")
       ])
     );
+    expect(observabilityStep.prerequisites.join("\n")).toContain(pack.evidenceFiles.operatorObservability);
+    expect(observabilityStep.notes.join("\n")).toContain("status=blocked, dryRun=true, and template=true");
     expect(pack.steps.find((step) => step.id === "observability_evidence")?.command.env).toEqual([
       "SITEFLOW_METRICS_TOKEN",
-      "SITEFLOW_METRICS_TOKEN_FILE"
+      "SITEFLOW_METRICS_TOKEN_FILE",
+      "SITEFLOW_OBSERVABILITY_STACK_TOKEN",
+      "SITEFLOW_OBSERVABILITY_STACK_TOKEN_FILE"
     ]);
     expect(pack.steps.find((step) => step.id === "ingress_evidence")?.command.args).toEqual(
       expect.arrayContaining([
@@ -274,13 +444,76 @@ describe("releaseEvidenceRehearsalPack", () => {
     expect(ingressStep.notes.join("\n")).toContain("status=blocked, dryRun=true, and template=true");
     expect(pack.blockedProductionClaims.join("\n")).toContain("does not execute GitHub");
     expect(pack.requiredManualInputs.join("\n")).toContain("source-provider:evidence:template");
-    expect(pack.requiredManualInputs.join("\n")).toContain("release:target-runtime:evidence:template");
-    expect(pack.requiredManualInputs.join("\n")).toContain("API/worker images pinned to the release digest");
-    expect(pack.requiredManualInputs.join("\n")).toContain("operator-access:evidence:template");
-    expect(pack.requiredManualInputs.join("\n")).toContain("non-session-credential:evidence:template");
+    expect(pack.requiredManualInputs.join("\n")).toContain("SITEFLOW_DOCKER_SOCKET_GID");
+    expect(pack.requiredManualInputs.join("\n")).toContain("target runtime collector run on the target host");
+    expect(pack.requiredManualInputs.join("\n")).toContain("API/worker image binding");
+    expect(pack.requiredManualInputs.join("\n")).toContain("operator access collector run on the target evidence host");
+    expect(pack.requiredManualInputs.join("\n")).toContain("non-session credential collector run after target metrics and root API token rotation");
+    expect(pack.requiredManualInputs.join("\n")).toContain("observability:operator-evidence:template");
     expect(pack.requiredManualInputs.join("\n")).toContain("ingress:operator-evidence:template");
     expect(pack.requiredManualInputs.join("\n")).toContain("upgrade-rollback:evidence:template");
     expect(JSON.stringify(pack)).not.toContain("Authorization");
+  });
+
+  it("uses a manual template and checker source-provider path for non-GitHub providers", () => {
+    const pack = createReleaseEvidenceRehearsalPack(baseOptions({
+      sourceProvider: "gitlab"
+    }));
+
+    expect(() => validateReleaseEvidenceRehearsalPackContract(pack as unknown as Record<string, unknown>)).not.toThrow();
+    expect(pack.release.sourceProvider).toBe("gitlab");
+    const sourceProviderStep = pack.steps.find((step) => step.id === "source_provider_evidence")!;
+
+    expect(sourceProviderStep.command).toMatchObject({
+      executable: "npm",
+      args: [
+        "run",
+        "--silent",
+        "source-provider:evidence",
+        "--",
+        "--evidence",
+        pack.evidenceFiles.sourceProviderRaw,
+        "--commit-ref",
+        "abc123def4567890",
+        "--repo",
+        "acme/siteflow",
+        "--branch",
+        "main",
+        "--target-environment",
+        "production",
+        "--json"
+      ],
+      captureStdoutTo: pack.evidenceFiles.sourceProvider
+    });
+    expect(sourceProviderStep.command.env).toBeUndefined();
+    expect(sourceProviderStep.command.args).not.toContain("source-provider:evidence:collect");
+    expect(sourceProviderStep.prerequisites.join("\n")).toContain("--provider gitlab");
+    expect(sourceProviderStep.prerequisites.join("\n")).toContain("GITHUB_TOKEN is not required");
+    expect(sourceProviderStep.notes.join("\n")).toContain("completed manual raw source-provider evidence");
+    expect(pack.requiredManualInputs.join("\n")).toContain("source provider gitlab raw evidence");
+
+    const wrongNonGithubCollector = createReleaseEvidenceRehearsalPack(baseOptions({
+      sourceProvider: "gitlab"
+    }));
+    const wrongStep = wrongNonGithubCollector.steps.find((step) => step.id === "source_provider_evidence")!;
+
+    wrongStep.command = {
+      ...wrongStep.command,
+      args: [
+        "run",
+        "--silent",
+        "source-provider:evidence:collect",
+        "--",
+        "--provider",
+        "github",
+        "--json"
+      ],
+      display: "npm run --silent source-provider:evidence:collect -- --provider github --json",
+      env: ["GITHUB_TOKEN"]
+    };
+
+    expect(() => validateReleaseEvidenceRehearsalPackContract(wrongNonGithubCollector as unknown as Record<string, unknown>))
+      .toThrow(/source_provider_evidence command args must run source-provider:evidence with -- separator|source_provider_evidence command env must not include GITHUB_TOKEN/);
   });
 
   it("includes Docker socket profile acceptance only when explicitly requested", () => {
@@ -304,7 +537,7 @@ describe("releaseEvidenceRehearsalPack", () => {
     };
 
     expect(() => validateReleaseEvidenceRehearsalPackContract(wrongStepScript as unknown as Record<string, unknown>))
-      .toThrow(/operator_access_evidence command args must run operator-access:evidence/);
+      .toThrow(/operator_access_evidence command args must run operator-access:evidence:collect/);
 
     const wrongFinalCapture = createReleaseEvidenceRehearsalPack(baseOptions());
 
@@ -326,6 +559,47 @@ describe("releaseEvidenceRehearsalPack", () => {
 
     expect(() => validateReleaseEvidenceRehearsalPackContract(missingProviderAudit as unknown as Record<string, unknown>))
       .toThrow(/backup_evidence command --provider-security-audit must be/);
+
+    const collectorOutputContracts = [
+      {
+        id: "source_provider_evidence",
+        rawKey: "sourceProviderRaw",
+        composeFlag: "--source-provider-evidence"
+      },
+      {
+        id: "target_runtime_evidence",
+        rawKey: "targetRuntimeRaw",
+        composeFlag: "--target-runtime-evidence"
+      },
+      {
+        id: "operator_access_evidence",
+        rawKey: "operatorAccessRaw",
+        composeFlag: "--operator-access-evidence"
+      },
+      {
+        id: "non_session_credential_evidence",
+        rawKey: "nonSessionCredentialRaw",
+        composeFlag: "--non-session-credential-evidence"
+      }
+    ];
+
+    for (const contract of collectorOutputContracts) {
+      const wrongStepOutput = createReleaseEvidenceRehearsalPack(baseOptions());
+      const step = wrongStepOutput.steps.find((entry) => entry.id === contract.id)!;
+
+      step.outputPath = wrongStepOutput.evidenceFiles[contract.rawKey];
+
+      expect(() => validateReleaseEvidenceRehearsalPackContract(wrongStepOutput as unknown as Record<string, unknown>))
+        .toThrow(`${contract.id} outputPath must equal`);
+
+      const wrongComposeInput = createReleaseEvidenceRehearsalPack(baseOptions());
+      const flagIndex = wrongComposeInput.finalCommands.compose.args.indexOf(contract.composeFlag);
+
+      wrongComposeInput.finalCommands.compose.args[flagIndex + 1] = wrongComposeInput.evidenceFiles[contract.rawKey];
+
+      expect(() => validateReleaseEvidenceRehearsalPackContract(wrongComposeInput as unknown as Record<string, unknown>))
+        .toThrow(`finalCommands.compose command ${contract.composeFlag} must be`);
+    }
   });
 
   it("rejects non-HTTPS public URLs and URLs that would archive credentials or query strings", () => {
@@ -338,6 +612,31 @@ describe("releaseEvidenceRehearsalPack", () => {
     expect(() => createReleaseEvidenceRehearsalPack(baseOptions({
       publicBaseUrl: "https://siteflow.example.com?token=do-not-store"
     }))).toThrow(/must not include credentials/);
+  });
+
+  it("requires target-stack proof collection URL for production packs only", () => {
+    expect(() => createReleaseEvidenceRehearsalPack(baseOptions({
+      observabilityTargetStackApiUrl: undefined
+    }))).toThrow(/--observability-target-stack-api-url is required for production/);
+
+    const stagingPack = createReleaseEvidenceRehearsalPack(baseOptions({
+      targetEnvironment: "staging",
+      observabilityTargetStackApiUrl: undefined
+    }));
+
+    expect(() => validateReleaseEvidenceRehearsalPackContract(stagingPack as unknown as Record<string, unknown>)).not.toThrow();
+    expect(stagingPack.steps.find((step) => step.id === "observability_evidence")?.command.args).not.toContain("--target-stack-api-url");
+  });
+
+  it("rejects production packs whose observability command omits target-stack proof collection", () => {
+    const pack = createReleaseEvidenceRehearsalPack(baseOptions());
+    const observabilityStep = pack.steps.find((step) => step.id === "observability_evidence")!;
+    const index = observabilityStep.command.args.indexOf("--target-stack-api-url");
+
+    observabilityStep.command.args.splice(index, 2);
+
+    expect(() => validateReleaseEvidenceRehearsalPackContract(pack as unknown as Record<string, unknown>))
+      .toThrow(/observability_evidence command --target-stack-api-url must be https:\/\/observability\.example\.com\/siteflow-proof/);
   });
 
   it("quotes PowerShell command displays without changing structured args", () => {
@@ -443,6 +742,10 @@ describe("releaseEvidenceRehearsalPack", () => {
           "release-operator",
           "--release-ticket",
           "REL-2026-0608",
+          "--observability-target-stack-api-url",
+          "https://observability.example.com/siteflow-proof",
+          "--source-provider",
+          "gitea",
           "--output-dir",
           outputDir,
           "--checked-at",
@@ -465,10 +768,15 @@ describe("releaseEvidenceRehearsalPack", () => {
       expect(printed).toMatchObject({
         status: "planned",
         generatedAt: "2026-06-08T12:34:56.000Z",
+        release: {
+          sourceProvider: "gitea"
+        },
         outputDir
       });
       expect(markdown).toContain("release_gate");
       expect(markdown).toContain("source-provider:evidence:template");
+      expect(markdown).toContain("GITHUB_TOKEN is not required");
+      expect(markdown).toContain("observability:operator-evidence:template");
       expect(markdown).toContain("ingress:evidence:collect");
       expect(markdown).toContain("ingress:operator-evidence:template");
       expect(markdown).toContain("release:evidence:compose");

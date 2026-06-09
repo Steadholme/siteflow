@@ -48,6 +48,7 @@ export interface IngressEvidenceCheckResult {
     forwardedHeaders: IngressEvidenceSummary | null;
     apiRateLimit: IngressEvidenceSummary | null;
     unthrottledRoutes: IngressEvidenceSummary | null;
+    metricsAccessControl: IngressEvidenceSummary | null;
   };
   checks: IngressEvidenceCheck[];
   exitCode: number;
@@ -76,12 +77,18 @@ const passStatuses = new Set(["pass", "passed", "ok", "healthy", "verified"]);
 const blockedStatuses = new Set([...passStatuses, "blocked"]);
 const limitedStatuses = new Set([...passStatuses, "limited"]);
 const validTrustProxyPolicies = new Set(["loopback", "private"]);
+const validMetricsPrivateScrapeProtections = new Set([
+  "private_network",
+  "localhost_sidecar",
+  "reverse_proxy_allowlist"
+]);
 export const requiredIngressEvidenceCheckNames = [
   "non_dry_run",
   "not_template",
   "status_final",
   "evidence_age",
   "release_identity",
+  "target_facts",
   "environment",
   "no_sensitive_evidence_values",
   "public_base_url",
@@ -282,6 +289,16 @@ function summarizeEvidence(candidate: Record<string, unknown> | undefined, extra
   return summary;
 }
 
+function booleanField(candidate: Record<string, unknown> | undefined, keys: string[]) {
+  for (const key of keys) {
+    if (typeof candidate?.[key] === "boolean") {
+      return candidate[key];
+    }
+  }
+
+  return undefined;
+}
+
 function isPassingStatus(value: unknown) {
   const normalized = statusValue(value);
 
@@ -304,6 +321,67 @@ function publicBaseUrl(root: Record<string, unknown> | undefined) {
   return stringValue(root?.publicBaseUrl) ??
     stringValue(root?.baseUrl) ??
     stringValue(nestedValue(root, ["target", "publicBaseUrl"]));
+}
+
+function targetObject(root: Record<string, unknown> | undefined) {
+  return nestedObject(root, "target");
+}
+
+function targetEnvironmentName(target: Record<string, unknown> | undefined) {
+  return stringValue(target?.environment) ?? stringValue(target?.targetEnvironment);
+}
+
+function targetPublicBaseUrl(target: Record<string, unknown> | undefined) {
+  return stringValue(target?.publicBaseUrl) ?? stringValue(target?.baseUrl);
+}
+
+function targetDirectApiUrl(target: Record<string, unknown> | undefined) {
+  return stringValue(target?.directApiUrl) ?? stringValue(target?.directApiBaseUrl);
+}
+
+function targetReleaseObject(target: Record<string, unknown> | undefined) {
+  return nestedObject(target, "release") ?? target;
+}
+
+function targetReleaseCommit(target: Record<string, unknown> | undefined) {
+  const release = targetReleaseObject(target);
+
+  return stringValue(release?.commitRef) ?? stringValue(release?.commitSha);
+}
+
+function targetReleaseRepository(target: Record<string, unknown> | undefined) {
+  return stringValue(targetReleaseObject(target)?.repository);
+}
+
+function targetReleaseBranch(target: Record<string, unknown> | undefined) {
+  return stringValue(targetReleaseObject(target)?.branch);
+}
+
+function targetFactsMatch(
+  root: Record<string, unknown> | undefined,
+  directApiPort: Record<string, unknown> | undefined
+) {
+  const target = targetObject(root);
+  const targetCommitRef = targetReleaseCommit(target);
+  const targetRepository = targetReleaseRepository(target);
+  const targetBranch = targetReleaseBranch(target);
+  const directApiTarget = stringValue(directApiPort?.target) ?? stringValue(directApiPort?.url);
+
+  return Boolean(
+    target &&
+      targetEnvironmentName(target) &&
+      targetEnvironmentName(target) === environmentName(root) &&
+      targetPublicBaseUrl(target) &&
+      targetPublicBaseUrl(target) === publicBaseUrl(root) &&
+      targetDirectApiUrl(target) &&
+      targetDirectApiUrl(target) === directApiTarget &&
+      targetCommitRef &&
+      targetCommitRef === releaseCommit(root) &&
+      targetRepository &&
+      targetRepository === releaseRepository(root) &&
+      targetBranch &&
+      targetBranch === releaseBranch(root)
+  );
 }
 
 function environmentName(root: Record<string, unknown> | undefined) {
@@ -454,6 +532,26 @@ function normalizedToken(value: unknown) {
   return stringValue(value)?.toLowerCase().replace(/[\s-]+/g, "_");
 }
 
+function metricsScrapePath(value: Record<string, unknown> | undefined) {
+  return stringValue(value?.scrapePath) ?? stringValue(value?.path) ?? stringValue(value?.endpoint);
+}
+
+function metricsPrivateScrapeProtectionAllowed(value: Record<string, unknown> | undefined) {
+  const protection = normalizedToken(value?.protection) ??
+    normalizedToken(value?.accessControl) ??
+    normalizedToken(value?.networkProtection);
+
+  return Boolean(protection && validMetricsPrivateScrapeProtections.has(protection));
+}
+
+function metricsPublicAccessBlocked(value: Record<string, unknown> | undefined) {
+  return booleanField(value, [
+    "publicAccessBlocked",
+    "noPublicUnauthenticatedAccess",
+    "publicUnauthenticatedAccessBlocked"
+  ]) === true;
+}
+
 function deploymentTopology(root: Record<string, unknown> | undefined) {
   return selectEvidence(root, ["deploymentTopology", "topology"], ["deployment_topology", "topology"]);
 }
@@ -565,6 +663,11 @@ export function evaluateIngressEvidence(
   const proxySource = selectEvidence(root, ["proxySourcePolicy", "trustedProxyPolicy"], ["proxy_source_policy", "trusted-proxy-policy"]);
   const apiRateLimit = selectEvidence(root, ["apiRateLimit", "edgeRateLimit", "sharedRateLimit"], ["api_rate_limit", "edge-rate-limit", "shared-rate-limit"]);
   const unthrottledRoutes = selectEvidence(root, ["unthrottledRoutes", "nonApiRoutes"], ["unthrottled_routes", "non-api-routes"]);
+  const metricsAccessControl = selectEvidence(
+    root,
+    ["metricsAccessControl", "metricsPrivateScrape", "metricsPrivateScrapeException"],
+    ["metrics_access_control", "metrics-private-scrape", "metrics_private_scrape", "metrics_private_scrape_exception"]
+  );
   const topology = deploymentTopology(root);
   const policy = trustProxyPolicy(root, proxySource);
   const releaseIdentity = releaseIdentityValues(root, options);
@@ -580,6 +683,12 @@ export function evaluateIngressEvidence(
   addCheck(checks, "not_template", root?.template !== true, "Ingress evidence must be final target evidence, not a template skeleton.");
   addCheck(checks, "evidence_age", freshTimestamp(selectedTimestamp(root), now, maxAgeHours), `Ingress evidence must be no older than ${maxAgeHours} hours.`);
   addCheck(checks, "release_identity", releaseIdentityMatches(root, options), "Ingress evidence must be bound to the requested release commit, repository, and branch.");
+  addCheck(
+    checks,
+    "target_facts",
+    targetFactsMatch(root, directApiPort),
+    "Ingress evidence must include target environment, public URL, direct API probe URL, and release identity facts matching the final evidence."
+  );
   addCheck(
     checks,
     "environment",
@@ -672,6 +781,30 @@ export function evaluateIngressEvidence(
     allRouteChecksPresent(unthrottledRoutes),
     "Health, readiness, metrics, preview, and static routes must be checked and not return 429 from the API edge limiter."
   );
+  addCheck(
+    checks,
+    "metrics_access_control_optional",
+    !metricsAccessControl || isPassingStatus(metricsAccessControl.status),
+    "Metrics private-scrape access-control evidence is optional, but when present its status must be passing."
+  );
+  addCheck(
+    checks,
+    "metrics_access_control_age",
+    !metricsAccessControl || freshTimestamp(selectedTimestamp(metricsAccessControl), now, maxAgeHours),
+    `Metrics private-scrape access-control evidence must be no older than ${maxAgeHours} hours when provided.`
+  );
+  addCheck(
+    checks,
+    "metrics_access_control_private_scrape",
+    !metricsAccessControl ||
+      (
+        metricsAccessControl.privateScrapeException === true &&
+        metricsScrapePath(metricsAccessControl) === "/metrics" &&
+        metricsPrivateScrapeProtectionAllowed(metricsAccessControl) &&
+        metricsPublicAccessBlocked(metricsAccessControl)
+      ),
+    "Metrics private-scrape evidence must prove /metrics is private-network, localhost-sidecar, or reverse-proxy-allowlist protected and not publicly unauthenticated."
+  );
   addCheck(checks, "operator", Boolean(operatorName(root)), "Ingress evidence must include the operator name.");
   addCheck(checks, "ticket", Boolean(ticketId(root)), "Ingress evidence must include a release, change, or incident ticket id.");
 
@@ -709,7 +842,19 @@ export function evaluateIngressEvidence(
         "enforcedAt",
         "clientIpBucketed"
       ]),
-      unthrottledRoutes: summarizeEvidence(unthrottledRoutes)
+      unthrottledRoutes: summarizeEvidence(unthrottledRoutes),
+      metricsAccessControl: summarizeEvidence(metricsAccessControl, [
+        "privateScrapeException",
+        "scrapePath",
+        "path",
+        "endpoint",
+        "protection",
+        "accessControl",
+        "networkProtection",
+        "publicAccessBlocked",
+        "noPublicUnauthenticatedAccess",
+        "publicUnauthenticatedAccessBlocked"
+      ])
     },
     checks,
     exitCode: passed ? 0 : 1
@@ -843,7 +988,8 @@ export async function runIngressEvidenceCheckCli(
         directApiPort: null,
         forwardedHeaders: null,
         apiRateLimit: null,
-        unthrottledRoutes: null
+        unthrottledRoutes: null,
+        metricsAccessControl: null
       },
       checks: [
         {

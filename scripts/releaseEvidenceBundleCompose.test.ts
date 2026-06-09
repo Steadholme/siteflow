@@ -2,45 +2,29 @@ import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promise
 import os from "node:os";
 import path from "node:path";
 import { composeReleaseEvidenceBundle, runReleaseEvidenceBundleComposeCli } from "./releaseEvidenceBundleCompose";
-import { evaluateReleaseEvidenceBundle } from "./releaseEvidenceBundleCheck";
+import { evaluateReleaseEvidenceBundle, releaseEvidenceBundleAttestationKeyId, releaseEvidenceBundlePayloadDigest } from "./releaseEvidenceBundleCheck";
 import { requiredOffHostBackupEvidenceCheckNames } from "./backupEvidenceCheck";
 import { requiredIngressEvidenceCheckNames } from "./ingressEvidenceCheck";
+import {
+  requiredNonSessionCredentialEvidenceCheckNames as exportedNonSessionCredentialEvidenceCheckNames
+} from "./nonSessionCredentialEvidenceCheck";
+import { requiredObservabilityEvidenceCheckNames } from "./observabilityEvidenceCheck";
+import { requiredOperatorAccessEvidenceCheckNames } from "./operatorAccessEvidenceCheck";
 import { requiredReleaseArtifactCheckNames } from "./releaseArtifactContracts";
 import { requiredSourceProviderEvidenceCheckNames } from "./sourceProviderEvidenceCheck";
 import { requiredTargetRuntimeEvidenceCheckNames } from "./releaseTargetRuntimeEvidenceCheck";
+import { requiredUpgradeRollbackDrillEvidenceCheckNames } from "./upgradeRollbackDrillEvidenceCheck";
 
 const now = () => new Date("2026-06-07T12:00:00.000Z");
 const commitRef = "abc123def456";
 const repository = "acme/siteflow";
 const branch = "main";
 const requiredStatusCheck = "Install, test, and build";
+const attestationSigningKey = "release-evidence-test-signing-key-with-enough-entropy";
+const attestationSigningKeyId = releaseEvidenceBundleAttestationKeyId(attestationSigningKey);
 const buildImage = "registry.local/siteflow/build-node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const backupKmsKeyRef = "arn:aws:kms:us-east-1:111122223333:key/siteflow-prod-backups";
-const requiredNonSessionCredentialEvidenceCheckNames = [
-  "non_dry_run",
-  "not_template",
-  "status_final",
-  "release_identity",
-  "environment",
-  "operator",
-  "ticket",
-  "credentials_present",
-  "credential_types_supported",
-  "credential_owners_and_tickets",
-  "credential_status",
-  "credential_age",
-  "credential_redacted_identifiers",
-  "no_raw_credentials_archived",
-  "no_sensitive_evidence_values",
-  "old_credentials_rejected",
-  "new_credentials_accepted",
-  "credential_specific_evidence",
-  "break_glass_present",
-  "break_glass_status",
-  "break_glass_age",
-  "break_glass_controls",
-  "automation_not_claimed"
-];
+const requiredNonSessionCredentialEvidenceCheckNames = [...exportedNonSessionCredentialEvidenceCheckNames];
 
 function passingCheck(name: string) {
   return {
@@ -107,6 +91,13 @@ function releaseGateEvidence() {
   return {
     status: "pass",
     checkedAt: "2026-06-07T10:09:00.000Z",
+    checks: [
+      passingCheck("local.gitStatus"),
+      passingCheck("local.requiredEnv"),
+      passingCheck("external.githubBranchProtection"),
+      passingCheck("external.githubProtectedBranchCommit"),
+      passingCheck("external.githubCommitStatus")
+    ],
     promotionEvidence: {
       gateStatus: "pass",
       checkedAt: "2026-06-07T10:09:00.000Z",
@@ -178,7 +169,11 @@ function releaseGateEvidence() {
         gitTimeoutStatus: "pass",
         gitTimeoutMs: 300000,
         buildNetworkStatus: "pass",
-        buildNetwork: "none"
+        buildNetwork: "none",
+        workerUserStatus: "pass",
+        workerUser: "1000:1000",
+        dockerSocketGidStatus: "pass",
+        dockerSocketGid: 998
       },
       dirtyWorktree: {
         status: "pass",
@@ -379,13 +374,49 @@ function releaseImageEvidence() {
         requested: true,
         present: true,
         predicateType: "https://slsa.dev/provenance/v1",
-        manifestDigest: `sha256:${"e".repeat(64)}`
+        manifestDigest: `sha256:${"e".repeat(64)}`,
+        statementDigest: `sha256:${"c".repeat(64)}`,
+        subjectDigest: `sha256:${"f".repeat(64)}`,
+        subjects: [
+          {
+            name: "ghcr.io/siteflow/siteflow",
+            digest: {
+              sha256: `${"f".repeat(64)}`
+            }
+          }
+        ],
+        source: {
+          repository,
+          commitRef,
+          refName: "v0.1.0"
+        },
+        builder: {
+          id: "https://github.com/docker/buildx/actions/runs/123456789/attempts/1"
+        },
+        materials: [
+          {
+            uri: "git+https://github.com/acme/siteflow.git#refs/tags/v0.1.0",
+            digest: {
+              gitCommit: commitRef
+            }
+          }
+        ]
       },
       sbom: {
         requested: true,
         present: true,
         predicateType: "https://spdx.dev/Document",
-        manifestDigest: `sha256:${"d".repeat(64)}`
+        manifestDigest: `sha256:${"d".repeat(64)}`,
+        statementDigest: `sha256:${"b".repeat(64)}`,
+        subjectDigest: `sha256:${"f".repeat(64)}`,
+        subjects: [
+          {
+            name: "ghcr.io/siteflow/siteflow",
+            digest: {
+              sha256: `${"f".repeat(64)}`
+            }
+          }
+        ]
       }
     },
     checkedAt: "2026-06-07T10:19:45.000Z"
@@ -406,7 +437,20 @@ function targetRuntimeEvidence() {
       commitRef,
       repository,
       branch,
+      targetIdentity: { status: "passed", timestamp: "2026-06-07T10:19:55.000Z" },
       composeConfig: { status: "passed", timestamp: "2026-06-07T10:20:00.000Z" },
+      workerRuntimePosture: {
+        status: "passed",
+        timestamp: "2026-06-07T10:20:00.000Z",
+        dockerSocketMounted: true,
+        groupAddConfigured: true,
+        buildRunnerDocker: true,
+        buildNetworkNone: true,
+        dockerCliPreflightPresent: true,
+        dockerInfoPreflightPresent: true,
+        gitSshKeyPathEnvPresent: true,
+        gitKnownHostsPathEnvPresent: true
+      },
       startup: { status: "passed", timestamp: "2026-06-07T10:20:05.000Z" },
       serviceHealth: { status: "passed", timestamp: "2026-06-07T10:20:10.000Z" },
       readiness: { status: "passed", timestamp: "2026-06-07T10:20:15.000Z" },
@@ -438,7 +482,36 @@ function sourceProviderEvidence() {
       branch,
       provider: "github",
       webhookDeliveryId: "delivery-123",
-      deployKeyMode: "not_required"
+      deployKeyMode: "not_required",
+      checkout: {
+        status: "passed",
+        timestamp: "2026-06-07T10:16:00.000Z",
+        commitRef,
+        headSha: commitRef,
+        exactCommitVerified: true
+      },
+      signedWebhook: {
+        status: "passed",
+        timestamp: "2026-06-07T10:17:00.000Z",
+        deliveryId: "delivery-123",
+        event: "push",
+        signatureVerified: true
+      },
+      deployKey: {
+        status: "not_required",
+        timestamp: "2026-06-07T10:18:00.000Z"
+      },
+      hostKey: {
+        status: "not_required",
+        timestamp: "2026-06-07T10:18:30.000Z"
+      },
+      releaseProvenance: {
+        status: "passed",
+        timestamp: "2026-06-07T10:19:00.000Z",
+        commitRef,
+        repository,
+        branch
+      }
     },
     checks: [
       passingCheck("evidence_shape"),
@@ -453,6 +526,12 @@ function backupEvidence() {
     name: "siteflow-backup-evidence-check",
     status: "passed",
     checkedAt: "2026-06-07T10:30:00.000Z",
+    release: {
+      commitRef,
+      repository,
+      branch,
+      targetEnvironment: "production"
+    },
     thresholds: {
       maxBackupAgeHours: 24,
       maxRestoreDrillAgeHours: 168,
@@ -591,76 +670,7 @@ function observabilityEvidence() {
       dashboard: { status: "available", timestamp: "2026-06-07T10:48:00.000Z" },
       logPipeline: { status: "passed", timestamp: "2026-06-07T10:49:00.000Z" }
     },
-    checks: [
-      passingCheck("release_identity"),
-      passingCheck("target_environment"),
-      passingCheck("readiness_present"),
-      passingCheck("readiness_status"),
-      passingCheck("readiness_age"),
-      passingCheck("readiness_status_codes"),
-      passingCheck("readiness_traffic_removed"),
-      passingCheck("metrics_present"),
-      passingCheck("metrics_status"),
-      passingCheck("metrics_age"),
-      passingCheck("metrics_access_control"),
-      passingCheck("metrics_expected_names"),
-      passingCheck("backup_automation_run_present"),
-      passingCheck("backup_automation_run_identity"),
-      passingCheck("backup_automation_run_status"),
-      passingCheck("backup_automation_run_age"),
-      passingCheck("backup_automation_run_steps"),
-      passingCheck("backup_automation_checker_output"),
-      passingCheck("backup_automation_history_present"),
-      passingCheck("backup_automation_history_identity"),
-      passingCheck("backup_automation_history_latest_run"),
-      passingCheck("backup_automation_history_latest_status"),
-      passingCheck("backup_restore_drill_cadence_count"),
-      passingCheck("backup_restore_drill_cadence_gap"),
-      passingCheck("backup_history_checker_output"),
-      passingCheck("backup_scheduler_ownership_present"),
-      passingCheck("backup_scheduler_ownership_status"),
-      passingCheck("backup_scheduler_ownership_age"),
-      passingCheck("backup_scheduler_ownership_schema"),
-      passingCheck("backup_scheduler_ownership_source"),
-      passingCheck("backup_scheduler_ownership_target_environment"),
-      passingCheck("backup_scheduler_ownership_enabled"),
-      passingCheck("backup_scheduler_ownership_schedule"),
-      passingCheck("backup_scheduler_ownership_command"),
-      passingCheck("backup_scheduler_ownership_run_links"),
-      passingCheck("backup_scheduler_ownership_owner"),
-      passingCheck("observability_apply_proof_present"),
-      passingCheck("observability_apply_proof_status"),
-      passingCheck("observability_apply_proof_age"),
-      passingCheck("observability_apply_proof_schema"),
-      passingCheck("observability_apply_proof_source"),
-      passingCheck("observability_apply_proof_plan_schema"),
-      passingCheck("observability_apply_proof_assets"),
-      passingCheck("observability_target_stack_proof_present"),
-      passingCheck("observability_target_stack_proof_status"),
-      passingCheck("observability_target_stack_proof_age"),
-      passingCheck("observability_target_stack_proof_schema"),
-      passingCheck("observability_target_stack_proof_source"),
-      passingCheck("observability_target_stack_proof_release_identity"),
-      passingCheck("observability_target_stack_proof_target_environment"),
-      passingCheck("observability_target_stack_prometheus_rules"),
-      passingCheck("observability_target_stack_grafana_dashboard"),
-      passingCheck("observability_target_stack_alertmanager_receiver"),
-      passingCheck("alert_present"),
-      passingCheck("alert_status"),
-      passingCheck("alert_age"),
-      passingCheck("alert_delivered"),
-      passingCheck("dashboard_present"),
-      passingCheck("dashboard_status"),
-      passingCheck("dashboard_age"),
-      passingCheck("dashboard_reference"),
-      passingCheck("dashboard_owner"),
-      passingCheck("log_pipeline_present"),
-      passingCheck("log_pipeline_status"),
-      passingCheck("log_pipeline_age"),
-      passingCheck("log_retention"),
-      passingCheck("log_redaction_spot_check"),
-      passingCheck("no_sensitive_evidence_values")
-    ],
+    checks: requiredObservabilityEvidenceCheckNames.map(passingCheck),
     exitCode: 0
   };
 }
@@ -723,6 +733,7 @@ function operatorAccessEvidence() {
       passingCheck("schema_version"),
       passingCheck("evidence_name"),
       passingCheck("evidence_status"),
+      ...requiredOperatorAccessEvidenceCheckNames.map(passingCheck),
       passingCheck("non_dry_run"),
       passingCheck("not_template"),
       passingCheck("status_final"),
@@ -800,6 +811,7 @@ function nonSessionCredentialEvidence() {
       credentialCount: 1,
       breakGlass: {
         status: "passed",
+        timestamp: "2026-06-07T10:59:00.000Z",
         ticket: "INC-123"
       }
     },
@@ -832,13 +844,19 @@ function upgradeRollbackEvidence() {
       toVersion: "0.1.1",
       rollbackVersion: "0.1.0",
       upgradeOperationId: "op_upgrade_1",
-      rollbackOperationId: "op_rollback_1"
+      rollbackOperationId: "op_rollback_1",
+      backupEvidence: { status: "passed", timestamp: "2026-06-07T10:30:00.000Z" },
+      routeUpgrade: { status: "passed", timestamp: "2026-06-07T10:40:00.000Z" },
+      routeRollback: { status: "passed", timestamp: "2026-06-07T10:50:00.000Z" },
+      readiness: { status: "passed", timestamp: "2026-06-07T10:55:00.000Z" },
+      observability: { status: "passed", timestamp: "2026-06-07T11:00:00.000Z" }
     },
     checks: [
       passingCheck("evidence_shape"),
       passingCheck("schema_version"),
       passingCheck("evidence_name"),
       passingCheck("drill_status"),
+      ...requiredUpgradeRollbackDrillEvidenceCheckNames.map(passingCheck),
       passingCheck("non_dry_run"),
       passingCheck("not_template"),
       passingCheck("status_final"),
@@ -994,6 +1012,7 @@ describe("releaseEvidenceBundleCompose", () => {
         upgradeRollbackEvidencePath: paths.upgradeRollback,
         operatorName: "release-operator",
         releaseTicket: "REL-2026-0607",
+        attestationSigningKey,
         now
       });
 
@@ -1042,14 +1061,35 @@ describe("releaseEvidenceBundleCompose", () => {
         nonSessionCredentialEvidence: {
           sourcePath: paths.nonSessionCredential,
           releaseCommit: commitRef
+        },
+        attestation: {
+          type: "siteflow.releaseEvidenceBundleAttestation.v1",
+          issuer: "siteflow-release-evidence-bundle-compose",
+          attestedAt: "2026-06-07T12:00:00.000Z",
+          payloadDigestAlgorithm: "sha256",
+          canonicalization: "siteflow.releaseEvidenceBundlePayload.v1",
+          signatureAlgorithm: "hmac-sha256",
+          signatureKeyId: attestationSigningKeyId,
+          subject: {
+            commitRef,
+            repository,
+            branch,
+            targetEnvironment: "production"
+          }
         }
       });
+      expect((result.bundle?.attestation as Record<string, unknown>).payloadDigest).toBe(
+        releaseEvidenceBundlePayloadDigest(result.bundle!)
+      );
+      expect((result.bundle?.attestation as Record<string, unknown>).signature).toMatch(/^sha256:[a-f0-9]{64}$/);
+      expect(JSON.stringify(result.bundle)).not.toContain(attestationSigningKey);
 
       const check = evaluateReleaseEvidenceBundle(result.bundle, {
         evidencePath: "release-evidence.json",
         commitRef,
         repo: repository,
         branch,
+        attestationSigningKey,
         now
       });
 
@@ -1107,10 +1147,55 @@ describe("releaseEvidenceBundleCompose", () => {
 
   it.each([
     [
+      "release gate failed check",
+      "releaseGate",
+      () => ({
+        ...releaseGateEvidence(),
+        checks: [
+          passingCheck("local.gitStatus"),
+          { name: "external.githubBranchProtection", status: "manual_required", message: "requires manual verification" }
+        ]
+      }),
+      /release-gate evidence must include non-empty checks and all checks must pass/
+    ],
+    [
+      "release gate manual required marker",
+      "releaseGate",
+      () => {
+        const evidence = releaseGateEvidence();
+
+        evidence.promotionEvidence.manualRequired = true;
+        evidence.promotionEvidence.manualRequiredCheckIds = ["external.githubBranchProtection"];
+
+        return evidence;
+      },
+      /release-gate evidence must not contain manual_required checks/
+    ],
+    [
       "source provider failed status",
       "sourceProvider",
       () => ({ ...sourceProviderEvidence(), status: "failed" }),
       /source provider evidence must have status passed/
+    ],
+    [
+      "source provider shallow checkout summary",
+      "sourceProvider",
+      () => {
+        const evidence = sourceProviderEvidence();
+        (evidence.selectedEvidence as Record<string, unknown>).checkout = { status: "passed" };
+        return evidence;
+      },
+      /source provider evidence selectedEvidence must include release-bound timestamped checkout/
+    ],
+    [
+      "backup shallow offload summary",
+      "backup",
+      () => {
+        const evidence = backupEvidence();
+        (evidence.selectedEvidence as Record<string, unknown>).backupOffload = { status: "offloaded" };
+        return evidence;
+      },
+      /backup evidence selectedEvidence must include timestamped backup verify/
     ],
     [
       "target runtime failed check",
@@ -1129,6 +1214,49 @@ describe("releaseEvidenceBundleCompose", () => {
       "operatorAccess",
       () => ({ ...operatorAccessEvidence(), name: "siteflow-operator-access-template" }),
       /operator access evidence must be checked by siteflow-operator-access-evidence-check/
+    ],
+    [
+      "operator access shallow selected summary",
+      "operatorAccess",
+      () => {
+        const evidence = operatorAccessEvidence();
+        (evidence.selectedEvidence as Record<string, unknown>).sessionCreate = { status: "passed" };
+        return evidence;
+      },
+      /operator access evidence selectedEvidence summaries must include allowed status and timestamp before compose: sessionCreate/
+    ],
+    [
+      "non-session credential shallow break-glass summary",
+      "nonSessionCredential",
+      () => {
+        const evidence = nonSessionCredentialEvidence();
+        (evidence.selectedEvidence as Record<string, unknown>).breakGlass = { status: "passed" };
+        return evidence;
+      },
+      /non-session credential evidence selectedEvidence summaries must include allowed status and timestamp before compose: breakGlass/
+    ],
+    [
+      "ingress failed selected summary",
+      "ingress",
+      () => {
+        const evidence = ingressEvidence();
+        (evidence.selectedEvidence as Record<string, unknown>).forwardedHeaders = {
+          status: "failed",
+          timestamp: "2026-06-07T10:56:00.000Z"
+        };
+        return evidence;
+      },
+      /ingress evidence selectedEvidence summaries must include allowed status and timestamp before compose: forwardedHeaders/
+    ],
+    [
+      "upgrade rollback shallow route summary",
+      "upgradeRollback",
+      () => {
+        const evidence = upgradeRollbackEvidence();
+        (evidence.selectedEvidence as Record<string, unknown>).routeRollback = { status: "passed" };
+        return evidence;
+      },
+      /upgrade\/rollback drill evidence selectedEvidence must include release-bound version pair/
     ],
     [
       "ingress missing checkedAt",
@@ -1178,6 +1306,46 @@ describe("releaseEvidenceBundleCompose", () => {
         return evidence;
       },
       /source provider evidence target environment staging does not match production/
+    ],
+    [
+      "observability missing required check",
+      "observability",
+      () => {
+        const evidence = observabilityEvidence();
+        evidence.checks = evidence.checks.filter((check) => check.name !== "observability_apply_proof_non_dry_run");
+        return evidence;
+      },
+      /observability evidence is missing required passed checks before compose: observability_apply_proof_non_dry_run/
+    ],
+    [
+      "operator access missing required check",
+      "operatorAccess",
+      () => {
+        const evidence = operatorAccessEvidence();
+        evidence.checks = evidence.checks.filter((check) => check.name !== "session_create_present");
+        return evidence;
+      },
+      /operator access evidence is missing required passed checks before compose: session_create_present/
+    ],
+    [
+      "non-session credential missing required check",
+      "nonSessionCredential",
+      () => {
+        const evidence = nonSessionCredentialEvidence();
+        evidence.checks = evidence.checks.filter((check) => check.name !== "old_credentials_rejected");
+        return evidence;
+      },
+      /non-session credential evidence is missing required passed checks before compose: old_credentials_rejected/
+    ],
+    [
+      "upgrade rollback missing required check",
+      "upgradeRollback",
+      () => {
+        const evidence = upgradeRollbackEvidence();
+        evidence.checks = evidence.checks.filter((check) => check.name !== "route_upgrade");
+        return evidence;
+      },
+      /upgrade\/rollback drill evidence is missing required passed checks before compose: route_upgrade/
     ]
   ] as const)("rejects %s before writing a bundle", async (_label, pathKey, replacementFactory, expectedMessage) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-compose-final-checker-"));
@@ -1361,6 +1529,7 @@ describe("releaseEvidenceBundleCompose", () => {
         operatorName: "release-operator",
         releaseTicket: "REL-2026-0607",
         hostBuildExceptionAccepted: true,
+        attestationSigningKey,
         now
       });
 
@@ -1376,6 +1545,7 @@ describe("releaseEvidenceBundleCompose", () => {
         commitRef,
         repo: repository,
         branch,
+        attestationSigningKey,
         now
       });
 
@@ -1675,10 +1845,12 @@ describe("releaseEvidenceBundleCompose", () => {
 
   it("writes the bundle to --output and prints JSON from the CLI", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-compose-cli-"));
+    const previousSigningKey = process.env.SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY;
     let stdout = "";
     let stderr = "";
 
     try {
+      process.env.SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY = attestationSigningKey;
       const paths = await writeEvidenceSet(root);
       const outputPath = path.join(root, "release-evidence.json");
       const exitCode = await runReleaseEvidenceBundleComposeCli(
@@ -1719,10 +1891,25 @@ describe("releaseEvidenceBundleCompose", () => {
         checkedAt: "2026-06-07T12:34:56.000Z",
         release: {
           commitRef
+        },
+        attestation: {
+          type: "siteflow.releaseEvidenceBundleAttestation.v1",
+          issuer: "siteflow-release-evidence-bundle-compose",
+          attestedAt: "2026-06-07T12:34:56.000Z",
+          signatureAlgorithm: "hmac-sha256",
+          signatureKeyId: attestationSigningKeyId
         }
       });
+      expect(printed.attestation.payloadDigest).toBe(releaseEvidenceBundlePayloadDigest(printed));
+      expect(printed.attestation.signature).toMatch(/^sha256:[a-f0-9]{64}$/);
+      expect(JSON.stringify(printed)).not.toContain(attestationSigningKey);
       expect(written).toEqual(printed);
     } finally {
+      if (previousSigningKey === undefined) {
+        delete process.env.SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY;
+      } else {
+        process.env.SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY = previousSigningKey;
+      }
       await rm(root, { recursive: true, force: true });
     }
   });

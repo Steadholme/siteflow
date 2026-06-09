@@ -96,6 +96,9 @@ function todoPhase(checkedAt: string, note: string, fields: Record<string, unkno
 export function createUpgradeRollbackDrillEvidenceTemplate(options: UpgradeRollbackDrillEvidenceTemplateOptions) {
   const checkedAt = options.checkedAt ? validIsoTimestamp(options.checkedAt) : (options.now?.() ?? new Date()).toISOString();
   const targetEnvironment = requiredValue(options.targetEnvironment, "--target-environment");
+  const commitRef = requiredValue(options.commitRef, "--commit-ref");
+  const repository = requiredValue(options.repo, "--repo");
+  const branch = requiredValue(options.branch, "--branch");
   const fromVersion = nullableString(options.fromVersion);
   const toVersion = nullableString(options.toVersion);
   const rollbackVersion = nullableString(options.rollbackVersion) ?? fromVersion;
@@ -111,15 +114,28 @@ export function createUpgradeRollbackDrillEvidenceTemplate(options: UpgradeRollb
     completedAt: null,
     targetEnvironment,
     release: {
-      commitRef: requiredValue(options.commitRef, "--commit-ref"),
-      repository: requiredValue(options.repo, "--repo"),
-      branch: requiredValue(options.branch, "--branch"),
+      commitRef,
+      repository,
+      branch,
       targetEnvironment,
       fromVersion,
       toVersion,
       rollbackVersion,
       operatorName: requiredValue(options.operatorName, "--operator-name"),
       releaseTicket: requiredValue(options.ticketId, "--release-ticket")
+    },
+    target: {
+      environment: targetEnvironment,
+      release: {
+        commitRef,
+        repository,
+        branch
+      },
+      versions: {
+        fromVersion,
+        toVersion,
+        rollbackVersion
+      }
     },
     instructions: [
       "Replace every todo/null field with observations from the target or target-equivalent upgrade/rollback drill.",

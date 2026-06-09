@@ -38,12 +38,41 @@ export interface NonSessionCredentialEvidenceCheckResult {
     credentialCount: number;
     breakGlass: {
       status?: string;
+      timestamp?: string;
       ticket?: string;
     } | null;
   };
   checks: NonSessionCredentialEvidenceCheck[];
   exitCode: number;
 }
+
+export const requiredNonSessionCredentialEvidenceCheckNames = [
+  "non_dry_run",
+  "not_template",
+  "status_final",
+  "evidence_age",
+  "release_identity",
+  "target_facts",
+  "environment",
+  "operator",
+  "ticket",
+  "credentials_present",
+  "credential_types_supported",
+  "credential_owners_and_tickets",
+  "credential_status",
+  "credential_age",
+  "credential_redacted_identifiers",
+  "no_raw_credentials_archived",
+  "no_sensitive_evidence_values",
+  "old_credentials_rejected",
+  "new_credentials_accepted",
+  "credential_specific_evidence",
+  "break_glass_present",
+  "break_glass_status",
+  "break_glass_age",
+  "break_glass_controls",
+  "automation_not_claimed"
+] as const;
 
 interface ParsedArgs {
   evidencePath?: string;
@@ -180,6 +209,51 @@ function environmentName(root: Record<string, unknown> | undefined) {
   return stringValue(root?.environment) ??
     stringValue(root?.targetEnvironment) ??
     stringValue(nestedValue(root, ["target", "environment"]));
+}
+
+function targetObject(root: Record<string, unknown> | undefined) {
+  return nestedObject(root, "target");
+}
+
+function targetEnvironmentName(target: Record<string, unknown> | undefined) {
+  return stringValue(target?.environment) ?? stringValue(target?.targetEnvironment);
+}
+
+function targetReleaseObject(target: Record<string, unknown> | undefined) {
+  return nestedObject(target, "release") ?? target;
+}
+
+function targetReleaseCommit(target: Record<string, unknown> | undefined) {
+  const release = targetReleaseObject(target);
+
+  return stringValue(release?.commitRef) ?? stringValue(release?.commitSha);
+}
+
+function targetReleaseRepository(target: Record<string, unknown> | undefined) {
+  return stringValue(targetReleaseObject(target)?.repository);
+}
+
+function targetReleaseBranch(target: Record<string, unknown> | undefined) {
+  return stringValue(targetReleaseObject(target)?.branch);
+}
+
+function targetFactsMatch(root: Record<string, unknown> | undefined) {
+  const target = targetObject(root);
+  const targetCommitRef = targetReleaseCommit(target);
+  const targetRepository = targetReleaseRepository(target);
+  const targetBranch = targetReleaseBranch(target);
+
+  return Boolean(
+    target &&
+      targetEnvironmentName(target) &&
+      targetEnvironmentName(target) === environmentName(root) &&
+      targetCommitRef &&
+      targetCommitRef === releaseCommit(root) &&
+      targetRepository &&
+      targetRepository === releaseRepository(root) &&
+      targetBranch &&
+      targetBranch === releaseBranch(root)
+  );
 }
 
 function operatorName(root: Record<string, unknown> | undefined) {
@@ -391,6 +465,12 @@ export function evaluateNonSessionCredentialEvidence(
   );
   addCheck(
     checks,
+    "target_facts",
+    targetFactsMatch(root),
+    "Non-session credential evidence must include target environment and release identity facts matching the final evidence."
+  );
+  addCheck(
+    checks,
     "environment",
     Boolean(environmentName(root) && (!options.targetEnvironment || environmentName(root) === options.targetEnvironment)),
     "Non-session credential evidence must include target environment and match the requested target environment when provided."
@@ -516,6 +596,7 @@ export function evaluateNonSessionCredentialEvidence(
       breakGlass: breakGlass
         ? {
             status: stringValue(breakGlass.status),
+            timestamp: selectedTimestamp(breakGlass),
             ticket: stringValue(breakGlass.incidentTicket) ?? stringValue(breakGlass.ticket) ?? rootTicket(root)
           }
         : null

@@ -3,6 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { createReleaseEvidenceRehearsalPack } from "./releaseEvidenceRehearsalPack";
 import {
+  passedReleaseEvidenceAttestationKeyId,
+  passedReleaseEvidenceAttestationSigningKey,
+  passedReleaseImageEvidence,
   passingEvidenceForCommandArgs,
   writePassingReleaseEvidenceOutputs
 } from "./releaseEvidencePassedFixtures.test-support";
@@ -15,6 +18,9 @@ import {
 } from "./releaseEvidenceTargetRun";
 
 const now = () => new Date("2026-06-08T12:00:00.000Z");
+const digestA = "a".repeat(64);
+const digestB = "b".repeat(64);
+const digestC = "c".repeat(64);
 const operatorAccessRequiredChecks = [
   "non_dry_run",
   "release_identity",
@@ -47,6 +53,46 @@ const operatorAccessRequiredChecks = [
   "operator",
   "ticket"
 ];
+
+function validTargetEnvFileContents() {
+  return [
+    "SITEFLOW_ENV=production",
+    "DATABASE_URL=postgres://siteflow@postgres:5432/siteflow",
+    "SITEFLOW_API_PORT=8787",
+    "SITEFLOW_ARTIFACT_ROOT=/var/lib/siteflow/artifacts",
+    "SITEFLOW_EVIDENCE_ROOT=/var/lib/siteflow/evidence",
+    "SITEFLOW_PUBLIC_SCHEME=https",
+    "SITEFLOW_BASE_DOMAIN=siteflow.example.com",
+    "SITEFLOW_WORKER_USER=1000:1000",
+    "SITEFLOW_DOCKER_SOCKET_GID=999",
+    "SITEFLOW_API_TOKEN_FILE=/etc/siteflow/secrets/api-token.secret",
+    "SITEFLOW_METRICS_TOKEN_FILE=/etc/siteflow/secrets/metrics-token.secret",
+    "SITEFLOW_APP_SECRET_FILE=/etc/siteflow/secrets/app-secret.secret",
+    "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE=/etc/siteflow/secrets/release-evidence-signing-key.secret",
+    "SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID=release-evidence-key-id",
+    "SITEFLOW_POSTGRES_PASSWORD_FILE=/etc/siteflow/secrets/postgres-password.secret",
+    "SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE=/etc/siteflow/secrets/github-webhook.secret",
+    "SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE=/etc/siteflow/secrets/gitlab-webhook.secret",
+    "SITEFLOW_GITEA_WEBHOOK_SECRET_FILE=/etc/siteflow/secrets/gitea-webhook.secret",
+    "SITEFLOW_GENERIC_WEBHOOK_SECRET_FILE=/etc/siteflow/secrets/generic-webhook.secret",
+    `SITEFLOW_IMAGE=ghcr.io/siteflow/siteflow@sha256:${digestA}`,
+    `SITEFLOW_POSTGRES_IMAGE=postgres@sha256:${digestB}`,
+    "SITEFLOW_BUILD_RUNNER=docker",
+    `SITEFLOW_BUILD_IMAGE=node:20-bookworm-slim@sha256:${digestC}`,
+    "SITEFLOW_BUILD_NETWORK=none",
+    "SITEFLOW_BUILD_MIN_FREE_BYTES=1073741824",
+    "SITEFLOW_BUILD_STEP_TIMEOUT_MS=900000",
+    "SITEFLOW_GIT_TIMEOUT_MS=300000",
+    "SITEFLOW_BUILD_MEMORY=1g",
+    "SITEFLOW_BUILD_CPUS=2",
+    "SITEFLOW_BUILD_PIDS_LIMIT=256",
+    "SITEFLOW_BUILD_MAX_ARTIFACT_BYTES=536870912",
+    "SITEFLOW_BUILD_MAX_ARTIFACT_FILES=20000",
+    "SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES=536870912",
+    "SITEFLOW_PREBUILT_MAX_FILES=20000",
+    ""
+  ].join("\n");
+}
 const nonSessionCredentialRequiredChecks = [
   "non_dry_run",
   "release_identity",
@@ -65,6 +111,13 @@ const nonSessionCredentialRequiredChecks = [
   "break_glass_controls",
   "automation_not_claimed"
 ];
+const targetCredentialEvidenceEnv = {
+  SITEFLOW_API_TOKEN: "present",
+  SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN: "present",
+  SITEFLOW_OLD_METRICS_TOKEN: "present",
+  SITEFLOW_OBSERVABILITY_STACK_TOKEN: "present",
+  SITEFLOW_OLD_API_TOKEN: "present"
+};
 
 function passingCheck(name: string) {
   return {
@@ -118,11 +171,11 @@ function passedNonSessionCredentialEvidence() {
 }
 
 function targetRunPassingStdout(args: string[]) {
-  if (args.includes("operator-access:evidence")) {
+  if (args.includes("operator-access:evidence:collect") || args.includes("operator-access:evidence")) {
     return JSON.stringify(passedOperatorAccessEvidence());
   }
 
-  if (args.includes("non-session-credential:evidence")) {
+  if (args.includes("non-session-credential:evidence:collect") || args.includes("non-session-credential:evidence")) {
     return JSON.stringify(passedNonSessionCredentialEvidence());
   }
 
@@ -176,6 +229,7 @@ function completePack(
     publicBaseUrl: "https://siteflow.example.com",
     operatorName: "release-operator",
     releaseTicket: "REL-123",
+    observabilityTargetStackApiUrl: "https://observability.example.com/siteflow-proof",
     outputDir: root,
     now
   });
@@ -192,10 +246,26 @@ function completePack(
 
 async function writePack(root: string, value: Record<string, unknown>) {
   const packPath = path.join(root, "release-evidence-rehearsal-pack.json");
+  const release = value.release as Record<string, unknown> | undefined;
+  const targetEnvFile = typeof release?.targetEnvFile === "string" ? release.targetEnvFile : undefined;
+
+  if (targetEnvFile) {
+    try {
+      await access(targetEnvFile);
+    } catch {
+      await mkdir(path.dirname(targetEnvFile), { recursive: true });
+      await writeFile(targetEnvFile, validTargetEnvFileContents(), "utf8");
+    }
+  }
 
   await writeFile(packPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 
   return packPath;
+}
+
+async function writeJson(filePath: string, value: unknown) {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
 async function exists(filePath: string) {
@@ -234,6 +304,33 @@ async function fakeExecutableEnv(root: string, names: string[], extra: NodeJS.Pr
     PATH: binDir,
     PATHEXT: ".COM;.EXE;.BAT;.CMD",
     ...extra
+  };
+}
+
+function targetRunReplacements(overrides: Record<string, string> = {}) {
+  return {
+    "direct-api-url": "http://10.0.0.5:8787/healthz",
+    "candidate-deployment-detail-path": path.join("evidence", "private", "deployment-detail.json"),
+    "release-image-digest": `sha256:${"f".repeat(64)}`,
+    "release-image-run-id": "123456789",
+    "webhook-delivery-id": "delivery-123",
+    "deploy-key-path": "/run/secrets/siteflow_git_ssh_key",
+    "known-hosts-path": "/etc/ssh/ssh_known_hosts",
+    "api-instance-count": "1",
+    "api-process-count": "1",
+    "ingress-count": "1",
+    "api-rate-limit-scope": "edge",
+    "api-rate-limit-enforcement-point": "ingress",
+    "operator-access-project-id": "project-allowed",
+    "operator-access-denied-project-id": "project-denied",
+    "old-metrics-token-redacted-id": "metrics-token-old-redacted",
+    "new-metrics-token-redacted-id": "metrics-token-new-redacted",
+    "old-root-api-token-redacted-id": "root-api-token-old-redacted",
+    "new-root-api-token-redacted-id": "root-api-token-new-redacted",
+    "break-glass-source": "pager-duty",
+    "break-glass-approver-count": "2",
+    SITEFLOW_TRUST_PROXY: "loopback",
+    ...overrides
   };
 }
 
@@ -351,6 +448,103 @@ describe("releaseEvidenceTargetRun", () => {
     }
   });
 
+  it("blocks plan-only runs when the production target env file violates the static contract", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-target-run-env-file-contract-"));
+
+    try {
+      await writeFile(path.join(root, "target.env"), [
+        "SITEFLOW_ENV=production",
+        "DATABASE_URL=postgres://siteflow:super-db-password-do-not-leak@postgres:5432/siteflow",
+        "SITEFLOW_API_PORT=8787",
+        "SITEFLOW_ARTIFACT_ROOT=/var/lib/siteflow/artifacts",
+        "SITEFLOW_EVIDENCE_ROOT=/var/lib/siteflow/evidence",
+        "SITEFLOW_PUBLIC_SCHEME=https",
+        "SITEFLOW_BASE_DOMAIN=siteflow.example.com",
+        "SITEFLOW_WORKER_USER=0:0",
+        "SITEFLOW_DOCKER_SOCKET_GID=not-a-gid",
+        "SITEFLOW_API_TOKEN=super-api-token-do-not-leak",
+        "SITEFLOW_API_TOKEN_FILE=/etc/siteflow/secrets/api-token.secret",
+        "SITEFLOW_METRICS_TOKEN_FILE=/etc/siteflow/secrets/metrics-token.secret",
+        "SITEFLOW_APP_SECRET_FILE=/etc/siteflow/secrets/app-secret.secret",
+        "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE=/etc/siteflow/secrets/release-evidence-signing-key.secret",
+        "SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID=release-evidence-key-id",
+        "SITEFLOW_POSTGRES_PASSWORD_FILE=/etc/siteflow/secrets/postgres-password.secret",
+        "SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE=/etc/siteflow/secrets/github-webhook.secret",
+        "SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE=/etc/siteflow/secrets/gitlab-webhook.secret",
+        "SITEFLOW_GITEA_WEBHOOK_SECRET_FILE=/etc/siteflow/secrets/gitea-webhook.secret",
+        "SITEFLOW_GENERIC_WEBHOOK_SECRET_FILE=/etc/siteflow/secrets/generic-webhook.secret",
+        "SITEFLOW_IMAGE=ghcr.io/siteflow/siteflow:latest",
+        `SITEFLOW_POSTGRES_IMAGE=postgres@sha256:${digestB}`,
+        "SITEFLOW_BUILD_RUNNER=docker",
+        `SITEFLOW_BUILD_IMAGE=node:20-bookworm-slim@sha256:${digestC}`,
+        "SITEFLOW_BUILD_NETWORK=bridge",
+        "SITEFLOW_BUILD_MIN_FREE_BYTES=1073741824",
+        "SITEFLOW_BUILD_STEP_TIMEOUT_MS=900000",
+        "SITEFLOW_GIT_TIMEOUT_MS=300000",
+        "SITEFLOW_BUILD_MEMORY=0g",
+        "SITEFLOW_BUILD_CPUS=0",
+        "SITEFLOW_BUILD_PIDS_LIMIT=0",
+        "SITEFLOW_BUILD_MAX_ARTIFACT_BYTES=536870912",
+        "SITEFLOW_BUILD_MAX_ARTIFACT_FILES=20000",
+        "SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES=536870912",
+        "SITEFLOW_PREBUILT_MAX_FILES=20000",
+        ""
+      ].join("\n"), "utf8");
+      const packPath = await writePack(root, completePack(root));
+      const result = await runReleaseEvidenceTargetRun({
+        packPath,
+        confirmTargetEnvironment: "production",
+        planOnly: true,
+        replacements: targetRunReplacements(),
+        env: {
+          GITHUB_TOKEN: "present",
+          GH_TOKEN: "present"
+        },
+        commandRunner: async () => {
+          throw new Error("should not execute");
+        },
+        now
+      });
+      const releaseGate = result.steps.find((step) => step.id === "release_gate");
+
+      expect(result.status).toBe("blocked");
+      expect(releaseGate).toMatchObject({
+        status: "blocked",
+        envRequirements: expect.arrayContaining([
+          expect.objectContaining({
+            name: "SITEFLOW_DOCKER_SOCKET_GID",
+            kind: "present",
+            status: "mismatch",
+            message: "SITEFLOW_DOCKER_SOCKET_GID must be a numeric group id."
+          }),
+          expect.objectContaining({
+            name: "SITEFLOW_IMAGE",
+            status: "mismatch",
+            message: "SITEFLOW_IMAGE must be pinned with @sha256:<64 hex digest>."
+          }),
+          expect.objectContaining({
+            name: "SITEFLOW_BUILD_NETWORK",
+            status: "mismatch",
+            message: "SITEFLOW_BUILD_NETWORK must be none in the target env file."
+          }),
+          expect.objectContaining({
+            name: "SITEFLOW_API_TOKEN",
+            status: "mismatch",
+            message: "SITEFLOW_API_TOKEN must not be stored as a raw value in the target env file; use SITEFLOW_API_TOKEN_FILE instead."
+          })
+        ])
+      });
+      expect(releaseGate?.message).toContain("SITEFLOW_DOCKER_SOCKET_GID");
+      expect(releaseGate?.message).toContain("SITEFLOW_IMAGE");
+      expect(JSON.stringify(result)).not.toContain("super-api-token-do-not-leak");
+      expect(JSON.stringify(result)).not.toContain("super-db-password-do-not-leak");
+      expect(JSON.stringify(result)).not.toContain("bridge");
+      expect(JSON.stringify(result)).not.toContain("latest");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("does not write captured stdout when it matches secret patterns", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-target-run-secret-"));
 
@@ -360,16 +554,7 @@ describe("releaseEvidenceTargetRun", () => {
       const result = await runReleaseEvidenceTargetRun({
         packPath,
         confirmTargetEnvironment: "production",
-        replacements: {
-          "direct-api-url": "http://10.0.0.5:8787/healthz",
-          "release-image-run-id": "123456789",
-          "api-instance-count": "1",
-          "api-process-count": "1",
-          "ingress-count": "1",
-          "api-rate-limit-scope": "edge",
-          "api-rate-limit-enforcement-point": "ingress",
-          SITEFLOW_TRUST_PROXY: "loopback"
-        },
+        replacements: targetRunReplacements(),
         env: {
           GITHUB_TOKEN: "ghp_secretsecretsecretsecret12345"
         },
@@ -401,6 +586,43 @@ describe("releaseEvidenceTargetRun", () => {
       expect(serialized).not.toContain("ghp_secretsecretsecretsecret12345");
       expect(runRecord).not.toContain("SITEFLOW_SECRET_CANARY");
       expect(runRecord).not.toContain("secret@db");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not write captured stdout when a JSON string contains secret fields", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-target-run-json-string-secret-"));
+
+    try {
+      const outputPath = path.join(root, "release-gate.json");
+      const packPath = await writePack(root, completePack(root));
+      const result = await runReleaseEvidenceTargetRun({
+        packPath,
+        confirmTargetEnvironment: "production",
+        replacements: targetRunReplacements(),
+        env: {
+          GITHUB_TOKEN: "present"
+        },
+        commandRunner: async () => ({
+          exitCode: 0,
+          stdout: JSON.stringify(JSON.stringify({
+            rawSecret: "super-secret-value"
+          })),
+          stderr: ""
+        }),
+        now
+      });
+
+      expect(result.status).toBe("failed");
+      expect(result.steps[0]).toMatchObject({
+        id: "release_gate",
+        status: "failed",
+        stdoutSensitiveReasons: expect.arrayContaining(["raw credential field"]),
+        message: expect.stringContaining("stdout")
+      });
+      expect(await exists(outputPath)).toBe(false);
+      expect(JSON.stringify(result)).not.toContain("super-secret-value");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -445,6 +667,43 @@ describe("releaseEvidenceTargetRun", () => {
       });
       expect(result.steps[0]).not.toHaveProperty("stdoutCapturedTo");
       expect(await exists(outputPath)).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks successful commands when stderr contains JSON-string encoded secret fields", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-target-run-command-json-string-secret-stderr-"));
+
+    try {
+      const outputPath = path.join(root, "release-gate.json");
+      const packPath = await writePack(root, completePack(root));
+      const result = await runReleaseEvidenceTargetRun({
+        packPath,
+        confirmTargetEnvironment: "production",
+        replacements: targetRunReplacements(),
+        env: {
+          GITHUB_TOKEN: "present"
+        },
+        commandRunner: async () => ({
+          exitCode: 0,
+          stdout: JSON.stringify({ status: "passed" }),
+          stderr: JSON.stringify(JSON.stringify({
+            rawSecret: "super-secret-value"
+          }))
+        }),
+        now
+      });
+
+      expect(result.status).toBe("failed");
+      expect(result.steps[0]).toMatchObject({
+        id: "release_gate",
+        status: "failed",
+        stderrSensitiveReasons: expect.arrayContaining(["raw credential field"]),
+        message: expect.stringContaining("stderr")
+      });
+      expect(await exists(outputPath)).toBe(false);
+      expect(JSON.stringify(result)).not.toContain("super-secret-value");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -557,6 +816,7 @@ describe("releaseEvidenceTargetRun", () => {
   it("applies replacements to gap report snapshots without storing replacement values", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-target-run-gap-replacements-"));
     const directApiUrl = "http://10.0.0.5:8787/healthz";
+    const releaseImageDigest = `sha256:${"a".repeat(64)}`;
     const releaseImageRunId = "123456789";
 
     try {
@@ -564,16 +824,11 @@ describe("releaseEvidenceTargetRun", () => {
       const result = await runReleaseEvidenceTargetRun({
         packPath,
         confirmTargetEnvironment: "production",
-        replacements: {
+        replacements: targetRunReplacements({
           "direct-api-url": directApiUrl,
-          "release-image-run-id": releaseImageRunId,
-          "api-instance-count": "1",
-          "api-process-count": "1",
-          "ingress-count": "1",
-          "api-rate-limit-scope": "edge",
-          "api-rate-limit-enforcement-point": "ingress",
-          SITEFLOW_TRUST_PROXY: "loopback"
-        },
+          "release-image-digest": releaseImageDigest,
+          "release-image-run-id": releaseImageRunId
+        }),
         commandRunner: async () => ({
           exitCode: 1,
           stdout: "",
@@ -588,9 +843,11 @@ describe("releaseEvidenceTargetRun", () => {
       );
 
       expect(commandArgGaps).not.toContain("direct-api-url");
+      expect(commandArgGaps).not.toContain("release-image-digest");
       expect(commandArgGaps).not.toContain("release-image-run-id");
       expect(commandArgGaps).not.toContain("SITEFLOW_TRUST_PROXY");
       expect(serializedSnapshot).not.toContain(directApiUrl);
+      expect(serializedSnapshot).not.toContain(releaseImageDigest);
       expect(serializedSnapshot).not.toContain(releaseImageRunId);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -613,9 +870,14 @@ describe("releaseEvidenceTargetRun", () => {
       };
 
       const packPath = await writePack(root, targetPack as unknown as Record<string, unknown>);
+      const replacements = targetRunReplacements();
+
+      delete replacements["direct-api-url"];
+
       const result = await runReleaseEvidenceTargetRun({
         packPath,
         confirmTargetEnvironment: "production",
+        replacements,
         envReplacements: {
           "direct-api-url": "SITEFLOW_DIRECT_API_URL"
         },
@@ -677,22 +939,16 @@ describe("releaseEvidenceTargetRun", () => {
         SITEFLOW_BUILD_IMAGE: "registry.local/siteflow/build-node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         SITEFLOW_RUN_POSTGRES_INTEGRATION: "1",
         TEST_DATABASE_URL: "postgres://siteflow:secret@localhost:5432/siteflow_rehearsal",
-        SITEFLOW_METRICS_TOKEN: "present"
+        ...targetCredentialEvidenceEnv,
+        SITEFLOW_METRICS_TOKEN: "present",
+        SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY: passedReleaseEvidenceAttestationSigningKey,
+        SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID: passedReleaseEvidenceAttestationKeyId
       });
       const result = await runReleaseEvidenceTargetRun({
         packPath,
         confirmTargetEnvironment: "production",
         planOnly: true,
-        replacements: {
-          "direct-api-url": "http://10.0.0.5:8787/healthz",
-          "release-image-run-id": "123456789",
-          "api-instance-count": "1",
-          "api-process-count": "1",
-          "ingress-count": "1",
-          "api-rate-limit-scope": "edge",
-          "api-rate-limit-enforcement-point": "ingress",
-          SITEFLOW_TRUST_PROXY: "loopback"
-        },
+        replacements: targetRunReplacements(),
         env,
         commandRunner: async () => {
           calls += 1;
@@ -716,6 +972,13 @@ describe("releaseEvidenceTargetRun", () => {
       expect(result.steps).toHaveLength(15);
       expect(result.steps.every((step) => step.status === "planned")).toBe(true);
       expect(result.steps.every((step) => step.executableRequirement?.status === "satisfied")).toBe(true);
+      expect(result.steps.find((step) => step.id === "release_evidence_bundle")?.envRequirements)
+        .not.toEqual(expect.arrayContaining([
+          expect.objectContaining({
+            name: "SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID",
+            status: "missing"
+          })
+        ]));
       expect(runRecord).toMatchObject({
         status: "planned",
         planOnly: true,
@@ -747,23 +1010,17 @@ describe("releaseEvidenceTargetRun", () => {
         SITEFLOW_BUILD_IMAGE: "registry.local/siteflow/build-node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         SITEFLOW_RUN_POSTGRES_INTEGRATION: "1",
         TEST_DATABASE_URL: "postgres://siteflow:secret@localhost:5432/siteflow_rehearsal",
-        SITEFLOW_METRICS_TOKEN: "present"
+        ...targetCredentialEvidenceEnv,
+        SITEFLOW_METRICS_TOKEN: "present",
+        SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY: passedReleaseEvidenceAttestationSigningKey,
+        SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID: passedReleaseEvidenceAttestationKeyId
       });
       const result = await runReleaseEvidenceTargetRun({
         packPath,
         confirmTargetEnvironment: "production",
         planOnly: true,
         failOnGaps: true,
-        replacements: {
-          "direct-api-url": "http://10.0.0.5:8787/healthz",
-          "release-image-run-id": "123456789",
-          "api-instance-count": "1",
-          "api-process-count": "1",
-          "ingress-count": "1",
-          "api-rate-limit-scope": "edge",
-          "api-rate-limit-enforcement-point": "ingress",
-          SITEFLOW_TRUST_PROXY: "loopback"
-        },
+        replacements: targetRunReplacements(),
         env,
         commandRunner: async () => {
           calls += 1;
@@ -804,7 +1061,9 @@ describe("releaseEvidenceTargetRun", () => {
 
     try {
       const tokenPath = path.join(root, "metrics-token");
+      const signingKeyPath = path.join(root, "release-evidence-signing-key");
       await writeFile(tokenPath, "metrics-token\n", "utf8");
+      await writeFile(signingKeyPath, `${passedReleaseEvidenceAttestationSigningKey}\n`, "utf8");
 
       const packPath = await writePack(root, completePack(root));
       const env = await fakeExecutableEnv(root, ["npm", "gh"], {
@@ -814,22 +1073,16 @@ describe("releaseEvidenceTargetRun", () => {
         SITEFLOW_BUILD_IMAGE: "registry.local/siteflow/build-node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         SITEFLOW_RUN_POSTGRES_INTEGRATION: "1",
         TEST_DATABASE_URL: "postgres://siteflow:secret@localhost:5432/siteflow_rehearsal",
-        SITEFLOW_METRICS_TOKEN_FILE: tokenPath
+        ...targetCredentialEvidenceEnv,
+        SITEFLOW_METRICS_TOKEN_FILE: tokenPath,
+        SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE: signingKeyPath,
+        SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID: passedReleaseEvidenceAttestationKeyId
       });
       const result = await runReleaseEvidenceTargetRun({
         packPath,
         confirmTargetEnvironment: "production",
         planOnly: true,
-        replacements: {
-          "direct-api-url": "http://10.0.0.5:8787/healthz",
-          "release-image-run-id": "123456789",
-          "api-instance-count": "1",
-          "api-process-count": "1",
-          "ingress-count": "1",
-          "api-rate-limit-scope": "edge",
-          "api-rate-limit-enforcement-point": "ingress",
-          SITEFLOW_TRUST_PROXY: "loopback"
-        },
+        replacements: targetRunReplacements(),
         env,
         commandRunner: async () => {
           calls += 1;
@@ -838,16 +1091,25 @@ describe("releaseEvidenceTargetRun", () => {
         now
       });
       const observabilityStep = result.steps.find((step) => step.id === "observability_evidence");
+      const finalComposeStep = result.steps.find((step) => step.id === "release_evidence_bundle");
 
       expect(calls).toBe(0);
       expect(result.status).toBe("planned");
       expect(observabilityStep?.envRequirements).toEqual(expect.arrayContaining([
         expect.objectContaining({
+          name: "SITEFLOW_METRICS_TOKEN_FILE",
+          status: "satisfied"
+        })
+      ]));
+      expect(observabilityStep?.envRequirements).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({
           name: "SITEFLOW_METRICS_TOKEN",
           status: "missing"
-        }),
+        })
+      ]));
+      expect(finalComposeStep?.envRequirements).toEqual(expect.arrayContaining([
         expect.objectContaining({
-          name: "SITEFLOW_METRICS_TOKEN_FILE",
+          name: "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE",
           status: "satisfied"
         })
       ]));
@@ -869,22 +1131,14 @@ describe("releaseEvidenceTargetRun", () => {
         SITEFLOW_BUILD_IMAGE: "registry.local/siteflow/build-node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         SITEFLOW_RUN_POSTGRES_INTEGRATION: "1",
         TEST_DATABASE_URL: "postgres://siteflow:secret@localhost:5432/siteflow_rehearsal",
+        ...targetCredentialEvidenceEnv,
         SITEFLOW_METRICS_TOKEN_FILE: path.join(root, "missing-metrics-token")
       });
       const result = await runReleaseEvidenceTargetRun({
         packPath,
         confirmTargetEnvironment: "production",
         planOnly: true,
-        replacements: {
-          "direct-api-url": "http://10.0.0.5:8787/healthz",
-          "release-image-run-id": "123456789",
-          "api-instance-count": "1",
-          "api-process-count": "1",
-          "ingress-count": "1",
-          "api-rate-limit-scope": "edge",
-          "api-rate-limit-enforcement-point": "ingress",
-          SITEFLOW_TRUST_PROXY: "loopback"
-        },
+        replacements: targetRunReplacements(),
         env,
         commandRunner: async () => {
           calls += 1;
@@ -925,22 +1179,14 @@ describe("releaseEvidenceTargetRun", () => {
         SITEFLOW_BUILD_IMAGE: "registry.local/siteflow/build-node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         SITEFLOW_RUN_POSTGRES_INTEGRATION: "1",
         TEST_DATABASE_URL: "postgres://siteflow:secret@localhost:5432/siteflow_rehearsal",
+        ...targetCredentialEvidenceEnv,
         SITEFLOW_METRICS_TOKEN: "present"
       });
       const result = await runReleaseEvidenceTargetRun({
         packPath,
         confirmTargetEnvironment: "production",
         planOnly: true,
-        replacements: {
-          "direct-api-url": "http://10.0.0.5:8787/healthz",
-          "release-image-run-id": "123456789",
-          "api-instance-count": "1",
-          "api-process-count": "1",
-          "ingress-count": "1",
-          "api-rate-limit-scope": "edge",
-          "api-rate-limit-enforcement-point": "ingress",
-          SITEFLOW_TRUST_PROXY: "loopback"
-        },
+        replacements: targetRunReplacements(),
         env,
         commandRunner: async () => {
           calls += 1;
@@ -1004,6 +1250,71 @@ describe("releaseEvidenceTargetRun", () => {
     }
   }, 30000);
 
+  it("fails before target runtime collection when downloaded release image evidence has a different digest", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-target-run-image-digest-"));
+
+    try {
+      const targetPack = createReleaseEvidenceRehearsalPack({
+        commitRef: "abc123def4567890",
+        repo: "acme/siteflow",
+        branch: "main",
+        targetEnvFile: path.join(root, "target.env"),
+        publicBaseUrl: "https://siteflow.example.com",
+        operatorName: "release-operator",
+        releaseTicket: "REL-2026-0608",
+        observabilityTargetStackApiUrl: "https://observability.example.com/siteflow-proof",
+        outputDir: root,
+        now
+      });
+      const packPath = await writePack(root, targetPack as unknown as Record<string, unknown>);
+      const executedCommands: string[] = [];
+      const commandRunner: ReleaseEvidenceCommandRunner = async ({ args }) => {
+        executedCommands.push(args.join(" "));
+
+        if (args.includes("run") && args.includes("download") && args.includes("release-image-evidence")) {
+          await writeJson(targetPack.evidenceFiles.releaseImage, passedReleaseImageEvidence());
+        }
+
+        return {
+          exitCode: 0,
+          stdout: targetRunPassingStdout(args),
+          stderr: ""
+        };
+      };
+      const result = await runReleaseEvidenceTargetRun({
+        packPath,
+        confirmTargetEnvironment: "production",
+        replacements: targetRunReplacements({
+          "release-image-digest": `sha256:${"a".repeat(64)}`
+        }),
+        env: {
+          GITHUB_TOKEN: "present",
+          GH_TOKEN: "present",
+          SITEFLOW_RUN_DOCKER_BUILD_REHEARSAL: "1",
+          SITEFLOW_BUILD_IMAGE: "registry.local/siteflow/build-node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          SITEFLOW_BUILD_IMAGE_ALLOWLIST: "registry.local/siteflow/build-node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          SITEFLOW_RUN_POSTGRES_INTEGRATION: "1",
+          TEST_DATABASE_URL: "postgres://siteflow@localhost:5432/siteflow_rehearsal"
+        },
+        commandRunner,
+        now
+      });
+
+      expect(result.status).toBe("failed");
+      expect(result.exitCode).toBe(1);
+      expect(result.steps.find((step) => step.id === "release_image_evidence")).toMatchObject({
+        status: "failed",
+        message: "Downloaded release image evidence digest must be a sha256 digest matching the release-image-digest replacement."
+      });
+      expect(result.steps.find((step) => step.id === "target_runtime_evidence")).toMatchObject({
+        status: "skipped"
+      });
+      expect(executedCommands.some((command) => command.includes("release:target-runtime:evidence"))).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("fails when all commands exit zero but the final gap report still has gaps", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-target-run-gaps-"));
 
@@ -1013,16 +1324,7 @@ describe("releaseEvidenceTargetRun", () => {
       const result = await runReleaseEvidenceTargetRun({
         packPath,
         confirmTargetEnvironment: "production",
-        replacements: {
-          "direct-api-url": "http://10.0.0.5:8787/healthz",
-          "release-image-run-id": "123456789",
-          "api-instance-count": "1",
-          "api-process-count": "1",
-          "ingress-count": "1",
-          "api-rate-limit-scope": "edge",
-          "api-rate-limit-enforcement-point": "ingress",
-          SITEFLOW_TRUST_PROXY: "loopback"
-        },
+        replacements: targetRunReplacements(),
         env: {
           GITHUB_TOKEN: "present",
           GH_TOKEN: "present",
@@ -1030,7 +1332,10 @@ describe("releaseEvidenceTargetRun", () => {
           SITEFLOW_BUILD_IMAGE: "registry.local/siteflow/build-node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           SITEFLOW_RUN_POSTGRES_INTEGRATION: "1",
           TEST_DATABASE_URL: "postgres://siteflow:secret@localhost:5432/siteflow_rehearsal",
-          SITEFLOW_METRICS_TOKEN: "present"
+          ...targetCredentialEvidenceEnv,
+          SITEFLOW_METRICS_TOKEN: "present",
+          SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY: passedReleaseEvidenceAttestationSigningKey,
+          SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID: passedReleaseEvidenceAttestationKeyId
         },
         commandRunner: async ({ args }) => ({
           exitCode: 0,
@@ -1053,6 +1358,144 @@ describe("releaseEvidenceTargetRun", () => {
     }
   }, 10000);
 
+  it("does not treat dry-run or template-only new collector outputs as production evidence", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-target-run-template-collector-"));
+
+    try {
+      const targetPack = createReleaseEvidenceRehearsalPack({
+        commitRef: "abc123def4567890",
+        repo: "acme/siteflow",
+        branch: "main",
+        targetEnvFile: path.join(root, "target.env"),
+        publicBaseUrl: "https://siteflow.example.com",
+        operatorName: "release-operator",
+        releaseTicket: "REL-2026-0608",
+        observabilityTargetStackApiUrl: "https://observability.example.com/siteflow-proof",
+        outputDir: root,
+        now
+      });
+      const packPath = await writePack(root, targetPack as unknown as Record<string, unknown>);
+      let seeded = false;
+      const commandRunner: ReleaseEvidenceCommandRunner = async ({ args }) => {
+        if (!seeded) {
+          await writePassingReleaseEvidenceOutputs(targetPack);
+          await writeJson(targetPack.evidenceFiles.sourceProvider, {
+            name: "siteflow-source-provider-evidence-check",
+            status: "passed",
+            checkedAt: "2026-06-08T11:30:00.000Z",
+            dryRun: true,
+            selectedEvidence: {
+              environment: "production",
+              commitRef: "abc123def4567890",
+              repository: "acme/siteflow",
+              branch: "main"
+            },
+            checks: []
+          });
+          await writeJson(targetPack.evidenceFiles.targetRuntime, {
+            name: "siteflow-target-runtime-evidence-check",
+            status: "passed",
+            checkedAt: "2026-06-08T11:30:00.000Z",
+            template: true,
+            selectedEvidence: {
+              targetEnvironment: "production",
+              commitRef: "abc123def4567890",
+              repository: "acme/siteflow",
+              branch: "main"
+            },
+            checks: []
+          });
+          await writeJson(targetPack.evidenceFiles.operatorAccess, {
+            name: "siteflow-operator-access-evidence-check",
+            status: "passed",
+            checkedAt: "2026-06-08T11:30:00.000Z",
+            dryRun: true,
+            selectedEvidence: {
+              environment: "production",
+              commitRef: "abc123def4567890",
+              repository: "acme/siteflow",
+              branch: "main"
+            },
+            checks: []
+          });
+          await writeJson(targetPack.evidenceFiles.nonSessionCredential, {
+            name: "siteflow-non-session-credential-evidence-check",
+            status: "passed",
+            checkedAt: "2026-06-08T11:30:00.000Z",
+            template: true,
+            selectedEvidence: {
+              environment: "production",
+              commitRef: "abc123def4567890",
+              repository: "acme/siteflow",
+              branch: "main"
+            },
+            checks: []
+          });
+          seeded = true;
+        }
+
+        const evidence = passingEvidenceForCommandArgs(args, targetPack);
+
+        return {
+          exitCode: 0,
+          stdout: evidence ? JSON.stringify(evidence) : "",
+          stderr: ""
+        };
+      };
+      const result = await runReleaseEvidenceTargetRun({
+        packPath,
+        confirmTargetEnvironment: "production",
+        replacements: targetRunReplacements({
+          "api-instance-count": "2",
+          "api-process-count": "2"
+        }),
+        env: {
+          GITHUB_TOKEN: "present",
+          GH_TOKEN: "present",
+          SITEFLOW_RUN_DOCKER_BUILD_REHEARSAL: "1",
+          SITEFLOW_BUILD_IMAGE: "registry.local/siteflow/build-node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          SITEFLOW_RUN_POSTGRES_INTEGRATION: "1",
+          TEST_DATABASE_URL: "postgres://siteflow@localhost:5432/siteflow_rehearsal",
+          ...targetCredentialEvidenceEnv,
+          SITEFLOW_METRICS_TOKEN: "present",
+          SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY: passedReleaseEvidenceAttestationSigningKey,
+          SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID: passedReleaseEvidenceAttestationKeyId
+        },
+        commandRunner,
+        now
+      });
+      const finalGapReport = JSON.parse(await readFile(result.gapReports.at(-1)!.path, "utf8")) as {
+        items: Array<{ id: string; status: string; message: string }>;
+      };
+      const item = (id: string) => finalGapReport.items.find((entry) => entry.id === id);
+
+      expect(result.steps).toHaveLength(15);
+      expect(result.steps.every((step) => step.status === "completed")).toBe(true);
+      expect(result.status).toBe("failed");
+      expect(result.exitCode).toBe(1);
+      expect(result.productionEvidenceGenerated).toBe(false);
+      expect(result.finalGapReportStatus).toBe("blocked");
+      expect(item("source_provider_evidence")).toMatchObject({
+        status: "dry_run_only",
+        message: expect.stringContaining("dry run")
+      });
+      expect(item("target_runtime_evidence")).toMatchObject({
+        status: "blocked",
+        message: expect.stringContaining("template")
+      });
+      expect(item("operator_access_evidence")).toMatchObject({
+        status: "dry_run_only",
+        message: expect.stringContaining("dry run")
+      });
+      expect(item("non_session_credential_evidence")).toMatchObject({
+        status: "blocked",
+        message: expect.stringContaining("template")
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 10000);
+
   it("completes when all target commands pass and the final gap report has no gaps", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-target-run-passed-"));
 
@@ -1065,6 +1508,7 @@ describe("releaseEvidenceTargetRun", () => {
         publicBaseUrl: "https://siteflow.example.com",
         operatorName: "release-operator",
         releaseTicket: "REL-2026-0608",
+        observabilityTargetStackApiUrl: "https://observability.example.com/siteflow-proof",
         outputDir: root,
         now
       });
@@ -1087,16 +1531,10 @@ describe("releaseEvidenceTargetRun", () => {
       const result = await runReleaseEvidenceTargetRun({
         packPath,
         confirmTargetEnvironment: "production",
-        replacements: {
-          "direct-api-url": "http://10.0.0.5:8787/healthz",
-          "release-image-run-id": "123456789",
+        replacements: targetRunReplacements({
           "api-instance-count": "2",
-          "api-process-count": "2",
-          "ingress-count": "1",
-          "api-rate-limit-scope": "edge",
-          "api-rate-limit-enforcement-point": "ingress",
-          SITEFLOW_TRUST_PROXY: "loopback"
-        },
+          "api-process-count": "2"
+        }),
         env: {
           GITHUB_TOKEN: "present",
           GH_TOKEN: "present",
@@ -1104,7 +1542,10 @@ describe("releaseEvidenceTargetRun", () => {
           SITEFLOW_BUILD_IMAGE: "registry.local/siteflow/build-node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           SITEFLOW_RUN_POSTGRES_INTEGRATION: "1",
           TEST_DATABASE_URL: "postgres://siteflow@localhost:5432/siteflow_rehearsal",
-          SITEFLOW_METRICS_TOKEN: "present"
+          ...targetCredentialEvidenceEnv,
+          SITEFLOW_METRICS_TOKEN: "present",
+          SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY: passedReleaseEvidenceAttestationSigningKey,
+          SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID: passedReleaseEvidenceAttestationKeyId
         },
         commandRunner,
         now
@@ -1115,6 +1556,72 @@ describe("releaseEvidenceTargetRun", () => {
       expect(result.exitCode).toBe(0);
       expect(result.steps).toHaveLength(15);
       expect(result.steps.every((step) => step.status === "completed")).toBe(true);
+      expect(result.evidenceProductionSummary).toMatchObject({
+        targetRunnerCommandSteps: {
+          total: 11,
+          completed: 11,
+          stepIds: expect.arrayContaining([
+            "release_artifact_evidence",
+            "backup_evidence",
+            "observability_evidence",
+            "ingress_evidence",
+            "upgrade_rollback_evidence"
+          ])
+        },
+        controlPlaneQuerySteps: {
+          total: 1,
+          completed: 1,
+          stepIds: ["release_gate"]
+        },
+        externalArtifactDownloadSteps: {
+          total: 1,
+          completed: 1,
+          stepIds: ["release_image_evidence"]
+        },
+        finalizationSteps: {
+          total: 2,
+          completed: 2,
+          stepIds: ["release_evidence_bundle", "release_evidence_check"]
+        }
+      });
+      expect(result.evidenceProductionSummary.productionReadyOnlyWhen).toContain("not templates, dry runs, placeholders");
+      expect(result.evidenceProductionSummary.preparedInputConsumerSteps.map((step) => step.id)).toEqual([
+        "release_artifact_evidence",
+        "backup_evidence",
+        "observability_evidence",
+        "ingress_evidence",
+        "upgrade_rollback_evidence"
+      ]);
+      expect(result.steps.find((step) => step.id === "release_image_evidence")?.evidenceProduction).toMatchObject({
+        source: "external_artifact_download",
+        consumesPreparedInputs: []
+      });
+      expect(result.steps.find((step) => step.id === "release_artifact_evidence")?.evidenceProduction).toMatchObject({
+        source: "target_runner_command",
+        consumesPreparedInputs: expect.arrayContaining([
+          expect.stringContaining("real target data")
+        ])
+      });
+      expect(result.steps.find((step) => step.id === "observability_evidence")?.evidenceProduction).toMatchObject({
+        source: "target_runner_command",
+        consumesPreparedInputs: expect.arrayContaining([
+          expect.stringContaining("observability:operator-evidence:template"),
+          expect.stringContaining("must not remain template or dry-run")
+        ])
+      });
+      expect(result.steps.find((step) => step.id === "ingress_evidence")?.evidenceProduction).toMatchObject({
+        source: "target_runner_command",
+        consumesPreparedInputs: expect.arrayContaining([
+          expect.stringContaining("ingress:operator-evidence:template"),
+          expect.stringContaining("must not remain template or dry-run")
+        ])
+      });
+      expect(result.steps.find((step) => step.id === "upgrade_rollback_evidence")?.evidenceProduction).toMatchObject({
+        source: "target_runner_command",
+        consumesPreparedInputs: expect.arrayContaining([
+          expect.stringContaining("completed non-dry-run target drill")
+        ])
+      });
       expect(result.gapReports.at(-1)).toMatchObject({
         id: "015-release_evidence_check",
         status: "passed",

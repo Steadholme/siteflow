@@ -39,6 +39,9 @@ jobs:
       - name: Release commit readiness plan
         run: npm run --silent release:commit:plan -- --fail-on-blocked --json
 
+      - name: Release evidence pack contract
+        run: npm run --silent release:evidence:pack-contract -- --json
+
       - name: Production Docker compose config check
         env:
           SITEFLOW_CONFIG_DIR: ${{ runner.temp }}/siteflow-config
@@ -49,24 +52,22 @@ jobs:
           SITEFLOW_BUILD_IMAGE_ALLOWLIST: node:22-alpine@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
           SITEFLOW_BUILD_MIN_FREE_BYTES: "1"
         run: |
-          if docker compose version >/dev/null 2>&1; then
-            mkdir -p "$SITEFLOW_CONFIG_DIR/secrets"
-            for secret_name in \
-              app-secret \
-              api-token \
-              metrics-token \
-              postgres-password \
-              github-webhook \
-              gitlab-webhook \
-              gitea-webhook \
-              generic-webhook
-            do
-              printf '%s\n' "ci-placeholder-${secret_name}" > "$SITEFLOW_CONFIG_DIR/secrets/${secret_name}.secret"
-            done
-            docker compose -f docker-compose.production.yml config --quiet
-          else
-            echo "docker compose is not available; skipping production compose config validation."
-          fi
+          docker compose version
+          mkdir -p "$SITEFLOW_CONFIG_DIR/secrets"
+          for secret_name in \
+            app-secret \
+            api-token \
+            metrics-token \
+            release-evidence-signing-key \
+            postgres-password \
+            github-webhook \
+            gitlab-webhook \
+            gitea-webhook \
+            generic-webhook
+          do
+            printf '%s\n' "ci-placeholder-${secret_name}" > "$SITEFLOW_CONFIG_DIR/secrets/${secret_name}.secret"
+          done
+          docker compose -f docker-compose.production.yml config --quiet
 
       - name: Run tests
         run: npm test -- --run

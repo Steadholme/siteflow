@@ -1,5 +1,5 @@
 export type SiteFlowMetricType = "counter" | "gauge";
-export type SiteFlowMetricFamily = "http" | "queue" | "runtime" | "backup";
+export type SiteFlowMetricFamily = "http" | "queue" | "runtime" | "backup" | "storage";
 
 export interface SiteFlowMetricDefinition {
   name: string;
@@ -76,6 +76,36 @@ export const siteFlowMetricDefinitions = [
     description: "1 when runtime metric collection failed during the scrape, otherwise 0."
   },
   {
+    name: "siteflow_storage_artifact_free_bytes",
+    type: "gauge",
+    family: "storage",
+    description: "Available bytes on the artifact storage filesystem, or -1 when it cannot be measured."
+  },
+  {
+    name: "siteflow_storage_evidence_free_bytes",
+    type: "gauge",
+    family: "storage",
+    description: "Available bytes on the release evidence storage filesystem, or -1 when it cannot be measured."
+  },
+  {
+    name: "siteflow_storage_temp_free_bytes",
+    type: "gauge",
+    family: "storage",
+    description: "Available bytes on the runtime temporary filesystem, or -1 when it cannot be measured."
+  },
+  {
+    name: "siteflow_storage_missing_paths",
+    type: "gauge",
+    family: "storage",
+    description: "Number of configured storage paths that were missing or unreadable during the scrape."
+  },
+  {
+    name: "siteflow_storage_metrics_collection_error",
+    type: "gauge",
+    family: "storage",
+    description: "1 when storage metric collection failed during the scrape, otherwise 0."
+  },
+  {
     name: "siteflow_backup_automation_last_success_age_seconds",
     type: "gauge",
     family: "backup",
@@ -128,6 +158,9 @@ export const runtimeQueueMetricNames = siteFlowMetricDefinitions
   .map((definition) => definition.name);
 export const backupMetricNames = siteFlowMetricDefinitions
   .filter((definition) => definition.family === "backup")
+  .map((definition) => definition.name);
+export const storageMetricNames = siteFlowMetricDefinitions
+  .filter((definition) => definition.family === "storage")
   .map((definition) => definition.name);
 
 export function metricDefinition(name: string) {

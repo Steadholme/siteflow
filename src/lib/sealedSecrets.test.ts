@@ -66,6 +66,21 @@ describe("sealed secret helpers", () => {
     }
   });
 
+  it("reads git webhook secrets from *_FILE fallbacks", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "siteflow-webhook-secret-file-"));
+
+    try {
+      const secretPath = path.join(tempDir, "github-webhook-secret");
+      await writeFile(secretPath, " github-webhook-file-secret \n", "utf8");
+
+      expect(resolveSecretEnvValue("SITEFLOW_GITHUB_WEBHOOK_SECRET", {
+        SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE: secretPath
+      })).toBe(" github-webhook-file-secret ");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("fails clearly for empty or unreadable *_FILE fallback secrets without exposing content", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "siteflow-secret-file-"));
 

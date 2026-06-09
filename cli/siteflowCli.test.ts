@@ -6,6 +6,11 @@ import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { createReleaseEvidenceRehearsalPack } from "../scripts/releaseEvidenceRehearsalPack";
+import {
+  passedReleaseEvidenceAttestationSigningKey,
+  passedReleaseEvidenceBundle
+} from "../scripts/releaseEvidencePassedFixtures.test-support";
 
 function createIo() {
   const output = {
@@ -42,7 +47,12 @@ const validReleaseGateProductionEnv = {
   SITEFLOW_PUBLIC_SCHEME: "https",
   SITEFLOW_API_TOKEN: "siteflow-api-token-0123456789abcdef",
   SITEFLOW_APP_SECRET: "siteflow-app-secret-0123456789abcdef",
+  SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY: "siteflow-release-evidence-key-0123456789abcdef",
   SITEFLOW_METRICS_TOKEN: "siteflow-metrics-token-0123456789abcdef",
+  SITEFLOW_GITHUB_WEBHOOK_SECRET: "github-webhook-secret-0123456789abcdef",
+  SITEFLOW_GITLAB_WEBHOOK_SECRET: "gitlab-webhook-secret-0123456789abcdef",
+  SITEFLOW_GITEA_WEBHOOK_SECRET: "gitea-webhook-secret-0123456789abcdef",
+  SITEFLOW_GENERIC_WEBHOOK_SECRET: "generic-webhook-secret-0123456789abcdef",
   SITEFLOW_ALLOW_UNAUTHENTICATED_METRICS: "0",
   VITE_SITEFLOW_ALLOW_BROWSER_TOKEN_FALLBACK: "0",
   SITEFLOW_BUILD_RUNNER: "docker",
@@ -58,6 +68,14 @@ const validReleaseGateProductionEnv = {
   SITEFLOW_PREBUILT_MAX_FILES: "20000",
   SITEFLOW_BUILD_STEP_TIMEOUT_MS: "900000",
   SITEFLOW_GIT_TIMEOUT_MS: "300000",
+  SITEFLOW_BUILD_MEMORY: "1g",
+  SITEFLOW_BUILD_CPUS: "2",
+  SITEFLOW_BUILD_PIDS_LIMIT: "256",
+  SITEFLOW_TRUST_PROXY: "",
+  SITEFLOW_WORKER_USER: "1000:1000",
+  SITEFLOW_DOCKER_SOCKET_GID: "998",
+  SITEFLOW_GIT_SSH_KEY_PATH: "/etc/siteflow/secrets/git-deploy-key",
+  SITEFLOW_GIT_KNOWN_HOSTS_PATH: "/etc/siteflow/ssh/known_hosts",
   SITEFLOW_BUILD_NETWORK: "none"
 };
 
@@ -70,6 +88,7 @@ const validReleaseGateCliWorkflow = [
   "      - run: npm ci",
   "      - run: npm run --silent release:source:check -- --json",
   "      - run: npm run --silent release:commit:plan -- --fail-on-blocked --json",
+  "      - run: npm run --silent release:evidence:pack-contract -- --json",
   "      - run: npm test -- --run",
   "      - run: npm run build",
   "      - run: npm run --silent release:artifacts:check -- --json",
@@ -85,13 +104,25 @@ const validReleasePreflightCliWorkflow = [
   "      siteflow_api_url:",
   "      candidate_deployment_id:",
   "      direct_api_url:",
+  "      release_image_digest:",
   "      release_image_run_id:",
+  "      source_provider_webhook_delivery_id:",
+  "      source_provider_deploy_key_path:",
+  "      source_provider_known_hosts_path:",
   "      trust_proxy_policy:",
   "      api_instance_count:",
   "      api_process_count:",
   "      ingress_count:",
   "      api_rate_limit_scope:",
   "      api_rate_limit_enforcement_point:",
+  "      operator_access_project_id:",
+  "      operator_access_denied_project_id:",
+  "      old_metrics_token_redacted_id:",
+  "      new_metrics_token_redacted_id:",
+  "      old_root_api_token_redacted_id:",
+  "      new_root_api_token_redacted_id:",
+  "      break_glass_source:",
+  "      break_glass_approver_count:",
   "permissions:",
   "  contents: read",
   "  checks: read",
@@ -103,6 +134,8 @@ const validReleasePreflightCliWorkflow = [
   "      - run: echo 'build_image must be pinned'",
   "      - run: npm run --silent release:dependency:policy -- --json",
   "      - run: npm run --silent release:source:check -- --json",
+  "      - run: npm run --silent release:commit:plan -- --fail-on-blocked --json",
+  "      - run: npm run --silent release:evidence:pack-contract -- --json",
   "      - run: npm run build",
   "      - run: npx playwright install --with-deps chromium",
   "      - run: npm run test:e2e",
@@ -119,11 +152,97 @@ const validReleasePreflightCliWorkflow = [
   "      - env:",
   "          GITHUB_TOKEN: ${{ secrets.SITEFLOW_RELEASE_GITHUB_TOKEN || github.token }}",
   "          GH_TOKEN: ${{ secrets.SITEFLOW_RELEASE_GITHUB_TOKEN || github.token }}",
-  "        run: npm run --silent release:evidence:target-run -- --pack evidence/release-evidence-rehearsal-pack.json --confirm-target-environment production --run-record evidence/release-evidence-target-run.json --gap-report-dir evidence/gap-reports --set-env direct-api-url=SITEFLOW_DIRECT_API_URL --set-env release-image-run-id=SITEFLOW_RELEASE_IMAGE_RUN_ID --set-env SITEFLOW_TRUST_PROXY=SITEFLOW_TRUST_PROXY --set-env api-instance-count=SITEFLOW_API_INSTANCE_COUNT --set-env api-process-count=SITEFLOW_API_PROCESS_COUNT --set-env ingress-count=SITEFLOW_INGRESS_COUNT --set-env api-rate-limit-scope=SITEFLOW_API_RATE_LIMIT_SCOPE --set-env api-rate-limit-enforcement-point=SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT --json",
-  "      - run: npm run --silent release:evidence:gaps -- --pack evidence/release-evidence-rehearsal-pack.json --set-env direct-api-url=SITEFLOW_DIRECT_API_URL --set-env release-image-run-id=SITEFLOW_RELEASE_IMAGE_RUN_ID --set-env SITEFLOW_TRUST_PROXY=SITEFLOW_TRUST_PROXY --set-env api-instance-count=SITEFLOW_API_INSTANCE_COUNT --set-env api-process-count=SITEFLOW_API_PROCESS_COUNT --set-env ingress-count=SITEFLOW_INGRESS_COUNT --set-env api-rate-limit-scope=SITEFLOW_API_RATE_LIMIT_SCOPE --set-env api-rate-limit-enforcement-point=SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT --json",
+  "          SITEFLOW_API_TOKEN: ${{ secrets.SITEFLOW_API_TOKEN }}",
+  "          SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN: ${{ secrets.SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN }}",
+  "          SITEFLOW_OLD_METRICS_TOKEN: ${{ secrets.SITEFLOW_OLD_METRICS_TOKEN }}",
+  "          SITEFLOW_METRICS_TOKEN: ${{ secrets.SITEFLOW_METRICS_TOKEN }}",
+  "          SITEFLOW_OLD_API_TOKEN: ${{ secrets.SITEFLOW_OLD_API_TOKEN }}",
+  "          SITEFLOW_OBSERVABILITY_STACK_TOKEN: ${{ secrets.SITEFLOW_OBSERVABILITY_STACK_TOKEN }}",
+  "          SITEFLOW_RELEASE_IMAGE_DIGEST: ${{ inputs.release_image_digest }}",
+  "          SITEFLOW_RELEASE_IMAGE_RUN_ID: ${{ inputs.release_image_run_id }}",
+  "          SITEFLOW_SOURCE_PROVIDER_WEBHOOK_DELIVERY_ID: ${{ inputs.source_provider_webhook_delivery_id }}",
+  "          SITEFLOW_SOURCE_PROVIDER_DEPLOY_KEY_PATH: ${{ inputs.source_provider_deploy_key_path }}",
+  "          SITEFLOW_SOURCE_PROVIDER_KNOWN_HOSTS_PATH: ${{ inputs.source_provider_known_hosts_path }}",
+  "          SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID: ${{ secrets.SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID }}",
+  "        run: npm run --silent release:evidence:target-run -- --pack evidence/release-evidence-rehearsal-pack.json --confirm-target-environment production --run-record evidence/release-evidence-target-run.json --gap-report-dir evidence/gap-reports --set-env direct-api-url=SITEFLOW_DIRECT_API_URL --set-env release-image-digest=SITEFLOW_RELEASE_IMAGE_DIGEST --set-env release-image-run-id=SITEFLOW_RELEASE_IMAGE_RUN_ID --set-env webhook-delivery-id=SITEFLOW_SOURCE_PROVIDER_WEBHOOK_DELIVERY_ID --set-env deploy-key-path=SITEFLOW_SOURCE_PROVIDER_DEPLOY_KEY_PATH --set-env known-hosts-path=SITEFLOW_SOURCE_PROVIDER_KNOWN_HOSTS_PATH --set-env SITEFLOW_TRUST_PROXY=SITEFLOW_TRUST_PROXY --set-env api-instance-count=SITEFLOW_API_INSTANCE_COUNT --set-env api-process-count=SITEFLOW_API_PROCESS_COUNT --set-env ingress-count=SITEFLOW_INGRESS_COUNT --set-env api-rate-limit-scope=SITEFLOW_API_RATE_LIMIT_SCOPE --set-env api-rate-limit-enforcement-point=SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT --set-env operator-access-project-id=SITEFLOW_OPERATOR_ACCESS_PROJECT_ID --set-env operator-access-denied-project-id=SITEFLOW_OPERATOR_ACCESS_DENIED_PROJECT_ID --set-env old-metrics-token-redacted-id=SITEFLOW_OLD_METRICS_TOKEN_REDACTED_ID --set-env new-metrics-token-redacted-id=SITEFLOW_NEW_METRICS_TOKEN_REDACTED_ID --set-env old-root-api-token-redacted-id=SITEFLOW_OLD_ROOT_API_TOKEN_REDACTED_ID --set-env new-root-api-token-redacted-id=SITEFLOW_NEW_ROOT_API_TOKEN_REDACTED_ID --set-env break-glass-source=SITEFLOW_BREAK_GLASS_SOURCE --set-env break-glass-approver-count=SITEFLOW_BREAK_GLASS_APPROVER_COUNT --json",
+  "      - env:",
+  "          SITEFLOW_API_TOKEN: ${{ secrets.SITEFLOW_API_TOKEN }}",
+  "          SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN: ${{ secrets.SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN }}",
+  "          SITEFLOW_OLD_METRICS_TOKEN: ${{ secrets.SITEFLOW_OLD_METRICS_TOKEN }}",
+  "          SITEFLOW_METRICS_TOKEN: ${{ secrets.SITEFLOW_METRICS_TOKEN }}",
+  "          SITEFLOW_OLD_API_TOKEN: ${{ secrets.SITEFLOW_OLD_API_TOKEN }}",
+  "          SITEFLOW_OBSERVABILITY_STACK_TOKEN: ${{ secrets.SITEFLOW_OBSERVABILITY_STACK_TOKEN }}",
+  "          SITEFLOW_RELEASE_IMAGE_DIGEST: ${{ inputs.release_image_digest }}",
+  "          SITEFLOW_RELEASE_IMAGE_RUN_ID: ${{ inputs.release_image_run_id }}",
+  "          SITEFLOW_SOURCE_PROVIDER_WEBHOOK_DELIVERY_ID: ${{ inputs.source_provider_webhook_delivery_id }}",
+  "          SITEFLOW_SOURCE_PROVIDER_DEPLOY_KEY_PATH: ${{ inputs.source_provider_deploy_key_path }}",
+  "          SITEFLOW_SOURCE_PROVIDER_KNOWN_HOSTS_PATH: ${{ inputs.source_provider_known_hosts_path }}",
+  "          SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID: ${{ secrets.SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID }}",
+  "        run: npm run --silent release:evidence:gaps -- --pack evidence/release-evidence-rehearsal-pack.json --set-env direct-api-url=SITEFLOW_DIRECT_API_URL --set-env release-image-digest=SITEFLOW_RELEASE_IMAGE_DIGEST --set-env release-image-run-id=SITEFLOW_RELEASE_IMAGE_RUN_ID --set-env webhook-delivery-id=SITEFLOW_SOURCE_PROVIDER_WEBHOOK_DELIVERY_ID --set-env deploy-key-path=SITEFLOW_SOURCE_PROVIDER_DEPLOY_KEY_PATH --set-env known-hosts-path=SITEFLOW_SOURCE_PROVIDER_KNOWN_HOSTS_PATH --set-env SITEFLOW_TRUST_PROXY=SITEFLOW_TRUST_PROXY --set-env api-instance-count=SITEFLOW_API_INSTANCE_COUNT --set-env api-process-count=SITEFLOW_API_PROCESS_COUNT --set-env ingress-count=SITEFLOW_INGRESS_COUNT --set-env api-rate-limit-scope=SITEFLOW_API_RATE_LIMIT_SCOPE --set-env api-rate-limit-enforcement-point=SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT --set-env operator-access-project-id=SITEFLOW_OPERATOR_ACCESS_PROJECT_ID --set-env operator-access-denied-project-id=SITEFLOW_OPERATOR_ACCESS_DENIED_PROJECT_ID --set-env old-metrics-token-redacted-id=SITEFLOW_OLD_METRICS_TOKEN_REDACTED_ID --set-env new-metrics-token-redacted-id=SITEFLOW_NEW_METRICS_TOKEN_REDACTED_ID --set-env old-root-api-token-redacted-id=SITEFLOW_OLD_ROOT_API_TOKEN_REDACTED_ID --set-env new-root-api-token-redacted-id=SITEFLOW_NEW_ROOT_API_TOKEN_REDACTED_ID --set-env break-glass-source=SITEFLOW_BREAK_GLASS_SOURCE --set-env break-glass-approver-count=SITEFLOW_BREAK_GLASS_APPROVER_COUNT --json",
   "      - run: rm -f \"$SITEFLOW_TARGET_ENV_FILE\"",
   "      - uses: actions/upload-artifact@v4"
 ].join("\n");
+
+const validReleaseImageCliWorkflow = [
+  "name: Release Image",
+  "on:",
+  "  workflow_dispatch:",
+  "permissions:",
+  "  contents: read",
+  "  packages: write",
+  "jobs:",
+  "  publish:",
+  "    steps:",
+  "      - run: npm run --silent release:dependency:policy -- --json",
+  "      - run: npm ci",
+  "      - run: npm run --silent release:source:check -- --json",
+  "      - run: npm run --silent release:commit:plan -- --fail-on-blocked --json",
+  "      - run: npm run --silent release:evidence:pack-contract -- --json",
+  "      - run: npm test -- --run",
+  "      - run: npm run build",
+  "      - run: npm run --silent release:artifacts:check -- --json",
+  "      - uses: docker/build-push-action@v6",
+  "        with:",
+  "          provenance: true",
+  "          sbom: true",
+  "      - run: docker buildx imagetools inspect --raw ghcr.io/siteflow/siteflow@sha256:abc",
+  "      - run: echo '{}' > release-image-evidence.json",
+  "      - uses: actions/upload-artifact@v4",
+  "        with:",
+  "          name: release-image-evidence",
+  "          path: release-image-evidence.json",
+  "      - name: Gate image attestation evidence",
+  "        run: |",
+  "          const failed = [",
+  "            ...(Array.isArray(attestations.provenance?.failedChecks) ? attestations.provenance.failedChecks : []),",
+  "            ...(Array.isArray(attestations.sbom?.failedChecks) ? attestations.sbom.failedChecks : [])",
+  "          ];",
+  "          if (failed.length || attestations.provenance?.present !== true || attestations.sbom?.present !== true) {",
+  "            throw new Error(\"Published image provenance/SBOM attestation evidence is incomplete.\");",
+  "          }"
+].join("\n");
+
+const validReleaseGatePackageJson = JSON.stringify({
+  scripts: {
+    build: "npm run clean:build-artifacts && tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json && npm run build:scripts && npm run build:cli && npm run build:server && npm run build:worker && vite build",
+    "build:scripts": "tsc --noEmit -p tsconfig.scripts.json",
+    "clean:build-artifacts": "node scripts/cleanBuildArtifacts.mjs",
+    "build:cli": "tsc -p tsconfig.cli.json",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build:worker": "tsc -p tsconfig.worker.json",
+    siteflow: "node dist-cli/cli/index.js",
+    "release:dependency:policy": "node scripts/releaseDependencyPolicyCheck.mjs",
+    "release:source:check": "node scripts/runCompiledScript.mjs releaseSourceTreeCheck.js",
+    "release:commit:plan": "node scripts/runCompiledScript.mjs releaseCommitReadinessPlan.js",
+    "release:evidence:pack-contract": "node scripts/runCompiledScript.mjs releaseEvidencePackContractCheck.js",
+    "release:evidence:rehearsal-pack": "node scripts/runCompiledScript.mjs releaseEvidenceRehearsalPack.js",
+    "release:evidence:target-run": "node scripts/runCompiledScript.mjs releaseEvidenceTargetRun.js",
+    "release:evidence:gaps": "node scripts/runCompiledScript.mjs releaseEvidenceGapReport.js",
+    "release:artifacts:check": "node scripts/runCompiledScript.mjs releaseArtifactCheck.js",
+    test: "vitest",
+    "test:e2e": "playwright test"
+  }
+}, null, 2);
 
 const validProductionCompose = [
   "services:",
@@ -152,22 +271,36 @@ const validProductionCompose = [
   "      SITEFLOW_APP_SECRET_FILE: /run/secrets/siteflow_app_secret",
   "      SITEFLOW_API_TOKEN_FILE: /run/secrets/siteflow_api_token",
   "      SITEFLOW_METRICS_TOKEN_FILE: /run/secrets/siteflow_metrics_token",
+  "      SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE: /run/secrets/siteflow_release_evidence_signing_key",
+  "      SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID: sha256:1111111111111111",
   "      SITEFLOW_POSTGRES_PASSWORD_FILE: /run/secrets/siteflow_postgres_password",
+  "      SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_github_webhook_secret",
+  "      SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_gitlab_webhook_secret",
+  "      SITEFLOW_GITEA_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_gitea_webhook_secret",
+  "      SITEFLOW_GENERIC_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_generic_webhook_secret",
   "      SITEFLOW_BACKUP_AUTOMATION_RUN_RECORD: /var/lib/siteflow/evidence/backup-automation-run.json",
   "      SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES: 536870912",
   "      SITEFLOW_PREBUILT_MAX_FILES: 20000",
+  "      SITEFLOW_TRUST_PROXY: \"${SITEFLOW_TRUST_PROXY:-}\"",
   "    secrets:",
   "      - siteflow_app_secret",
   "      - siteflow_api_token",
   "      - siteflow_metrics_token",
+  "      - siteflow_release_evidence_signing_key",
   "      - siteflow_postgres_password",
+  "      - siteflow_github_webhook_secret",
+  "      - siteflow_gitlab_webhook_secret",
+  "      - siteflow_gitea_webhook_secret",
+  "      - siteflow_generic_webhook_secret",
   "    healthcheck:",
   "      test: fetch /readyz",
+  "    ports:",
+  "      - \"${SITEFLOW_API_BIND:-127.0.0.1}:8787:8787\"",
   "  worker:",
   "    image: ${SITEFLOW_IMAGE:?SITEFLOW_IMAGE must be the digest-pinned release image for production}",
-  "    user: \"${SITEFLOW_WORKER_USER:-0:0}\"",
+  "    user: \"${SITEFLOW_WORKER_USER:-1000:1000}\"",
   "    group_add:",
-  "      - \"${SITEFLOW_DOCKER_SOCKET_GID:-0}\"",
+  "      - \"${SITEFLOW_DOCKER_SOCKET_GID:?SITEFLOW_DOCKER_SOCKET_GID must match /var/run/docker.sock group id}\"",
   "    init: true",
   "    read_only: true",
   "    cap_drop:",
@@ -189,6 +322,13 @@ const validProductionCompose = [
   "      SITEFLOW_BUILD_MAX_ARTIFACT_BYTES: 536870912",
   "      SITEFLOW_BUILD_MAX_ARTIFACT_FILES: 20000",
   "      SITEFLOW_BUILD_MIN_FREE_BYTES: 1073741824",
+  "      SITEFLOW_BUILD_STEP_TIMEOUT_MS: 900000",
+  "      SITEFLOW_GIT_TIMEOUT_MS: 300000",
+  "      SITEFLOW_BUILD_MEMORY: 1g",
+  "      SITEFLOW_BUILD_CPUS: 2",
+  "      SITEFLOW_BUILD_PIDS_LIMIT: 256",
+  "      SITEFLOW_GIT_SSH_KEY_PATH: \"${SITEFLOW_GIT_SSH_KEY_PATH:-}\"",
+  "      SITEFLOW_GIT_KNOWN_HOSTS_PATH: \"${SITEFLOW_GIT_KNOWN_HOSTS_PATH:-}\"",
   "    secrets:",
   "      - siteflow_app_secret",
   "      - siteflow_postgres_password",
@@ -196,6 +336,12 @@ const validProductionCompose = [
   "      - type: bind",
   "        source: /var/run/docker.sock",
   "        target: /var/run/docker.sock",
+  "    command: |",
+  "      command -v docker",
+  "      docker info",
+  "      exec node dist-worker/worker/index.js",
+  "    healthcheck:",
+  "      test: node dist-worker/worker/index.js --healthcheck",
   "secrets:",
   "  siteflow_app_secret:",
   "    file: /etc/siteflow/secrets/app-secret.secret",
@@ -203,8 +349,18 @@ const validProductionCompose = [
   "    file: /etc/siteflow/secrets/api-token.secret",
   "  siteflow_metrics_token:",
   "    file: /etc/siteflow/secrets/metrics-token.secret",
+  "  siteflow_release_evidence_signing_key:",
+  "    file: /etc/siteflow/secrets/release-evidence-signing-key.secret",
   "  siteflow_postgres_password:",
-  "    file: /etc/siteflow/secrets/postgres-password.secret"
+  "    file: /etc/siteflow/secrets/postgres-password.secret",
+  "  siteflow_github_webhook_secret:",
+  "    file: /etc/siteflow/secrets/github-webhook.secret",
+  "  siteflow_gitlab_webhook_secret:",
+  "    file: /etc/siteflow/secrets/gitlab-webhook.secret",
+  "  siteflow_gitea_webhook_secret:",
+  "    file: /etc/siteflow/secrets/gitea-webhook.secret",
+  "  siteflow_generic_webhook_secret:",
+  "    file: /etc/siteflow/secrets/generic-webhook.secret"
 ].join("\n");
 
 const validProductionDeploymentDoc = [
@@ -216,11 +372,29 @@ const validProductionDeploymentDoc = [
   "SITEFLOW_POSTGRES_IMAGE",
   "SITEFLOW_BUILD_IMAGE",
   "SITEFLOW_BUILD_MIN_FREE_BYTES",
+  "SITEFLOW_BUILD_STEP_TIMEOUT_MS",
+  "SITEFLOW_GIT_TIMEOUT_MS",
+  "SITEFLOW_BUILD_MEMORY",
+  "SITEFLOW_BUILD_CPUS",
+  "SITEFLOW_BUILD_PIDS_LIMIT",
   "SITEFLOW_BUILD_MAX_ARTIFACT_BYTES",
   "SITEFLOW_BUILD_MAX_ARTIFACT_FILES",
   "SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES",
   "SITEFLOW_PREBUILT_MAX_FILES",
+  "SITEFLOW_TRUST_PROXY",
+  "SITEFLOW_WORKER_USER",
+  "SITEFLOW_DOCKER_SOCKET_GID",
+  "SITEFLOW_GIT_SSH_KEY_PATH",
+  "SITEFLOW_GIT_KNOWN_HOSTS_PATH",
+  "SITEFLOW_APP_SECRET_FILE",
+  "SITEFLOW_API_TOKEN_FILE",
+  "SITEFLOW_METRICS_TOKEN_FILE",
+  "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE",
   "SITEFLOW_POSTGRES_PASSWORD_FILE",
+  "SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE",
+  "SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE",
+  "SITEFLOW_GITEA_WEBHOOK_SECRET_FILE",
+  "SITEFLOW_GENERIC_WEBHOOK_SECRET_FILE",
   "docker compose -f docker-compose.production.yml config"
 ].join("\n");
 
@@ -229,6 +403,8 @@ async function writeReleaseGateCliFixtureFiles(root: string) {
   await mkdir(path.join(root, "docs", "deployment"), { recursive: true });
   await writeFile(path.join(root, ".github", "workflows", "ci.yml"), validReleaseGateCliWorkflow);
   await writeFile(path.join(root, ".github", "workflows", "release-preflight.yml"), validReleasePreflightCliWorkflow);
+  await writeFile(path.join(root, ".github", "workflows", "release-image.yml"), validReleaseImageCliWorkflow);
+  await writeFile(path.join(root, "package.json"), validReleaseGatePackageJson);
   await writeFile(path.join(root, "docker-compose.production.yml"), validProductionCompose);
   await writeFile(path.join(root, "docs", "deployment", "production-single-host.md"), validProductionDeploymentDoc);
   await writeFile(path.join(root, "docs", "production-readiness.md"), [
@@ -240,6 +416,8 @@ async function writeReleaseGateCliFixtureFiles(root: string) {
     "SITEFLOW_API_TOKEN",
     "SITEFLOW_APP_SECRET",
     "SITEFLOW_SEALING_KEY",
+    "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY",
+    "SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID",
     "SITEFLOW_METRICS_TOKEN",
     "SITEFLOW_ALLOW_UNAUTHENTICATED_METRICS",
     "SITEFLOW_BUILD_RUNNER",
@@ -256,6 +434,14 @@ async function writeReleaseGateCliFixtureFiles(root: string) {
     "SITEFLOW_PREBUILT_MAX_FILES",
     "SITEFLOW_BUILD_STEP_TIMEOUT_MS",
     "SITEFLOW_GIT_TIMEOUT_MS",
+    "SITEFLOW_BUILD_MEMORY",
+    "SITEFLOW_BUILD_CPUS",
+    "SITEFLOW_BUILD_PIDS_LIMIT",
+    "SITEFLOW_TRUST_PROXY",
+    "SITEFLOW_WORKER_USER",
+    "SITEFLOW_DOCKER_SOCKET_GID",
+    "SITEFLOW_GIT_SSH_KEY_PATH",
+    "SITEFLOW_GIT_KNOWN_HOSTS_PATH",
     "SITEFLOW_BUILD_NETWORK"
   ].join("\n"));
 }
@@ -431,6 +617,7 @@ function releaseEvidenceDependencies() {
       status: (rawEvidence && typeof rawEvidence === "object" && "blocked" in rawEvidence ? "blocked" : "passed") as "passed" | "blocked",
       checkedAt: "2026-06-08T12:00:00.000Z",
       evidencePath: options.evidencePath,
+      payloadDigest: `sha256:${"d".repeat(64)}`,
       thresholds: {
         maxEvidenceAgeHours: 168,
         allowHostBuildException: false
@@ -478,6 +665,30 @@ async function writeReleaseEvidence(root: string, overrides: Record<string, unkn
       },
       ...overrides
     }, null, 2)}\n`,
+    "utf8"
+  );
+
+  return evidencePath;
+}
+
+async function writePassedSignedReleaseEvidence(root: string) {
+  const pack = createReleaseEvidenceRehearsalPack({
+    commitRef: "abc123def4567890",
+    repo: "acme/siteflow",
+    branch: "main",
+    targetEnvFile: path.join(root, "target.env"),
+    publicBaseUrl: "https://siteflow.example.com",
+    operatorName: "release-operator",
+    releaseTicket: "REL-2026-0608",
+    observabilityTargetStackApiUrl: "https://observability.example.com/siteflow-proof",
+    outputDir: root,
+    now: () => new Date("2026-06-08T12:00:00.000Z")
+  });
+  const evidencePath = path.join(root, "release-evidence.json");
+
+  await writeFile(
+    evidencePath,
+    `${JSON.stringify(passedReleaseEvidenceBundle(pack), null, 2)}\n`,
     "utf8"
   );
 
@@ -1194,6 +1405,63 @@ describe("siteflow CLI", () => {
               });
             }
 
+            if (/\/branches\/[^/]+\/protection$/.test(url)) {
+              return new Response(JSON.stringify({
+                required_status_checks: {
+                  contexts: ["Required / siteflow"],
+                  checks: []
+                },
+                required_pull_request_reviews: {
+                  required_approving_review_count: 1
+                },
+                allow_force_pushes: {
+                  enabled: false
+                },
+                required_linear_history: {
+                  enabled: true
+                },
+                required_signatures: {
+                  enabled: true
+                }
+              }), {
+                status: 200,
+                headers: { "content-type": "application/json" }
+              });
+            }
+
+            if (url.includes("/rulesets")) {
+              return new Response(JSON.stringify([
+                {
+                  name: "production",
+                  target: "branch",
+                  enforcement: "active",
+                  conditions: {
+                    ref_name: {
+                      include: ["refs/heads/release"],
+                      exclude: []
+                    }
+                  },
+                  rules: [
+                    {
+                      type: "required_status_checks",
+                      parameters: {
+                        required_status_checks: [
+                          { context: "Required / siteflow" }
+                        ]
+                      }
+                    },
+                    { type: "pull_request", parameters: { required_approving_review_count: 1 } },
+                    { type: "non_fast_forward" },
+                    { type: "required_linear_history" },
+                    { type: "required_signatures" }
+                  ]
+                }
+              ]), {
+                status: 200,
+                headers: { "content-type": "application/json" }
+              });
+            }
+
             if (/\/branches\/[^/]+$/.test(url)) {
               return new Response(JSON.stringify({
                 commit: { sha: "abc123def456abc123def456abc123def456abcd" }
@@ -1279,6 +1547,10 @@ describe("siteflow CLI", () => {
           authorization: "Bearer ghs_test"
         },
         {
+          url: "https://api.github.com/repos/acme/siteflow/branches/release/protection",
+          authorization: "Bearer ghs_test"
+        },
+        {
           url: "https://api.github.com/repos/acme/siteflow/branches/release",
           authorization: "Bearer ghs_test"
         },
@@ -1326,6 +1598,8 @@ describe("siteflow CLI", () => {
       installPostgresImage,
       "--build-image",
       installBuildImage,
+      "--docker-socket-gid",
+      "998",
       "--dry-run",
       "--json"
     ], io, {
@@ -1354,6 +1628,8 @@ describe("siteflow CLI", () => {
         SITEFLOW_IMAGE: installRuntimeImage,
         SITEFLOW_POSTGRES_IMAGE: installPostgresImage,
         SITEFLOW_BUILD_IMAGE: installBuildImage,
+        SITEFLOW_WORKER_USER: "1000:1000",
+        SITEFLOW_DOCKER_SOCKET_GID: "998",
         SITEFLOW_BUILD_MAX_ARTIFACT_BYTES: "536870912",
         SITEFLOW_BUILD_MAX_ARTIFACT_FILES: "20000",
         SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES: "536870912",
@@ -1361,13 +1637,16 @@ describe("siteflow CLI", () => {
       }
     });
     expect(plan.renderedAssets.env.content).toContain("SITEFLOW_BASE_DOMAIN=siteflow.example.com");
+    expect(plan.renderedAssets.env.content).toContain("SITEFLOW_WORKER_USER=1000:1000");
+    expect(plan.renderedAssets.env.content).toContain("SITEFLOW_DOCKER_SOCKET_GID=998");
     expect(plan.renderedAssets.env.content).not.toContain("WEBHOOK_SECRET");
     expect(plan.renderedAssets.compose.content).toContain("  worker:");
     expect(plan.renderedAssets.compose.content).toContain("exec node dist-worker/worker/index.js");
     expect(plan.renderedAssets.compose.content).toContain("condition: service_healthy");
     expect(plan.renderedAssets.compose.content).toContain("fetch('http://127.0.0.1:8787/readyz')");
-    expect(plan.renderedAssets.compose.content).toContain('    user: "${SITEFLOW_WORKER_USER:-0:0}"');
+    expect(plan.renderedAssets.compose.content).toContain('    user: "${SITEFLOW_WORKER_USER:-1000:1000}"');
     expect(plan.renderedAssets.compose.content).toContain("    group_add:");
+    expect(plan.renderedAssets.compose.content).toContain('      - "${SITEFLOW_DOCKER_SOCKET_GID:?SITEFLOW_DOCKER_SOCKET_GID must match /var/run/docker.sock group id}"');
     expect(plan.renderedAssets.compose.content).toContain("SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE");
     expect(plan.renderedAssets.compose.content).toContain('DATABASE_URL: "postgres://siteflow@postgres:5432/siteflow"');
     expect(plan.renderedAssets.compose.content).not.toContain("export SITEFLOW_");
@@ -1402,6 +1681,8 @@ describe("siteflow CLI", () => {
         installPostgresImage,
         "--build-image",
         installBuildImage,
+        "--docker-socket-gid",
+        "998",
         "--dry-run",
         "--json"
       ],
@@ -1420,6 +1701,7 @@ describe("siteflow CLI", () => {
     });
     expect(plan.installState.tls.domains).toEqual(["siteflow.w33d.xyz", "*.w33d.xyz"]);
     expect(plan.runtimeEnv.SITEFLOW_BASE_DOMAIN).toBe("w33d.xyz");
+    expect(plan.runtimeEnv.SITEFLOW_DOCKER_SOCKET_GID).toBe("998");
     expect(plan.runtimeEnv.SITEFLOW_WORKER_POLL_INTERVAL_MS).toBe("5000");
     expect(plan.renderedAssets.nginx.content).toContain("server_name siteflow.w33d.xyz;");
     expect(plan.renderedAssets.nginx.content).toContain("server_name *.w33d.xyz;");
@@ -1432,6 +1714,33 @@ describe("siteflow CLI", () => {
 
     expect(code).toBe(2);
     expect(output.stderr).toContain("requires --yes");
+  });
+
+  it("requires Docker socket GID for install planning", async () => {
+    const { io, output } = createIo();
+    const code = await runSiteFlowCli([
+      "install",
+      "--topology",
+      "single",
+      "--domain",
+      "siteflow.w33d.xyz",
+      "--image",
+      installRuntimeImage,
+      "--postgres-image",
+      installPostgresImage,
+      "--build-image",
+      installBuildImage,
+      "--dry-run",
+      "--json"
+    ], io, {
+      version: "0.1.0-test"
+    });
+
+    expect(code).toBe(1);
+    expect(JSON.parse(output.stdout)).toMatchObject({
+      status: "failed",
+      message: expect.stringContaining("SITEFLOW_DOCKER_SOCKET_GID is required")
+    });
   });
 
   it("applies install assets when explicitly confirmed", async () => {
@@ -1456,6 +1765,8 @@ describe("siteflow CLI", () => {
           installPostgresImage,
           "--build-image",
           installBuildImage,
+          "--docker-socket-gid",
+          "998",
           "--yes",
           "--json"
         ],
@@ -1507,16 +1818,23 @@ describe("siteflow CLI", () => {
       const envFile = await readFile(path.join(root, "etc/siteflow/siteflow.env"), "utf8");
       const composeFile = await readFile(path.join(root, "opt/siteflow/compose.yaml"), "utf8");
       expect(envFile).toContain("SITEFLOW_BASE_DOMAIN=w33d.xyz");
-      expect(envFile).toContain("SITEFLOW_TRUST_PROXY=loopback");
+      expect(envFile).toContain("SITEFLOW_TRUST_PROXY=");
+      expect(envFile).not.toContain("SITEFLOW_TRUST_PROXY=loopback");
+      expect(envFile).toContain("SITEFLOW_WORKER_USER=1000:1000");
+      expect(envFile).toContain("SITEFLOW_DOCKER_SOCKET_GID=998");
       expect(composeFile).toContain(installRuntimeImage);
       expect(composeFile).toContain(installPostgresImage);
       expect(composeFile).toContain(`SITEFLOW_BUILD_IMAGE: "${installBuildImage}"`);
       expect(composeFile).not.toContain("SITEFLOW_BUILD_IMAGE_ALLOWLIST");
-      expect(composeFile).toContain('SITEFLOW_TRUST_PROXY: "loopback"');
+      expect(composeFile).toContain('SITEFLOW_TRUST_PROXY: ""');
+      expect(composeFile).not.toContain('SITEFLOW_TRUST_PROXY: "loopback"');
+      expect(composeFile).toContain('SITEFLOW_GIT_SSH_KEY_PATH: "${SITEFLOW_GIT_SSH_KEY_PATH:-}"');
+      expect(composeFile).toContain('SITEFLOW_GIT_KNOWN_HOSTS_PATH: "${SITEFLOW_GIT_KNOWN_HOSTS_PATH:-}"');
       expect(composeFile).toContain("condition: service_healthy");
       expect(composeFile).toContain("fetch('http://127.0.0.1:8787/readyz')");
-      expect(composeFile).toContain('    user: "${SITEFLOW_WORKER_USER:-0:0}"');
+      expect(composeFile).toContain('    user: "${SITEFLOW_WORKER_USER:-1000:1000}"');
       expect(composeFile).toContain("    group_add:");
+      expect(composeFile).toContain('      - "${SITEFLOW_DOCKER_SOCKET_GID:?SITEFLOW_DOCKER_SOCKET_GID must match /var/run/docker.sock group id}"');
       expect(composeFile).toContain("  worker:");
       expect(composeFile).toContain("SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE");
       expect(composeFile).toContain("SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE");
@@ -2948,6 +3266,165 @@ describe("siteflow CLI", () => {
       });
       expect(JSON.parse(output.stdout)).toMatchObject({
         status: "accepted"
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("verifies signed production release evidence with a key file before promotion", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-promote-signed-evidence-"));
+    const seen: string[] = [];
+    const { io, output } = createIo();
+
+    try {
+      const evidencePath = await writePassedSignedReleaseEvidence(root);
+      const keyPath = path.join(root, "release-evidence-signing.key");
+
+      await writeFile(keyPath, `${passedReleaseEvidenceAttestationSigningKey}\n`, "utf8");
+
+      const code = await runSiteFlowCli(
+        [
+          "promote",
+          "dep_123",
+          "--project",
+          "project-acme-dashboard",
+          "--server",
+          "https://siteflow.example.com",
+          "--token",
+          "secret-token",
+          "--reason",
+          "ship",
+          "--release-evidence",
+          evidencePath,
+          "--json"
+        ],
+        io,
+        {
+          env: {
+            SITEFLOW_ACTOR_ID: "user_1",
+            SITEFLOW_ACTOR_NAME: "Acme Dev"
+          },
+          releaseEvidence: {
+            env: {
+              SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE: keyPath
+            },
+            now: () => new Date("2026-06-08T12:00:00.000Z")
+          },
+          fetch: async (input) => {
+            seen.push(input.toString());
+            return new Response(JSON.stringify(acceptedPromotionResponse()), {
+              status: 202,
+              headers: { "content-type": "application/json" }
+            });
+          }
+        }
+      );
+
+      expect(code).toBe(0);
+      expect(seen).toEqual(["https://siteflow.example.com/api/projects/project-acme-dashboard/release/production/promote"]);
+      expect(JSON.parse(output.stdout)).toMatchObject({
+        status: "accepted"
+      });
+      expect(output.stdout).not.toContain(passedReleaseEvidenceAttestationSigningKey);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks signed production release evidence before promotion when the env-pinned key id differs", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-promote-signed-evidence-key-id-"));
+    const seen: string[] = [];
+    const { io, output } = createIo();
+
+    try {
+      const evidencePath = await writePassedSignedReleaseEvidence(root);
+      const code = await runSiteFlowCli(
+        [
+          "promote",
+          "dep_123",
+          "--project",
+          "project-acme-dashboard",
+          "--server",
+          "https://siteflow.example.com",
+          "--token",
+          "secret-token",
+          "--reason",
+          "ship",
+          "--release-evidence",
+          evidencePath,
+          "--json"
+        ],
+        io,
+        {
+          releaseEvidence: {
+            env: {
+              SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY: passedReleaseEvidenceAttestationSigningKey,
+              SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID: "sha256:0000000000000000"
+            },
+            now: () => new Date("2026-06-08T12:00:00.000Z")
+          },
+          fetch: async (input) => {
+            seen.push(input.toString());
+            return new Response("{}", { status: 500 });
+          }
+        }
+      );
+      const result = JSON.parse(output.stdout);
+
+      expect(code).toBe(2);
+      expect(seen).toEqual([]);
+      expect(result).toMatchObject({
+        status: "blocked",
+        message: expect.stringContaining("bundle_attestation_signature")
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks signed production release evidence before promotion when the signing key is unavailable", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-promote-missing-signing-key-"));
+    const seen: string[] = [];
+    const { io, output } = createIo();
+
+    try {
+      const evidencePath = await writePassedSignedReleaseEvidence(root);
+      const code = await runSiteFlowCli(
+        [
+          "promote",
+          "dep_123",
+          "--project",
+          "project-acme-dashboard",
+          "--server",
+          "https://siteflow.example.com",
+          "--token",
+          "secret-token",
+          "--reason",
+          "ship",
+          "--release-evidence",
+          evidencePath,
+          "--json"
+        ],
+        io,
+        {
+          releaseEvidence: {
+            env: {},
+            now: () => new Date("2026-06-08T12:00:00.000Z")
+          },
+          fetch: async (input) => {
+            seen.push(input.toString());
+            return new Response("{}", { status: 500 });
+          }
+        }
+      );
+      const result = JSON.parse(output.stdout);
+
+      expect(code).toBe(2);
+      expect(seen).toEqual([]);
+      expect(result).toMatchObject({
+        status: "blocked",
+        message: expect.stringContaining("bundle_attestation_signature")
       });
     } finally {
       await rm(root, { recursive: true, force: true });

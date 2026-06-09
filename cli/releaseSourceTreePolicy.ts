@@ -216,3 +216,11 @@ export function releaseSourceTreePolicyDetails() {
     forbiddenPatterns: forbiddenTrackedReleasePathPatterns.map((entry) => entry.label)
   };
 }
+
+export function releaseSourceTreeForbiddenPathspecs() {
+  return [
+    ...forbiddenTrackedReleasePathPrefixes.map((entry) => entry.prefix),
+    ...forbiddenTrackedReleasePathFiles.map((entry) => entry.path),
+    ...forbiddenTrackedReleasePathPatterns.map((entry) => entry.label)
+  ];
+}

@@ -133,6 +133,20 @@ function stringValue(value: unknown) {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+function targetStackProofNotDryRun(candidate: Record<string, unknown>) {
+  const mode = (
+    stringValue(candidate.mode) ??
+    stringValue(candidate.applyMode) ??
+    stringValue(candidate.evidenceMode)
+  )?.toLowerCase().replace(/[-\s]+/g, "_");
+
+  return candidate.dryRun !== true &&
+    candidate.template !== true &&
+    candidate.sourceApplied !== false &&
+    mode !== "dry_run" &&
+    mode !== "template";
+}
+
 function trimTrailingNewlines(value: string) {
   return value.replace(/[\r\n]+$/g, "");
 }
@@ -390,10 +404,13 @@ export async function collectTargetStackProofEvidence(
     };
   }
 
+  const productionProof = targetStackProofNotDryRun(body);
+
   return {
     ...body,
     ...baseProof,
-    status: body.status === "passed" ? "passed" : "blocked",
+    status: body.status === "passed" && productionProof ? "passed" : "blocked",
+    ...(productionProof ? {} : { message: "Target-stack API proof must come from a real target stack query, not a template or dry-run." }),
     ...(isObject(body.release) ? { release: body.release } : {}),
     ...(isObject(body.prometheusRules) ? { prometheusRules: body.prometheusRules } : {}),
     ...(isObject(body.grafanaDashboard) ? { grafanaDashboard: body.grafanaDashboard } : {}),
@@ -706,9 +723,15 @@ export async function collectObservabilityEvidence(
   );
   addCheck(
     checks,
+    "target_stack_proof_configured",
+    options.targetEnvironment !== "production" || Boolean(options.targetStackApiUrl),
+    "Production observability evidence must collect target-stack API proof with --target-stack-api-url."
+  );
+  addCheck(
+    checks,
     "target_stack_proof_collected",
-    !observabilityTargetStackProof || observabilityTargetStackProof.status === "passed",
-    "Collector must receive a passing target-stack API proof when --target-stack-api-url is provided."
+    options.targetEnvironment !== "production" && !observabilityTargetStackProof || observabilityTargetStackProof?.status === "passed",
+    "Collector must receive a passing target-stack API proof for production or when --target-stack-api-url is provided."
   );
   addCheck(
     checks,

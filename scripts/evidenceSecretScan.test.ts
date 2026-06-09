@@ -63,6 +63,20 @@ describe("evidenceSecretScan", () => {
     ]));
   });
 
+  it("detects sensitive fields inside JSON-string encoded output", () => {
+    const encodedEvidence = JSON.stringify(JSON.stringify({
+      rawSecret: "super-secret-value",
+      nested: {
+        authorization: "Bearer abcdefghijklmnop"
+      }
+    }));
+
+    expect(sensitiveOutputReasons(encodedEvidence)).toEqual(expect.arrayContaining([
+      "raw credential field",
+      "authorization field"
+    ]));
+  });
+
   it("flags uppercase raw values under high-risk credential keys while allowing explicit env var references", () => {
     const findings = scanEvidenceForRawSecrets({
       token: "ABCDEF1234567890",

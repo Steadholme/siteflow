@@ -37,6 +37,11 @@ export interface SourceProviderEvidenceCheckResult {
     provider: string | null;
     webhookDeliveryId: string | null;
     deployKeyMode: string | null;
+    checkout: Record<string, unknown> | null;
+    signedWebhook: Record<string, unknown> | null;
+    deployKey: Record<string, unknown> | null;
+    hostKey: Record<string, unknown> | null;
+    releaseProvenance: Record<string, unknown> | null;
   };
   checks: SourceProviderEvidenceCheck[];
   exitCode: number;
@@ -279,8 +284,7 @@ function noRawCredentialArchive(root: Record<string, unknown> | undefined) {
 
 function deployKeyPolicyPassed(root: Record<string, unknown> | undefined) {
   const deployKey = deployKeyEvidence(root);
-  const repository = nestedObject(root, "repository");
-  const privateRepo = repository?.private === true || repository?.visibility === "private" || deployKey?.required === true;
+  const privateRepo = deployKeyRequired(root);
 
   if (!privateRepo && deployKey?.required !== true) {
     return true;
@@ -312,6 +316,47 @@ function hostKeyPolicyPassed(root: Record<string, unknown> | undefined) {
   );
 }
 
+function deployKeyRequired(root: Record<string, unknown> | undefined) {
+  const deployKey = deployKeyEvidence(root);
+  const repository = nestedObject(root, "repository");
+
+  return repository?.private === true || repository?.visibility === "private" || deployKey?.required === true;
+}
+
+function hostKeyRequired(root: Record<string, unknown> | undefined) {
+  return isSshRemote(remoteUrl(root));
+}
+
+function sourceSectionTimestamp(candidate: Record<string, unknown> | undefined, fallback: string | undefined) {
+  return timestampValue(candidate?.completedAt) ??
+    timestampValue(candidate?.checkedAt) ??
+    timestampValue(candidate?.timestamp) ??
+    fallback;
+}
+
+function sourceSectionSummary(
+  candidate: Record<string, unknown> | undefined,
+  fallbackTimestamp: string | undefined,
+  details: Record<string, unknown> = {}
+) {
+  if (!candidate) {
+    return null;
+  }
+
+  return {
+    status: stringValue(candidate.status) ?? null,
+    timestamp: sourceSectionTimestamp(candidate, fallbackTimestamp) ?? null,
+    ...details
+  };
+}
+
+function notRequiredSourceSectionSummary(fallbackTimestamp: string | undefined) {
+  return {
+    status: "not_required",
+    timestamp: fallbackTimestamp ?? null
+  };
+}
+
 export function evaluateSourceProviderEvidence(
   rawEvidence: unknown,
   options: SourceProviderEvidenceCheckOptions
@@ -327,6 +372,8 @@ export function evaluateSourceProviderEvidence(
   const checkedAt = evidenceTimestamp(root);
   const webhook = webhookEvidence(root);
   const checkout = nestedObject(root, "checkout");
+  const deployKey = deployKeyEvidence(root);
+  const hostKey = hostKeyEvidence(root);
   const provenance = releaseProvenanceEvidence(root);
   const secretFindings = scanEvidenceForRawSecrets(rawEvidence);
   const checks: SourceProviderEvidenceCheck[] = [];
@@ -441,7 +488,39 @@ export function evaluateSourceProviderEvidence(
       branch: branch ?? null,
       provider: provider ?? null,
       webhookDeliveryId: stringValue(webhook?.deliveryId) ?? null,
-      deployKeyMode: stringValue(deployKeyEvidence(root)?.mode) ?? (deployKeyEvidence(root)?.required === true ? "required" : "not_required")
+      deployKeyMode: stringValue(deployKey?.mode) ?? (deployKey?.required === true ? "required" : "not_required"),
+      checkout: sourceSectionSummary(checkout, checkedAt, {
+        commitRef: stringValue(checkout?.commitRef) ?? null,
+        headSha: stringValue(checkout?.headSha) ?? null,
+        exactCommitVerified: checkout?.exactCommitVerified === true || checkout?.headMatchesCommit === true
+      }),
+      signedWebhook: sourceSectionSummary(webhook, checkedAt, {
+        deliveryId: stringValue(webhook?.deliveryId) ?? null,
+        event: stringValue(webhook?.event) ?? null,
+        signatureVerified: webhook?.signatureVerified === true
+      }),
+      deployKey: deployKey
+        ? sourceSectionSummary(deployKey, checkedAt, {
+          mode: stringValue(deployKey.mode) ?? null,
+          mounted: deployKey.mounted === true || deployKey.available === true,
+          required: deployKey.required === true || deployKeyRequired(root)
+        })
+        : deployKeyRequired(root)
+          ? null
+          : notRequiredSourceSectionSummary(checkedAt),
+      hostKey: hostKey
+        ? sourceSectionSummary(hostKey, checkedAt, {
+          pinned: hostKey.pinned === true || hostKey.knownHostsConfigured === true,
+          required: hostKeyRequired(root)
+        })
+        : hostKeyRequired(root)
+          ? null
+          : notRequiredSourceSectionSummary(checkedAt),
+      releaseProvenance: sourceSectionSummary(provenance, checkedAt, {
+        commitRef: stringValue(provenance?.commitRef) ?? null,
+        repository: stringValue(provenance?.repository) ?? null,
+        branch: stringValue(provenance?.branch) ?? null
+      })
     },
     checks,
     exitCode: passed ? 0 : 1

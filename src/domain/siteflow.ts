@@ -286,6 +286,7 @@ export interface CdnOperation {
 export interface ReleaseEvidenceMetadata {
   evidencePath: string;
   checkedAt: IsoTimestamp;
+  payloadDigest?: string;
   status: "passed";
   commitRef: string;
   repository: string;

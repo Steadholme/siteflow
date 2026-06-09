@@ -54,6 +54,65 @@ export interface OperatorAccessEvidenceCheckResult {
   exitCode: number;
 }
 
+export const requiredOperatorAccessEvidenceCheckNames = [
+  "non_dry_run",
+  "not_template",
+  "status_final",
+  "evidence_age",
+  "release_identity",
+  "target_facts",
+  "environment",
+  "public_base_url",
+  "session_create_present",
+  "session_create_status",
+  "session_create_age",
+  "session_cookie_flags",
+  "session_secret_not_returned",
+  "session_policy_present",
+  "session_policy_enforced",
+  "session_policy_age",
+  "project_scope_present",
+  "project_scope_enforced",
+  "project_scope_age",
+  "session_rotation_present",
+  "session_rotation_status",
+  "session_rotation_cookie_flags",
+  "session_rotation_secret_not_returned",
+  "session_rotation_csrf_enforced",
+  "session_rotation_old_cookie_rejected",
+  "session_rotation_age",
+  "session_revoke_present",
+  "session_revoke_status",
+  "session_revoke_age",
+  "csrf_present",
+  "csrf_enforced",
+  "csrf_age",
+  "bearer_precedence_present",
+  "bearer_precedence_enforced",
+  "bearer_precedence_age",
+  "actor_attribution_present",
+  "actor_attribution_enforced",
+  "actor_attribution_age",
+  "browser_token_fallback_present",
+  "browser_token_fallback_posture",
+  "browser_token_fallback_exception_documented",
+  "browser_token_fallback_local_storage_disabled",
+  "browser_token_fallback_age",
+  "emergency_cutoff_present",
+  "emergency_cutoff_global",
+  "emergency_cutoff_project",
+  "emergency_cutoff_cookie_only_rejected",
+  "emergency_cutoff_low_scope_bearer",
+  "emergency_cutoff_old_cookie_rejected",
+  "emergency_cutoff_age",
+  "negative_evidence_present",
+  "no_raw_secrets_stored",
+  "no_sensitive_evidence_values",
+  "non_goals_not_claimed",
+  "operator",
+  "ticket"
+] as const;
+
 interface ParsedArgs {
   evidencePath?: string;
   commitRef?: string;
@@ -180,6 +239,57 @@ function publicBaseUrl(root: Record<string, unknown> | undefined) {
   return stringValue(root?.publicBaseUrl) ??
     stringValue(root?.baseUrl) ??
     stringValue(nestedValue(root, ["target", "publicBaseUrl"]));
+}
+
+function targetObject(root: Record<string, unknown> | undefined) {
+  return nestedObject(root, "target");
+}
+
+function targetEnvironmentName(target: Record<string, unknown> | undefined) {
+  return stringValue(target?.environment) ?? stringValue(target?.targetEnvironment);
+}
+
+function targetPublicBaseUrl(target: Record<string, unknown> | undefined) {
+  return stringValue(target?.publicBaseUrl) ?? stringValue(target?.baseUrl);
+}
+
+function targetReleaseObject(target: Record<string, unknown> | undefined) {
+  return nestedObject(target, "release") ?? target;
+}
+
+function targetReleaseCommit(target: Record<string, unknown> | undefined) {
+  const release = targetReleaseObject(target);
+
+  return stringValue(release?.commitRef) ?? stringValue(release?.commitSha);
+}
+
+function targetReleaseRepository(target: Record<string, unknown> | undefined) {
+  return stringValue(targetReleaseObject(target)?.repository);
+}
+
+function targetReleaseBranch(target: Record<string, unknown> | undefined) {
+  return stringValue(targetReleaseObject(target)?.branch);
+}
+
+function targetFactsMatch(root: Record<string, unknown> | undefined) {
+  const target = targetObject(root);
+  const targetCommitRef = targetReleaseCommit(target);
+  const targetRepository = targetReleaseRepository(target);
+  const targetBranch = targetReleaseBranch(target);
+
+  return Boolean(
+    target &&
+      targetEnvironmentName(target) &&
+      targetEnvironmentName(target) === environmentName(root) &&
+      targetPublicBaseUrl(target) &&
+      targetPublicBaseUrl(target) === publicBaseUrl(root) &&
+      targetCommitRef &&
+      targetCommitRef === releaseCommit(root) &&
+      targetRepository &&
+      targetRepository === releaseRepository(root) &&
+      targetBranch &&
+      targetBranch === releaseBranch(root)
+  );
 }
 
 function environmentName(root: Record<string, unknown> | undefined) {
@@ -392,6 +502,12 @@ export function evaluateOperatorAccessEvidence(
         (!options.branch || options.branch === branch)
     ),
     "Operator access evidence must include release commit, repository, and branch matching requested values."
+  );
+  addCheck(
+    checks,
+    "target_facts",
+    targetFactsMatch(root),
+    "Operator access evidence must include target environment, public base URL, and release identity facts matching the final evidence."
   );
   addCheck(
     checks,

@@ -34,17 +34,79 @@ function passedEvidence(overrides: Record<string, unknown> = {}) {
       repository: "acme/siteflow",
       branch: "main"
     },
+    targetIdentity: passedSection({
+      command: "hostname && docker context show && docker context inspect siteflow-prod",
+      source: "target_host_identity_probe",
+      hostname: "siteflow-prod-01",
+      dockerContext: "siteflow-prod",
+      dockerContextInspectSha256: "d".repeat(64),
+      rawContextArchived: false,
+      hostFingerprintSha256: "e".repeat(64),
+      composeProject: "siteflow-prod",
+      composeFile: "docker-compose.production.yml",
+      envFileConfigured: true,
+      publicBaseUrl: "https://siteflow.example.com"
+    }),
     composeConfig: passedSection({
       command: "docker compose --env-file /etc/siteflow/target.env -f docker-compose.production.yml config",
       source: "target_host_docker_compose_config",
       composeProject: "siteflow-prod",
       services: ["postgres", "api", "worker"],
-      secrets: ["siteflow_app_secret", "siteflow_api_token", "siteflow_metrics_token", "siteflow_postgres_password"],
-      healthchecks: ["postgres", "api"],
+      secrets: [
+        "siteflow_app_secret",
+        "siteflow_api_token",
+        "siteflow_metrics_token",
+        "siteflow_release_evidence_signing_key",
+        "siteflow_postgres_password"
+      ],
+      healthchecks: ["postgres", "api", "worker"],
       images: {
         postgres: postgresImage,
         api: releaseImage,
         worker: releaseImage
+      },
+      serviceProfiles: {
+        api: {
+          user: "1000:1000",
+          privileged: false,
+          readOnly: true,
+          capDropAll: true,
+          capAdd: [],
+          capAddEmpty: true,
+          noNewPrivileges: true,
+          dangerousSecurityOpt: [],
+          dangerousSecurityOptConfigured: false,
+          networkMode: null,
+          hostNetworkMode: false,
+          dockerSocketMounted: false
+        },
+        worker: {
+          user: "1000:1000",
+          groupAdd: ["998"],
+          groupAddConfigured: true,
+          hostDockerSocketGid: 998,
+          groupAddMatchesHostDockerSocketGid: true,
+          privileged: false,
+          readOnly: true,
+          capDropAll: true,
+          capAdd: [],
+          capAddEmpty: true,
+          noNewPrivileges: true,
+          dangerousSecurityOpt: [],
+          dangerousSecurityOptConfigured: false,
+          networkMode: null,
+          hostNetworkMode: false,
+          dockerSocketMounted: true,
+          buildRunnerDocker: true,
+          buildNetworkNone: true,
+          buildMemoryConfigured: true,
+          buildCpusConfigured: true,
+          buildPidsLimitConfigured: true,
+          dockerCliPreflightPresent: true,
+          dockerInfoPreflightPresent: true,
+          gitSshKeyPathEnvPresent: true,
+          gitKnownHostsPathEnvPresent: true
+        }
       },
       imagePolicy: {
         postgresDigestPinned: true,
@@ -137,6 +199,32 @@ describe("releaseTargetRuntimeEvidenceCheck", () => {
       commitRef: "abc123def456",
       repository: "acme/siteflow",
       branch: "main",
+      targetIdentity: {
+        status: "passed",
+        hostname: "siteflow-prod-01",
+        dockerContext: "siteflow-prod",
+        composeProject: "siteflow-prod"
+      },
+      workerRuntimePosture: {
+        status: "passed",
+        dockerSocketMounted: true,
+        groupAddConfigured: true,
+        hostDockerSocketGid: 998,
+        groupAddMatchesHostDockerSocketGid: true,
+        privileged: false,
+        capAddEmpty: true,
+        dangerousSecurityOptConfigured: false,
+        hostNetworkMode: false,
+        buildRunnerDocker: true,
+        buildNetworkNone: true,
+        buildMemoryConfigured: true,
+        buildCpusConfigured: true,
+        buildPidsLimitConfigured: true,
+        dockerCliPreflightPresent: true,
+        dockerInfoPreflightPresent: true,
+        gitSshKeyPathEnvPresent: true,
+        gitKnownHostsPathEnvPresent: true
+      },
       imageBinding: {
         status: "passed",
         expectedDigest: digest,
@@ -144,6 +232,103 @@ describe("releaseTargetRuntimeEvidenceCheck", () => {
         workerImageDigest: digest
       }
     });
+  });
+
+  it("passes real /readyz body status ready", () => {
+    const result = evaluateReleaseTargetRuntimeEvidence(passedEvidence({
+      readiness: passedSection({
+        loopbackStatusCode: 200,
+        publicStatusCode: 200,
+        loopbackBodyStatus: "ready",
+        publicBodyStatus: "ready"
+      })
+    }), {
+      evidencePath: "target-runtime-evidence.json",
+      commitRef: "abc123def456",
+      repo: "acme/siteflow",
+      branch: "main",
+      targetEnvironment: "production",
+      now
+    });
+
+    expect(result.status).toBe("passed");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "readiness_loopback",
+      status: "pass"
+    }));
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "readiness_public",
+      status: "pass"
+    }));
+  });
+
+  it("fails when Compose config evidence omits the release evidence signing key secret", () => {
+    const evidence = passedEvidence({
+      composeConfig: passedSection({
+        ...passedEvidence().composeConfig,
+        secrets: ["siteflow_app_secret", "siteflow_api_token", "siteflow_metrics_token", "siteflow_postgres_password"]
+      })
+    });
+    const result = evaluateReleaseTargetRuntimeEvidence(evidence, {
+      evidencePath: "target-runtime-evidence.json",
+      commitRef: "abc123def456",
+      repo: "acme/siteflow",
+      branch: "main",
+      targetEnvironment: "production",
+      now
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "compose_config_secrets",
+      status: "fail"
+    }));
+  });
+
+  it.each([
+    {
+      label: "loopback not_ready body",
+      bodyStatusField: "loopbackBodyStatus",
+      bodyStatus: "not_ready",
+      expectedCheck: "readiness_loopback"
+    },
+    {
+      label: "public not_ready body",
+      bodyStatusField: "publicBodyStatus",
+      bodyStatus: "not_ready",
+      expectedCheck: "readiness_public"
+    },
+    {
+      label: "loopback unrelated body",
+      bodyStatusField: "loopbackBodyStatus",
+      bodyStatus: "healthy",
+      expectedCheck: "readiness_loopback"
+    },
+    {
+      label: "public unrelated body",
+      bodyStatusField: "publicBodyStatus",
+      bodyStatus: "healthy",
+      expectedCheck: "readiness_public"
+    }
+  ])("blocks $label", ({ bodyStatusField, bodyStatus, expectedCheck }) => {
+    const readiness = {
+      ...(passedEvidence().readiness as Record<string, unknown>),
+      [bodyStatusField]: bodyStatus
+    };
+    const result = evaluateReleaseTargetRuntimeEvidence(passedEvidence({ readiness }), {
+      evidencePath: "target-runtime-evidence.json",
+      commitRef: "abc123def456",
+      repo: "acme/siteflow",
+      branch: "main",
+      targetEnvironment: "production",
+      now
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: expectedCheck,
+      status: "fail"
+    }));
   });
 
   it("blocks template evidence", () => {
@@ -186,6 +371,81 @@ describe("releaseTargetRuntimeEvidenceCheck", () => {
     expect(result.status).toBe("blocked");
     expect(result.checks).toContainEqual(expect.objectContaining({
       name: "image_binding_present",
+      status: "fail"
+    }));
+  });
+
+  it("blocks missing target host identity evidence", () => {
+    const result = evaluateReleaseTargetRuntimeEvidence(passedEvidence({ targetIdentity: undefined }), {
+      evidencePath: "target-runtime-evidence.json",
+      commitRef: "abc123def456",
+      repo: "acme/siteflow",
+      branch: "main",
+      targetEnvironment: "production",
+      now
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "target_identity_present",
+          status: "fail"
+        }),
+        expect.objectContaining({
+          name: "target_identity_status",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
+  it.each([
+    {
+      label: "compose project mismatch",
+      mutate: (evidence: Record<string, unknown>) => {
+        (evidence.targetIdentity as Record<string, unknown>).composeProject = "other-project";
+      },
+      expectedCheck: "target_identity_compose_project"
+    },
+    {
+      label: "public URL mismatch",
+      mutate: (evidence: Record<string, unknown>) => {
+        (evidence.targetIdentity as Record<string, unknown>).publicBaseUrl = "https://other.example.com";
+      },
+      expectedCheck: "target_identity_compose_project"
+    },
+    {
+      label: "bad Docker context hash",
+      mutate: (evidence: Record<string, unknown>) => {
+        (evidence.targetIdentity as Record<string, unknown>).dockerContextInspectSha256 = "not-a-sha";
+      },
+      expectedCheck: "target_identity_docker_context"
+    },
+    {
+      label: "raw Docker context archived",
+      mutate: (evidence: Record<string, unknown>) => {
+        (evidence.targetIdentity as Record<string, unknown>).rawContextArchived = true;
+      },
+      expectedCheck: "target_identity_docker_context"
+    }
+  ])("blocks target identity with $label", ({ mutate, expectedCheck }) => {
+    const evidence = passedEvidence();
+
+    mutate(evidence);
+
+    const result = evaluateReleaseTargetRuntimeEvidence(evidence, {
+      evidencePath: "target-runtime-evidence.json",
+      commitRef: "abc123def456",
+      repo: "acme/siteflow",
+      branch: "main",
+      targetEnvironment: "production",
+      now
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: expectedCheck,
       status: "fail"
     }));
   });
@@ -234,6 +494,13 @@ describe("releaseTargetRuntimeEvidenceCheck", () => {
       expectedCheck: "compose_config_sanitized"
     },
     {
+      label: "missing compose worker healthcheck",
+      mutate: (evidence: Record<string, unknown>) => {
+        (evidence.composeConfig as Record<string, unknown>).healthchecks = ["postgres", "api"];
+      },
+      expectedCheck: "compose_config_healthchecks"
+    },
+    {
       label: "mutable compose image",
       mutate: (evidence: Record<string, unknown>) => {
         ((evidence.composeConfig as Record<string, unknown>).images as Record<string, unknown>).api = "ghcr.io/siteflow/siteflow:latest";
@@ -260,6 +527,99 @@ describe("releaseTargetRuntimeEvidenceCheck", () => {
         composeConfig.buildServices = ["api"];
       },
       expectedCheck: "compose_config_no_build_fallback"
+    },
+    {
+      label: "API mounts Docker socket",
+      mutate: (evidence: Record<string, unknown>) => {
+        const profiles = (evidence.composeConfig as Record<string, unknown>).serviceProfiles as Record<string, unknown>;
+
+        (profiles.api as Record<string, unknown>).dockerSocketMounted = true;
+      },
+      expectedCheck: "compose_config_api_profile"
+    },
+    {
+      label: "worker runs as root",
+      mutate: (evidence: Record<string, unknown>) => {
+        const profiles = (evidence.composeConfig as Record<string, unknown>).serviceProfiles as Record<string, unknown>;
+
+        (profiles.worker as Record<string, unknown>).user = "0:0";
+      },
+      expectedCheck: "compose_config_worker_socket_profile"
+    },
+    {
+      label: "worker missing Docker socket group posture",
+      mutate: (evidence: Record<string, unknown>) => {
+        const profiles = (evidence.composeConfig as Record<string, unknown>).serviceProfiles as Record<string, unknown>;
+
+        (profiles.worker as Record<string, unknown>).groupAddConfigured = false;
+      },
+      expectedCheck: "compose_config_worker_socket_profile"
+    },
+    {
+      label: "worker Docker socket gid mismatch",
+      mutate: (evidence: Record<string, unknown>) => {
+        const profiles = (evidence.composeConfig as Record<string, unknown>).serviceProfiles as Record<string, unknown>;
+
+        (profiles.worker as Record<string, unknown>).hostDockerSocketGid = 999;
+        (profiles.worker as Record<string, unknown>).groupAddMatchesHostDockerSocketGid = false;
+      },
+      expectedCheck: "compose_config_worker_socket_gid"
+    },
+    {
+      label: "worker adds a capability",
+      mutate: (evidence: Record<string, unknown>) => {
+        const profiles = (evidence.composeConfig as Record<string, unknown>).serviceProfiles as Record<string, unknown>;
+
+        (profiles.worker as Record<string, unknown>).capAdd = ["SYS_ADMIN"];
+        (profiles.worker as Record<string, unknown>).capAddEmpty = false;
+      },
+      expectedCheck: "compose_config_privilege_posture"
+    },
+    {
+      label: "API is privileged",
+      mutate: (evidence: Record<string, unknown>) => {
+        const profiles = (evidence.composeConfig as Record<string, unknown>).serviceProfiles as Record<string, unknown>;
+
+        (profiles.api as Record<string, unknown>).privileged = true;
+      },
+      expectedCheck: "compose_config_privilege_posture"
+    },
+    {
+      label: "worker disables seccomp",
+      mutate: (evidence: Record<string, unknown>) => {
+        const profiles = (evidence.composeConfig as Record<string, unknown>).serviceProfiles as Record<string, unknown>;
+
+        (profiles.worker as Record<string, unknown>).dangerousSecurityOpt = ["seccomp=unconfined"];
+        (profiles.worker as Record<string, unknown>).dangerousSecurityOptConfigured = true;
+      },
+      expectedCheck: "compose_config_privilege_posture"
+    },
+    {
+      label: "worker missing Docker build resource limits",
+      mutate: (evidence: Record<string, unknown>) => {
+        const profiles = (evidence.composeConfig as Record<string, unknown>).serviceProfiles as Record<string, unknown>;
+
+        (profiles.worker as Record<string, unknown>).buildMemoryConfigured = false;
+      },
+      expectedCheck: "compose_config_worker_build_resources"
+    },
+    {
+      label: "worker missing Docker socket preflight",
+      mutate: (evidence: Record<string, unknown>) => {
+        const profiles = (evidence.composeConfig as Record<string, unknown>).serviceProfiles as Record<string, unknown>;
+
+        (profiles.worker as Record<string, unknown>).dockerInfoPreflightPresent = false;
+      },
+      expectedCheck: "compose_config_worker_socket_profile"
+    },
+    {
+      label: "worker missing private Git credential env wiring",
+      mutate: (evidence: Record<string, unknown>) => {
+        const profiles = (evidence.composeConfig as Record<string, unknown>).serviceProfiles as Record<string, unknown>;
+
+        (profiles.worker as Record<string, unknown>).gitKnownHostsPathEnvPresent = false;
+      },
+      expectedCheck: "compose_config_worker_git_credentials"
     },
     {
       label: "missing compose observation source",

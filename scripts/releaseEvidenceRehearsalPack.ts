@@ -3,11 +3,13 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 type PackStatus = "planned" | "blocked";
+export type SourceProvider = "github" | "gitlab" | "gitea" | "generic";
 
 export interface ReleaseEvidenceRehearsalPackOptions {
   commitRef: string;
   repo: string;
   branch: string;
+  sourceProvider?: SourceProvider;
   targetEnvFile: string;
   publicBaseUrl: string;
   operatorName: string;
@@ -49,6 +51,7 @@ export interface ReleaseEvidenceRehearsalPackResult {
     commitRef: string;
     repository: string;
     branch: string;
+    sourceProvider: SourceProvider;
     targetEnvironment: string;
     requiredStatusCheck: string;
     operatorName: string;
@@ -76,6 +79,7 @@ interface ParsedArgs {
   commitRef?: string;
   repo?: string;
   branch?: string;
+  sourceProvider?: SourceProvider;
   targetEnvFile?: string;
   publicBaseUrl?: string;
   operatorName?: string;
@@ -99,6 +103,11 @@ interface CliIo {
 const defaultTargetEnvironment = "production";
 const defaultRequiredStatusCheck = "Install, test, and build";
 const defaultOutputRoot = "evidence";
+const defaultSourceProvider: SourceProvider = "github";
+const defaultObservabilityTargetStackTokenEnv = "SITEFLOW_OBSERVABILITY_STACK_TOKEN";
+const sourceProviders = new Set<SourceProvider>(["github", "gitlab", "gitea", "generic"]);
+const releaseEvidenceSigningKeyEnv = "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY";
+const releaseEvidenceRequiredSigningKeyIdEnv = "SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID";
 
 function isEntrypoint() {
   const entryPath = process.argv[1];
@@ -117,6 +126,26 @@ function requiredValue(value: string | undefined, label: string) {
   }
 
   return normalized;
+}
+
+function sourceProviderValue(value: string | undefined) {
+  const normalized = (stringValue(value) ?? defaultSourceProvider).toLowerCase();
+
+  if (!sourceProviders.has(normalized as SourceProvider)) {
+    throw new Error("--source-provider must be one of github, gitlab, gitea, or generic.");
+  }
+
+  return normalized as SourceProvider;
+}
+
+function observabilityTargetStackApiUrlValue(value: string | undefined, targetEnvironment: string) {
+  const normalized = stringValue(value);
+
+  if (targetEnvironment === "production" && !normalized) {
+    throw new Error("--observability-target-stack-api-url is required for production release evidence packs.");
+  }
+
+  return normalized ?? null;
 }
 
 function requiredArgValue(args: string[], index: number, flag: string) {
@@ -256,7 +285,12 @@ function buildSteps(
 ) {
   const releaseArgs = ["--commit-ref", release.commitRef, "--repo", release.repository, "--branch", release.branch];
   const productionArtifactEvidenceArgs = release.targetEnvironment === "production"
-    ? ["--deployment-artifact-manifest", files.deploymentArtifactManifest]
+    ? [
+        "--deployment-detail",
+        "<candidate-deployment-detail-path>",
+        "--write-deployment-artifact-manifest",
+        files.deploymentArtifactManifest
+      ]
     : [];
   const operatorAccessTemplate = command("npm", [
     "run",
@@ -299,13 +333,28 @@ function buildSteps(
     "--target-environment",
     release.targetEnvironment,
     "--provider",
-    "<source-provider>",
+    release.sourceProvider,
     "--operator-name",
     release.operatorName,
     "--release-ticket",
     release.releaseTicket,
     "--output",
     files.sourceProviderRaw
+  ]);
+  const observabilityOperatorTemplate = command("npm", [
+    "run",
+    "--silent",
+    "observability:operator-evidence:template",
+    "--",
+    ...releaseArgs,
+    "--target-environment",
+    release.targetEnvironment,
+    "--operator-name",
+    release.operatorName,
+    "--release-ticket",
+    release.releaseTicket,
+    "--output",
+    files.operatorObservability
   ]);
   const ingressOperatorTemplate = command("npm", [
     "run",
@@ -358,6 +407,80 @@ function buildSteps(
     "--output",
     files.targetRuntimeRaw
   ]);
+  const sourceProviderCommand = release.sourceProvider === "github"
+    ? command(
+        "npm",
+        [
+          "run",
+          "--silent",
+          "source-provider:evidence:collect",
+          "--",
+          "--provider",
+          "github",
+          ...releaseArgs,
+          "--target-environment",
+          release.targetEnvironment,
+          "--operator-name",
+          release.operatorName,
+          "--release-ticket",
+          release.releaseTicket,
+          "--webhook-delivery-id",
+          "<webhook-delivery-id>",
+          "--webhook-signature-verified",
+          "--webhook-secret-configured",
+          "--deploy-key-path",
+          "<deploy-key-path>",
+          "--deploy-key-mounted",
+          "--host-key-pinned",
+          "--known-hosts-path",
+          "<known-hosts-path>",
+          "--output",
+          files.sourceProviderRaw,
+          "--check-output",
+          files.sourceProvider,
+          "--json"
+        ],
+        undefined,
+        ["GITHUB_TOKEN"]
+      )
+    : command(
+        "npm",
+        [
+          "run",
+          "--silent",
+          "source-provider:evidence",
+          "--",
+          "--evidence",
+          files.sourceProviderRaw,
+          ...releaseArgs,
+          "--target-environment",
+          release.targetEnvironment,
+          "--json"
+        ],
+        files.sourceProvider
+      );
+  const sourceProviderPrerequisites = release.sourceProvider === "github"
+    ? [
+        "GitHub token with read access to repository metadata and deploy keys.",
+        "Target-side signed webhook verification has selected a real delivery id for this release.",
+        `To start from a non-passing placeholder, run: ${sourceProviderTemplate.display}`
+      ]
+    : [
+        `Source provider is ${release.sourceProvider}; the GitHub collector is not used and GITHUB_TOKEN is not required for this step.`,
+        `Run the template first, replace every placeholder with real ${release.sourceProvider} target or target-equivalent observations, then run the checker command: ${sourceProviderTemplate.display}`,
+        "Manual evidence must include signed webhook delivery, exact checkout, safe remote URL, deploy-key, host-key, and release provenance observations."
+      ];
+  const sourceProviderNotes = release.sourceProvider === "github"
+    ? [
+        "The collector writes both the raw source-provider evidence and the checker output expected by release:evidence:compose.",
+        "The template command still writes status=blocked, dryRun=true, and template=true raw evidence for manual fallback; production evidence must come from the collector or equivalent target observations.",
+        "The checker expects signed webhook delivery proof, exact commit checkout, remote URL hygiene, deploy-key policy, host-key policy, and no raw credential archival."
+      ]
+    : [
+        "The generated command checks the completed manual raw source-provider evidence and captures the checker output expected by release:evidence:compose.",
+        "The template command writes status=blocked, dryRun=true, and template=true raw evidence; production evidence requires replacing every placeholder with real target observations before running the checker.",
+        "The checker expects signed webhook delivery proof, exact commit checkout, remote URL hygiene, deploy-key policy, host-key policy, and no raw credential archival."
+      ];
 
   return [
     step(
@@ -439,9 +562,15 @@ function buildSteps(
         files.releaseArtifact
       ),
       release.targetEnvironment === "production"
-        ? ["Clean build outputs exist in dist, dist-cli, dist-server, and dist-worker for the exact release commit.", "deployment-artifact-manifest.json has been exported from the candidate deployment artifact manifest or deployment detail lineage."]
+        ? [
+            "Clean build outputs exist in dist, dist-cli, dist-server, and dist-worker for the exact release commit.",
+            "candidate deployment detail has been collected from the target SiteFlow API with private retention, and lineage.artifact.manifest is bound to the release identity."
+          ]
         : ["Clean build outputs exist in dist, dist-cli, dist-server, and dist-worker for the exact release commit."],
-      ["This gate hashes release artifacts, scans for canary/fixture/credential leakage, validates CLI topology, runs production dependency audit, and attaches a sanitized deployment function manifest summary."]
+      [
+        "This gate hashes release artifacts, scans for canary/fixture/credential leakage, validates CLI topology, runs production dependency audit, and attaches a sanitized deployment function manifest summary.",
+        "The raw deployment detail is consumed from a private path and is not uploaded as release evidence; only deployment-artifact-manifest.json is written as sanitized evidence."
+      ]
     ),
     step(
       "release_image_evidence",
@@ -460,43 +589,49 @@ function buildSteps(
       "source_provider_evidence",
       "Validate target source provider, signed webhook, and checkout provenance evidence",
       files.sourceProvider,
-      command(
-        "npm",
-        ["run", "--silent", "source-provider:evidence", "--", "--evidence", files.sourceProviderRaw, ...releaseArgs, "--target-environment", release.targetEnvironment, "--json"],
-        files.sourceProvider
-      ),
-      [
-        "Raw source provider evidence has been collected from the enabled Git provider and target worker checkout path.",
-        `To start from a non-passing placeholder, run: ${sourceProviderTemplate.display}`
-      ],
-      [
-        "The template command writes status=blocked, dryRun=true, and template=true raw evidence; replace every todo/null field with real provider, checkout, webhook, deploy-key, host-key, and provenance observations before running this checker.",
-        "The checker expects signed webhook delivery proof, exact commit checkout, remote URL hygiene, deploy-key policy, host-key policy, and no raw credential archival."
-      ]
+      sourceProviderCommand,
+      sourceProviderPrerequisites,
+      sourceProviderNotes
     ),
     step(
       "target_runtime_evidence",
-      "Validate target Compose startup, readiness, running image binding, restart smoke, and log sanity evidence",
+      "Collect target Compose startup, readiness, running image binding, restart smoke, and log sanity evidence",
       files.targetRuntime,
       command("npm", [
         "run",
         "--silent",
-        "release:target-runtime:evidence",
+        "release:target-runtime:evidence:collect",
         "--",
-        "--evidence",
-        files.targetRuntimeRaw,
         ...releaseArgs,
         "--target-environment",
         release.targetEnvironment,
+        "--env-file",
+        release.targetEnvFile,
+        "--public-base-url",
+        release.publicBaseUrl,
+        "--expected-digest",
+        "<release-image-digest>",
+        "--operator-name",
+        release.operatorName,
+        "--release-ticket",
+        release.releaseTicket,
+        "--output",
+        files.targetRuntimeRaw,
+        "--check-output",
+        files.targetRuntime,
         "--json"
-      ], files.targetRuntime),
+      ]),
       [
-        "Raw target runtime evidence has been collected from the actual target host after docker compose/systemd startup, with Compose config, image binding, worker health, and restart observations completed.",
+        "Run this collector on the actual target host after the release image and target env are configured.",
+        "Target env file must include SITEFLOW_DOCKER_SOCKET_GID with the target host /var/run/docker.sock group id.",
+        "Provide <release-image-digest> from the release image evidence artifact so API and worker runtime evidence is bound to the published release image.",
+        "Docker CLI access to the target Compose project, loopback API access, and public /readyz reachability are required.",
         `To start from a non-passing placeholder, run: ${targetRuntimeTemplate.display}`
       ],
       [
-        "The template command writes status=blocked, dryRun=true, and template=true raw evidence; replace every todo/null field with target-host redacted Compose command/source/composeProject, startup command, service health command/composeProject, worker health/queue/heartbeat, readiness, API/worker release image digests, container/image ids, restart worker health, and log sanity observations before running this checker.",
-        "This checker does not run docker compose by itself; it validates the operator-captured target runtime evidence, requires Compose API/worker image digests to match the release image digest, and blocks raw config/env/log archival."
+        "The collector writes both the raw target-runtime evidence and the checker output expected by release:evidence:compose.",
+        "It summarizes docker compose config, startup, service health, worker healthcheck, loopback and public /readyz, image/container binding, restart smoke, and log sanity without archiving raw config, raw env, or unredacted logs.",
+        "The template command remains a blocked manual fallback; production evidence should come from the collector or equivalent target-host observations."
       ]
     ),
     step(
@@ -524,6 +659,14 @@ function buildSteps(
           files.backupPrune,
           "--policy",
           files.backupPolicy,
+          "--commit-ref",
+          release.commitRef,
+          "--repo",
+          release.repository,
+          "--branch",
+          release.branch,
+          "--target-environment",
+          release.targetEnvironment,
           "--operator-name",
           release.operatorName,
           "--release-ticket",
@@ -584,8 +727,8 @@ function buildSteps(
           "SITEFLOW_METRICS_TOKEN_FILE",
           ...(release.observabilityTargetStackApiUrl
             ? [
-                release.observabilityTargetStackTokenEnv ?? "SITEFLOW_OBSERVABILITY_STACK_TOKEN",
-                `${release.observabilityTargetStackTokenEnv ?? "SITEFLOW_OBSERVABILITY_STACK_TOKEN"}_FILE`
+                release.observabilityTargetStackTokenEnv ?? defaultObservabilityTargetStackTokenEnv,
+                `${release.observabilityTargetStackTokenEnv ?? defaultObservabilityTargetStackTokenEnv}_FILE`
               ]
             : [])
         ]
@@ -594,37 +737,135 @@ function buildSteps(
         "Backup automation run record exists and points at passed backup checker output.",
         "Backup automation history exists with at least two successful restore drills inside the expected cadence.",
         "Backup scheduler ownership evidence exists for an enabled cron, systemd timer, or external orchestrator job that invokes backup:automation and points at the selected run record and history.",
+        `To start from a non-passing operator-observability placeholder, run: ${observabilityOperatorTemplate.display}`,
         "Operator evidence file includes observabilityProvisioning.renderedAssets and observabilityApplyProof applied asset hashes.",
         "Operator evidence file includes observabilityTargetStackProof from target Prometheus, Alertmanager, and Grafana APIs matching rendered asset hashes.",
         "Operator evidence file covers alert delivery, dashboard owner, log retention, and readiness traffic removal."
       ],
-      ["The collector does not provision the observability stack; it only scrapes and checks evidence."]
+      [
+        "The observability operator template writes status=blocked, dryRun=true, and template=true; replace it with real target observations before running the collector for production evidence.",
+        "The collector does not provision the observability stack; it only scrapes and checks evidence."
+      ]
     ),
     step(
       "operator_access_evidence",
-      "Validate operator session and emergency cutoff evidence",
+      "Collect operator session and emergency cutoff evidence",
       files.operatorAccess,
-      command("npm", ["run", "--silent", "operator-access:evidence", "--", "--evidence", files.operatorAccessRaw, ...releaseArgs, "--target-environment", release.targetEnvironment, "--json"], files.operatorAccess),
+      command("npm", [
+        "run",
+        "--silent",
+        "operator-access:evidence:collect",
+        "--",
+        "--base-url",
+        release.publicBaseUrl,
+        ...releaseArgs,
+        "--target-environment",
+        release.targetEnvironment,
+        "--operator-name",
+        release.operatorName,
+        "--release-ticket",
+        release.releaseTicket,
+        "--admin-token-env",
+        "SITEFLOW_API_TOKEN",
+        "--low-scope-token-env",
+        "SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN",
+        "--project-id",
+        "<operator-access-project-id>",
+        "--denied-project-id",
+        "<operator-access-denied-project-id>",
+        "--execute-project-cutoff",
+        "--execute-global-cutoff",
+        "--i-understand-this-revokes-active-operator-sessions",
+        "--browser-token-fallback-disabled",
+        "--local-storage-fallback-disabled",
+        "--output",
+        files.operatorAccessRaw,
+        "--check-output",
+        files.operatorAccess
+      ], undefined, [
+        "SITEFLOW_API_TOKEN",
+        "SITEFLOW_API_TOKEN_FILE",
+        "SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN",
+        "SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN_FILE"
+      ]),
       [
-        "Raw operator access evidence has been collected from target or target-equivalent access flows.",
+        "Collector runs on the target evidence host with an admin API token and a low-scope API token available by env or *_FILE.",
+        "Operator selects a project id and a denied project id to prove project-scoped sessions are constrained.",
+        "Collector creates and disables a temporary routing rule to prove server-derived actor attribution; cleanup failure blocks the evidence.",
+        "Global emergency cutoff confirmation is intentional: executing this step revokes active operator sessions.",
         `To start from a non-passing placeholder, run: ${operatorAccessTemplate.display}`
       ],
       [
-        "The template command writes status=blocked, dryRun=true, and template=true raw evidence; replace every todo/null field with real observations before running this checker.",
+        "The collector writes both the raw operator-access evidence and the checker output expected by release:evidence:compose.",
+        "The template command remains a blocked manual fallback; production evidence should come from the collector or equivalent target observations.",
         "This does not prove IdP, MFA, credentialed CORS, or full login is complete."
       ]
     ),
     step(
       "non_session_credential_evidence",
-      "Validate non-session credential rotation and break-glass evidence",
+      "Collect non-session credential rotation and break-glass evidence",
       files.nonSessionCredential,
-      command("npm", ["run", "--silent", "non-session-credential:evidence", "--", "--evidence", files.nonSessionCredentialRaw, ...releaseArgs, "--target-environment", release.targetEnvironment, "--json"], files.nonSessionCredential),
+      command("npm", [
+        "run",
+        "--silent",
+        "non-session-credential:evidence:collect",
+        "--",
+        "--base-url",
+        release.publicBaseUrl,
+        ...releaseArgs,
+        "--target-environment",
+        release.targetEnvironment,
+        "--operator-name",
+        release.operatorName,
+        "--release-ticket",
+        release.releaseTicket,
+        "--old-metrics-token-env",
+        "SITEFLOW_OLD_METRICS_TOKEN",
+        "--new-metrics-token-env",
+        "SITEFLOW_METRICS_TOKEN",
+        "--old-api-token-env",
+        "SITEFLOW_OLD_API_TOKEN",
+        "--new-api-token-env",
+        "SITEFLOW_API_TOKEN",
+        "--old-redacted-identifier",
+        "<old-metrics-token-redacted-id>",
+        "--new-redacted-identifier",
+        "<new-metrics-token-redacted-id>",
+        "--old-api-redacted-identifier",
+        "<old-root-api-token-redacted-id>",
+        "--new-api-redacted-identifier",
+        "<new-root-api-token-redacted-id>",
+        "--break-glass-source",
+        "<break-glass-source>",
+        "--break-glass-approver-count",
+        "<break-glass-approver-count>",
+        "--break-glass-reviewed",
+        "--break-glass-time-bounded",
+        "--break-glass-revocation-planned",
+        "--output",
+        files.nonSessionCredentialRaw,
+        "--check-output",
+        files.nonSessionCredential
+      ], undefined, [
+        "SITEFLOW_OLD_METRICS_TOKEN",
+        "SITEFLOW_OLD_METRICS_TOKEN_FILE",
+        "SITEFLOW_METRICS_TOKEN",
+        "SITEFLOW_METRICS_TOKEN_FILE",
+        "SITEFLOW_OLD_API_TOKEN",
+        "SITEFLOW_OLD_API_TOKEN_FILE",
+        "SITEFLOW_API_TOKEN",
+        "SITEFLOW_API_TOKEN_FILE"
+      ]),
       [
-        "Raw credential evidence uses redacted identifiers and excludes raw secrets or authorization headers.",
+        "Collector runs after rotating the metrics token and root API token, then reloading the target service or scraper.",
+        "Old and new metrics tokens are available by env or *_FILE; raw token values are never written.",
+        "Old and new root API tokens are available by env or *_FILE; /api/auth/verify proves the retired token is rejected and the active token is accepted without archiving raw token values.",
+        "Break-glass source and approver count are operator-supplied non-secret facts.",
         `To start from a non-passing placeholder, run: ${nonSessionCredentialTemplate.display}`
       ],
       [
-        "The template command writes status=blocked, dryRun=true, and template=true raw evidence; replace every todo/null field with real credential rotation or break-glass observations before running this checker.",
+        "The collector writes both the raw non-session credential evidence and the checker output expected by release:evidence:compose.",
+        "The template command remains a blocked manual fallback; production evidence should come from the collector or equivalent target observations.",
         "This is an evidence gate; SiteFlow does not automatically rotate external credentials."
       ]
     ),
@@ -750,9 +991,13 @@ function composeCommand(
     "--release-ticket",
     release.releaseTicket,
     ...(options.dockerSocketProfileAccepted ? ["--docker-socket-profile-accepted"] : []),
+    "--attestation-key-env",
+    releaseEvidenceSigningKeyEnv,
+    "--attestation-key-id-env",
+    releaseEvidenceRequiredSigningKeyIdEnv,
     "--output",
     files.releaseEvidence
-  ]);
+  ], undefined, [releaseEvidenceSigningKeyEnv, releaseEvidenceRequiredSigningKeyIdEnv]);
 }
 
 function checkCommand(release: ReleaseEvidenceRehearsalPackResult["release"], files: Record<string, string>) {
@@ -773,9 +1018,14 @@ function checkCommand(release: ReleaseEvidenceRehearsalPackResult["release"], fi
       release.branch,
       "--target-environment",
       release.targetEnvironment,
+      "--attestation-key-env",
+      releaseEvidenceSigningKeyEnv,
+      "--attestation-key-id-env",
+      releaseEvidenceRequiredSigningKeyIdEnv,
       "--json"
     ],
-    files.releaseEvidenceCheck
+    files.releaseEvidenceCheck,
+    [releaseEvidenceSigningKeyEnv, releaseEvidenceRequiredSigningKeyIdEnv]
   );
 }
 
@@ -879,15 +1129,17 @@ export function createReleaseEvidenceRehearsalPack(
   const commitRef = requiredValue(options.commitRef, "--commit-ref");
   const outputDir = options.outputDir ?? path.join(defaultOutputRoot, `release-${safeSlug(commitRef.slice(0, 12))}`);
   const files = evidencePaths(outputDir);
+  const targetEnvironment = stringValue(options.targetEnvironment) ?? defaultTargetEnvironment;
   const release = {
     commitRef,
     repository: requiredValue(options.repo, "--repo"),
     branch: requiredValue(options.branch, "--branch"),
-    targetEnvironment: stringValue(options.targetEnvironment) ?? defaultTargetEnvironment,
+    sourceProvider: sourceProviderValue(options.sourceProvider),
+    targetEnvironment,
     requiredStatusCheck: stringValue(options.requiredStatusCheck) ?? defaultRequiredStatusCheck,
     operatorName: requiredValue(options.operatorName, "--operator-name"),
     releaseTicket: requiredValue(options.releaseTicket, "--release-ticket"),
-    observabilityTargetStackApiUrl: stringValue(options.observabilityTargetStackApiUrl) ?? null,
+    observabilityTargetStackApiUrl: observabilityTargetStackApiUrlValue(options.observabilityTargetStackApiUrl, targetEnvironment),
     observabilityTargetStackTokenEnv: stringValue(options.observabilityTargetStackTokenEnv) ?? null,
     publicBaseUrl: normalizePublicBaseUrl(requiredValue(options.publicBaseUrl, "--public-base-url")),
     targetEnvFile: requiredValue(options.targetEnvFile, "--target-env-file")
@@ -914,20 +1166,21 @@ export function createReleaseEvidenceRehearsalPack(
     },
     requiredManualInputs: [
       "target env file reviewed without raw secret archival",
+      "SITEFLOW_DOCKER_SOCKET_GID captured from the target host /var/run/docker.sock group id in the target env file",
       "GitHub branch protection and exact commit status access",
       "target Docker worker profile",
       "release artifact evidence proving clean dist outputs, SHA-256 manifest, attached deployment artifact manifest, no canary/fixture/credential leakage, CLI bin topology, and production dependency audit",
       "release image workflow run id and GitHub artifact download permission for release-image-evidence.json",
-      "target runtime raw evidence prepared from release:target-runtime:evidence:template and completed with real target-host redacted Compose command/source/composeProject, no-build-fallback state, API/worker images pinned to the release digest, startup command, service health command/composeProject, worker health/queue/heartbeat, readiness, API/worker container and image ids, restart worker health, and log sanity observations",
+      "target runtime collector run on the target host, writing raw target-runtime evidence and checker output with redacted Compose metadata, no-build-fallback state, API/worker image binding, startup, service health, worker healthcheck, readiness, restart smoke, and log sanity observations",
       ...(dockerSocketProfileAccepted
         ? ["Docker socket trusted single-host profile explicitly accepted for this release pack"]
         : ["Docker socket trusted single-host profile not accepted by this pack; add --docker-socket-profile-accepted only after a release owner records the risk acceptance"]),
       "target-equivalent Postgres database",
-      "source provider raw evidence prepared from source-provider:evidence:template and completed with real signed webhook delivery, exact commit checkout, remote URL hygiene, deploy key policy, host key policy, and release provenance observations",
+      `source provider ${release.sourceProvider} raw evidence prepared from source-provider:evidence:template and completed with real signed webhook delivery, exact commit checkout, remote URL hygiene, deploy key policy, host key policy, and release provenance observations`,
       "backup verify, restore drill, offload, prune, policy evidence, backup automation run record, and backup automation history",
-      "operator observability evidence",
-      "operator access raw evidence prepared from operator-access:evidence:template and completed with real target observations",
-      "non-session credential raw evidence prepared from non-session-credential:evidence:template and completed with real target observations",
+      "operator observability evidence prepared from observability:operator-evidence:template and completed with real target apply proof, target-stack proof, alert delivery, dashboard owner, log retention, and readiness traffic-removal observations",
+      "operator access collector run on the target evidence host, writing raw operator-access evidence and checker output with real target observations",
+      "non-session credential collector run after target metrics and root API token rotation, writing raw credential evidence and checker output with real target observations",
       "operator ingress evidence prepared from ingress:operator-evidence:template for forwarded-header/proxy final-hop proof when the target has no echo endpoint, plus deployment topology and edge/shared limiter proof for the actual ingress topology",
       "upgrade/rollback raw evidence prepared from upgrade-rollback:evidence:template and completed with real target drill observations"
     ],
@@ -970,6 +1223,9 @@ export function parseReleaseEvidenceRehearsalPackArgs(args: string[]): ParsedArg
       index += 1;
     } else if (arg === "--branch") {
       parsed.branch = requiredArgValue(args, index, arg);
+      index += 1;
+    } else if (arg === "--source-provider") {
+      parsed.sourceProvider = sourceProviderValue(requiredArgValue(args, index, arg));
       index += 1;
     } else if (arg === "--target-env-file") {
       parsed.targetEnvFile = requiredArgValue(args, index, arg);
@@ -1039,6 +1295,7 @@ export function releaseEvidenceRehearsalPackUsage() {
     "Options:",
     "  Alias: npm run --silent release:evidence:pack --",
     "  --output-dir <dir>              Directory for the pack and expected evidence files. Default: evidence/release-<sha>.",
+    `  --source-provider <provider>    Source provider for source evidence. One of github, gitlab, gitea, or generic. Default: ${defaultSourceProvider}.`,
     "  --target-environment <name>     Target environment label. Default: production.",
     `  --required-status-check <name>  Protected branch check name. Default: ${defaultRequiredStatusCheck}.`,
     "  --observability-target-stack-api-url <url>  Target observability stack proof API URL passed to observability:evidence:collect.",
@@ -1084,6 +1341,7 @@ export async function runReleaseEvidenceRehearsalPackCli(
       commitRef: parsed.commitRef!,
       repo: parsed.repo!,
       branch: parsed.branch!,
+      sourceProvider: parsed.sourceProvider,
       targetEnvFile: parsed.targetEnvFile!,
       publicBaseUrl: parsed.publicBaseUrl!,
       operatorName: parsed.operatorName!,

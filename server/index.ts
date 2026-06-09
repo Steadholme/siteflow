@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-import { readFile, stat } from "node:fs/promises";
+import { readFile, stat, statfs } from "node:fs/promises";
 import { isIP } from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
@@ -78,6 +79,44 @@ export function requireProductionApiToken(env: NodeJS.ProcessEnv = process.env) 
   assertProductionSecretStrength(apiToken, "SITEFLOW_API_TOKEN");
 }
 
+export function requireProductionGitWebhookSecrets(env: NodeJS.ProcessEnv = process.env) {
+  if (!isProductionRuntime(env)) {
+    return;
+  }
+
+  for (const key of [
+    "SITEFLOW_GITHUB_WEBHOOK_SECRET",
+    "SITEFLOW_GITLAB_WEBHOOK_SECRET",
+    "SITEFLOW_GITEA_WEBHOOK_SECRET",
+    "SITEFLOW_GENERIC_WEBHOOK_SECRET"
+  ]) {
+    const secret = resolveSecretEnvValue(key, env);
+
+    if (secret) {
+      assertProductionSecretStrength(secret, key);
+    }
+  }
+}
+
+export function requireProductionReleaseEvidenceSigningKey(env: NodeJS.ProcessEnv = process.env) {
+  if (!isProductionRuntime(env)) {
+    return;
+  }
+
+  const signingKey = resolveSecretEnvValue("SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY", env);
+
+  if (!signingKey) {
+    throw new Error("SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY is required when NODE_ENV=production or SITEFLOW_ENV=production.");
+  }
+
+  assertProductionSecretStrength(signingKey, "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY");
+}
+
+export function defaultReleaseEvidenceRequiredAttestationKeyId(env: NodeJS.ProcessEnv = process.env) {
+  return stringValue(env.SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID) ??
+    stringValue(env.SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_ID);
+}
+
 export function createProductionReadinessCheck(pool: Pool, artifactRoot: string): SiteFlowReadinessCheck {
   return async () => {
     let ready = true;
@@ -117,6 +156,9 @@ interface ProductionMetricsRow {
 
 export interface ProductionMetricsCollectorOptions {
   backupAutomationRunRecordPath?: string;
+  artifactRoot?: string;
+  evidenceRoot?: string;
+  tempRoot?: string;
   now?: () => Date;
 }
 
@@ -280,6 +322,57 @@ async function collectBackupAutomationMetrics(
   }
 }
 
+function storageMetricPath(value: string | undefined) {
+  const normalized = stringValue(value);
+
+  return normalized ? path.resolve(normalized) : undefined;
+}
+
+function statfsAvailableBytes(stats: Awaited<ReturnType<typeof statfs>>) {
+  return Number(stats.bavail) * Number(stats.bsize);
+}
+
+async function collectStorageFreeBytes(storagePath: string | undefined) {
+  if (!storagePath) {
+    return {
+      freeBytes: -1,
+      missing: 0,
+      error: 0
+    };
+  }
+
+  try {
+    const stats = await statfs(storagePath);
+    const freeBytes = statfsAvailableBytes(stats);
+
+    return Number.isFinite(freeBytes) && freeBytes >= 0
+      ? { freeBytes, missing: 0, error: 0 }
+      : { freeBytes: -1, missing: 1, error: 1 };
+  } catch {
+    return {
+      freeBytes: -1,
+      missing: 1,
+      error: 1
+    };
+  }
+}
+
+async function collectStorageMetrics(options: ProductionMetricsCollectorOptions) {
+  const [artifact, evidence, temp] = await Promise.all([
+    collectStorageFreeBytes(storageMetricPath(options.artifactRoot)),
+    collectStorageFreeBytes(storageMetricPath(options.evidenceRoot)),
+    collectStorageFreeBytes(storageMetricPath(options.tempRoot ?? os.tmpdir()))
+  ]);
+
+  return {
+    storageArtifactFreeBytes: artifact.freeBytes,
+    storageEvidenceFreeBytes: evidence.freeBytes,
+    storageTempFreeBytes: temp.freeBytes,
+    storageMissingPaths: artifact.missing + evidence.missing + temp.missing,
+    storageMetricsCollectionError: artifact.error || evidence.error || temp.error ? 1 : 0
+  };
+}
+
 export function createProductionMetricsCollector(
   pool: Pick<Pool, "query">,
   options: ProductionMetricsCollectorOptions = {}
@@ -299,6 +392,7 @@ export function createProductionMetricsCollector(
     `);
     const row = result.rows[0];
     const backupMetrics = await collectBackupAutomationMetrics(options.backupAutomationRunRecordPath, options.now?.() ?? new Date());
+    const storageMetrics = await collectStorageMetrics(options);
 
     return {
       queuedBuildJobs: metricValue(row?.queued_build_jobs),
@@ -306,6 +400,7 @@ export function createProductionMetricsCollector(
       staleBuildJobs: metricValue(row?.stale_build_jobs),
       oldestQueuedBuildAgeSeconds: metricValue(row?.oldest_queued_age_seconds),
       oldestRunningBuildHeartbeatAgeSeconds: metricValue(row?.oldest_running_heartbeat_age_seconds),
+      ...storageMetrics,
       ...backupMetrics
     };
   };
@@ -460,9 +555,12 @@ export async function main() {
   const port = Number(process.env.SITEFLOW_API_PORT ?? process.env.PORT ?? 8787);
   const version = process.env.SITEFLOW_VERSION ?? "0.1.0";
   const artifactRoot = process.env.SITEFLOW_ARTIFACT_ROOT ?? "/var/lib/siteflow/artifacts";
+  const evidenceRoot = process.env.SITEFLOW_EVIDENCE_ROOT ?? "/var/lib/siteflow/evidence";
   const publicScheme = process.env.SITEFLOW_PUBLIC_SCHEME === "http" ? "http" : "https";
   const apiToken = resolveSecretEnvValue("SITEFLOW_API_TOKEN");
   const metricsToken = resolveSecretEnvValue("SITEFLOW_METRICS_TOKEN");
+  const releaseEvidenceAttestationSigningKey = resolveSecretEnvValue("SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY");
+  const releaseEvidenceRequiredAttestationKeyId = defaultReleaseEvidenceRequiredAttestationKeyId();
   const baseDomain = process.env.SITEFLOW_BASE_DOMAIN;
   const gitWebhookSecrets = gitWebhookSecretsFromEnv();
   const prebuiltUploadBudget = defaultPrebuiltUploadBudget();
@@ -475,6 +573,8 @@ export async function main() {
     requireProductionSecret();
     requireProductionMetricsToken();
     requireProductionApiToken();
+    requireProductionGitWebhookSecrets();
+    requireProductionReleaseEvidenceSigningKey();
   }
 
   const pool = new Pool({ connectionString: databaseUrl });
@@ -500,12 +600,17 @@ export async function main() {
     requestLogger: createDefaultRequestLogger(version),
     readinessCheck: createProductionReadinessCheck(pool, artifactRoot),
     runtimeMetricsCollector: createProductionMetricsCollector(pool, {
-      backupAutomationRunRecordPath: process.env.SITEFLOW_BACKUP_AUTOMATION_RUN_RECORD
+      backupAutomationRunRecordPath: process.env.SITEFLOW_BACKUP_AUTOMATION_RUN_RECORD,
+      artifactRoot,
+      evidenceRoot,
+      tempRoot: process.env.TMPDIR ?? process.env.TEMP ?? process.env.TMP ?? os.tmpdir()
     }),
     secureCookies: defaultSecureCookies(),
     trustProxy: defaultTrustProxy(),
     prebuiltMaxUploadBytes: prebuiltUploadBudget.maxUploadBytes,
     prebuiltMaxFiles: prebuiltUploadBudget.maxFiles,
+    releaseEvidenceAttestationSigningKey,
+    releaseEvidenceRequiredAttestationKeyId,
     productionRuntime: isProductionRuntime(),
     allowSameProcessFunctionRuntime: defaultAllowSameProcessFunctionRuntime()
   });

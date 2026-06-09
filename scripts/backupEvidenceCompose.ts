@@ -9,6 +9,10 @@ export interface BackupEvidenceComposeOptions {
   backupVerifyPath: string;
   restoreDrillPath: string;
   policyPath: string;
+  commitRef?: string;
+  repo?: string;
+  branch?: string;
+  targetEnvironment?: string;
   backupOffloadPath?: string;
   backupFetchPath?: string;
   providerSecurityAuditPath?: string;
@@ -25,6 +29,12 @@ export interface BackupEvidenceComposeOptions {
 }
 
 export interface ComposedBackupEvidence {
+  release?: {
+    commitRef?: string;
+    repository?: string;
+    branch?: string;
+    targetEnvironment?: string;
+  };
   backupVerify: Record<string, unknown>;
   restoreDrill: Record<string, unknown>;
   backupOffload?: Record<string, unknown>;
@@ -58,6 +68,10 @@ interface ParsedArgs {
   backupVerifyPath?: string;
   restoreDrillPath?: string;
   policyPath?: string;
+  commitRef?: string;
+  repo?: string;
+  branch?: string;
+  targetEnvironment?: string;
   backupOffloadPath?: string;
   backupFetchPath?: string;
   providerSecurityAuditPath?: string;
@@ -170,7 +184,14 @@ export async function composeBackupEvidence(
   const backupFetch = options.backupFetchPath ? await readJsonObject(options.backupFetchPath) : undefined;
   const backupProviderSecurityAudit = options.providerSecurityAuditPath ? await readJsonObject(options.providerSecurityAuditPath) : undefined;
   const backupPrune = options.backupPrunePath ? await readJsonObject(options.backupPrunePath) : undefined;
+  const release = {
+    ...(stringValue(options.commitRef) ? { commitRef: stringValue(options.commitRef)! } : {}),
+    ...(stringValue(options.repo) ? { repository: stringValue(options.repo)! } : {}),
+    ...(stringValue(options.branch) ? { branch: stringValue(options.branch)! } : {}),
+    ...(stringValue(options.targetEnvironment) ? { targetEnvironment: stringValue(options.targetEnvironment)! } : {})
+  };
   const evidence: ComposedBackupEvidence = {
+    ...(Object.keys(release).length > 0 ? { release } : {}),
     backupVerify,
     restoreDrill,
     ...(backupOffload ? { backupOffload } : {}),
@@ -192,6 +213,10 @@ export async function composeBackupEvidence(
   if (shouldCheck) {
     checkResult = evaluateBackupEvidence(evidence, {
       evidencePath: options.outputPath ?? "<composed-backup-evidence>",
+      commitRef: options.commitRef,
+      repo: options.repo,
+      branch: options.branch,
+      targetEnvironment: options.targetEnvironment,
       maxBackupAgeHours: options.maxBackupAgeHours,
       maxRestoreDrillAgeHours: options.maxRestoreDrillAgeHours,
       requireOffHost: options.requireOffHost,
@@ -264,6 +289,18 @@ export function parseBackupEvidenceComposeArgs(args: string[]): ParsedArgs {
     } else if (arg === "--policy" || arg === "--backup-policy") {
       parsed.policyPath = readArgValue(args, index, arg);
       index += 1;
+    } else if (arg === "--commit-ref") {
+      parsed.commitRef = readArgValue(args, index, arg);
+      index += 1;
+    } else if (arg === "--repo") {
+      parsed.repo = readArgValue(args, index, arg);
+      index += 1;
+    } else if (arg === "--branch") {
+      parsed.branch = readArgValue(args, index, arg);
+      index += 1;
+    } else if (arg === "--target-environment") {
+      parsed.targetEnvironment = readArgValue(args, index, arg);
+      index += 1;
     } else if (arg === "--operator-name") {
       parsed.operatorName = readArgValue(args, index, arg);
       index += 1;
@@ -325,6 +362,10 @@ export function backupEvidenceComposeUsage() {
     "  --backup-fetch <file>               Backup fetch command JSON output.",
     "  --provider-security-audit <file>    Provider security audit summary evidence.",
     "  --backup-prune <file>               Backup prune command JSON output.",
+    "  --commit-ref <sha>                  Bind raw and checker output to the release commit SHA.",
+    "  --repo <owner/repo>                 Bind raw and checker output to the release repository.",
+    "  --branch <branch>                   Bind raw and checker output to the release branch.",
+    "  --target-environment <name>         Bind raw and checker output to the release target environment.",
     "  --require-off-host                  Require offload, fetch, provider security audit, and non-dry-run prune inputs before composing.",
     "  --check                             Run backup:evidence checks against the composed evidence.",
     "  --check-output <file>               Write backup:evidence checker output for release:evidence:compose.",
@@ -390,6 +431,10 @@ export async function runBackupEvidenceComposeCli(
       providerSecurityAuditPath: parsed.providerSecurityAuditPath,
       backupPrunePath: parsed.backupPrunePath,
       policyPath: parsed.policyPath!,
+      commitRef: parsed.commitRef,
+      repo: parsed.repo,
+      branch: parsed.branch,
+      targetEnvironment: parsed.targetEnvironment,
       outputPath: parsed.outputPath,
       checkOutputPath: parsed.checkOutputPath,
       operatorName: parsed.operatorName,

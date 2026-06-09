@@ -1,16 +1,26 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { requiredOffHostBackupEvidenceCheckNames } from "./backupEvidenceCheck.js";
-import { evaluateReleaseEvidenceBundle } from "./releaseEvidenceBundleCheck.js";
+import {
+  bundleWithReleaseEvidenceAttestation,
+  evaluateReleaseEvidenceBundle,
+  releaseEvidenceBundleAttestationKeyId
+} from "./releaseEvidenceBundleCheck.js";
 import type { createReleaseEvidenceRehearsalPack } from "./releaseEvidenceRehearsalPack.js";
 import { requiredIngressEvidenceCheckNames } from "./ingressEvidenceCheck.js";
+import { requiredNonSessionCredentialEvidenceCheckNames } from "./nonSessionCredentialEvidenceCheck.js";
+import { requiredOperatorAccessEvidenceCheckNames } from "./operatorAccessEvidenceCheck.js";
 import { requiredReleaseArtifactCheckNames } from "./releaseArtifactContracts.js";
 import { requiredSourceProviderEvidenceCheckNames } from "./sourceProviderEvidenceCheck.js";
 import { requiredTargetRuntimeEvidenceCheckNames } from "./releaseTargetRuntimeEvidenceCheck.js";
+import { requiredUpgradeRollbackDrillEvidenceCheckNames } from "./upgradeRollbackDrillEvidenceCheck.js";
+import { requiredObservabilityEvidenceCheckNames } from "./observabilityEvidenceCheck.js";
 
 const pinnedBuildImage = "registry.local/siteflow/build-node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const backupKmsKeyRef = "arn:aws:kms:us-east-1:111122223333:key/siteflow-prod-backups";
 const now = () => new Date("2026-06-08T12:00:00.000Z");
+export const passedReleaseEvidenceAttestationSigningKey = "release-evidence-test-signing-key-with-enough-entropy";
+export const passedReleaseEvidenceAttestationKeyId = releaseEvidenceBundleAttestationKeyId(passedReleaseEvidenceAttestationSigningKey);
 
 type ReleaseEvidencePack = ReturnType<typeof createReleaseEvidenceRehearsalPack>;
 
@@ -31,6 +41,13 @@ export function passedReleaseGateEvidence() {
   return {
     status: "pass",
     checkedAt: "2026-06-08T11:30:00.000Z",
+    checks: [
+      passingCheck("local.gitStatus"),
+      passingCheck("local.requiredEnv"),
+      passingCheck("external.githubBranchProtection"),
+      passingCheck("external.githubProtectedBranchCommit"),
+      passingCheck("external.githubCommitStatus")
+    ],
     promotionEvidence: {
       gateStatus: "pass",
       checkedAt: "2026-06-08T11:30:00.000Z",
@@ -102,7 +119,11 @@ export function passedReleaseGateEvidence() {
         gitTimeoutStatus: "pass",
         gitTimeoutMs: 300000,
         buildNetworkStatus: "pass",
-        buildNetwork: "none"
+        buildNetwork: "none",
+        workerUserStatus: "pass",
+        workerUser: "1000:1000",
+        dockerSocketGidStatus: "pass",
+        dockerSocketGid: 998
       },
       dirtyWorktree: {
         status: "pass",
@@ -226,12 +247,104 @@ export function passedSourceProviderEvidence() {
       branch: "main",
       provider: "github",
       webhookDeliveryId: "delivery-123",
-      deployKeyMode: "not_required"
+      deployKeyMode: "not_required",
+      checkout: {
+        status: "passed",
+        timestamp: "2026-06-08T11:25:00.000Z",
+        commitRef: "abc123def4567890",
+        headSha: "abc123def4567890",
+        exactCommitVerified: true
+      },
+      signedWebhook: {
+        status: "passed",
+        timestamp: "2026-06-08T11:26:00.000Z",
+        deliveryId: "delivery-123",
+        event: "push",
+        signatureVerified: true
+      },
+      deployKey: {
+        status: "not_required",
+        timestamp: "2026-06-08T11:27:00.000Z"
+      },
+      hostKey: {
+        status: "not_required",
+        timestamp: "2026-06-08T11:28:00.000Z"
+      },
+      releaseProvenance: {
+        status: "passed",
+        timestamp: "2026-06-08T11:29:00.000Z",
+        commitRef: "abc123def4567890",
+        repository: "acme/siteflow",
+        branch: "main"
+      }
     },
     checks: [
       passingCheck("evidence_shape"),
       ...requiredSourceProviderEvidenceCheckNames.map(passingCheck)
     ]
+  };
+}
+
+export function passedSourceProviderRawEvidence() {
+  return {
+    schemaVersion: "siteflow.sourceProviderEvidence.v1",
+    name: "siteflow-source-provider-evidence",
+    status: "passed",
+    dryRun: false,
+    checkedAt: "2026-06-08T11:30:00.000Z",
+    targetEnvironment: "production",
+    provider: "github",
+    release: {
+      commitRef: "abc123def4567890",
+      repository: "acme/siteflow",
+      branch: "main"
+    },
+    repository: {
+      provider: "github",
+      fullName: "acme/siteflow",
+      remoteUrl: "git@github.com:acme/siteflow.git",
+      visibility: "private",
+      urlEmbeddedCredentials: false
+    },
+    checkout: {
+      status: "passed",
+      commitRef: "abc123def4567890",
+      headSha: "abc123def4567890",
+      exactCommitVerified: true,
+      remoteUrl: "git@github.com:acme/siteflow.git"
+    },
+    webhook: {
+      status: "passed",
+      deliveryId: "delivery-123",
+      event: "push",
+      signatureVerified: true,
+      secretConfigured: true,
+      rawSecretArchived: false,
+      signatureHeaderArchived: false
+    },
+    deployKey: {
+      status: "passed",
+      required: true,
+      mounted: true,
+      mode: "read_only",
+      path: "/run/secrets/siteflow_git_ssh_key",
+      privateKeyArchived: false
+    },
+    hostKey: {
+      status: "passed",
+      pinned: true,
+      knownHostsConfigured: true,
+      acceptedBlindly: false
+    },
+    releaseProvenance: {
+      status: "passed",
+      commitRef: "abc123def4567890",
+      repository: "acme/siteflow",
+      branch: "main"
+    },
+    operatorName: "Platform Operator",
+    ticketId: "REL-2026-0608",
+    rawCredentialArchived: false
   };
 }
 
@@ -280,6 +393,8 @@ export function passedReleaseArtifactEvidence() {
 }
 
 export function passedReleaseImageEvidence() {
+  const imageDigest = `sha256:${"f".repeat(64)}`;
+
   return {
     schemaVersion: "siteflow.releaseImageEvidence.v1",
     name: "siteflow-release-image-evidence",
@@ -287,7 +402,7 @@ export function passedReleaseImageEvidence() {
       name: "ghcr.io/siteflow/siteflow",
       versionTag: "ghcr.io/siteflow/siteflow:0.1.0",
       commitTag: "ghcr.io/siteflow/siteflow:sha-abc123def4567890",
-      digest: `sha256:${"f".repeat(64)}`
+      digest: imageDigest
     },
     source: {
       repository: "acme/siteflow",
@@ -300,20 +415,40 @@ export function passedReleaseImageEvidence() {
     },
     attestations: {
       mode: "registry",
-      subjectDigest: `sha256:${"f".repeat(64)}`,
+      subjectDigest: imageDigest,
       inspector: "docker buildx imagetools inspect --raw",
       inspectedAt: "2026-06-08T11:30:35.000Z",
       provenance: {
         requested: true,
         present: true,
         predicateType: "https://slsa.dev/provenance/v1",
-        manifestDigest: `sha256:${"e".repeat(64)}`
+        manifestDigest: `sha256:${"e".repeat(64)}`,
+        statementDigest: `sha256:${"c".repeat(64)}`,
+        subjectDigest: imageDigest,
+        builder: {
+          id: "https://github.com/actions/runner/github-hosted"
+        },
+        materials: [
+          {
+            uri: "git+https://github.com/acme/siteflow",
+            digest: {
+              sha1: "abc123def4567890"
+            }
+          }
+        ],
+        source: {
+          repository: "acme/siteflow",
+          commitRef: "abc123def4567890",
+          refName: "v0.1.0"
+        }
       },
       sbom: {
         requested: true,
         present: true,
         predicateType: "https://spdx.dev/Document",
-        manifestDigest: `sha256:${"d".repeat(64)}`
+        manifestDigest: `sha256:${"d".repeat(64)}`,
+        statementDigest: `sha256:${"b".repeat(64)}`,
+        subjectDigest: imageDigest
       }
     },
     checkedAt: "2026-06-08T11:30:30.000Z"
@@ -379,6 +514,12 @@ export function passedBackupEvidence() {
     status: "passed",
     checkedAt: "2026-06-08T11:30:00.000Z",
     exitCode: 0,
+    release: {
+      commitRef: "abc123def4567890",
+      repository: "acme/siteflow",
+      branch: "main",
+      targetEnvironment: "production"
+    },
     thresholds: {
       maxBackupAgeHours: 24,
       maxRestoreDrillAgeHours: 168,
@@ -394,14 +535,18 @@ export function passedBackupEvidence() {
       },
       restoreDrill: {
         status: "restored",
-        completedAt: "2026-06-08T10:40:00.000Z",
-        restoreDrill: true
+        timestamp: "2026-06-08T10:40:00.000Z",
+        restoreDrill: true,
+        backupPath: "/tmp/siteflow-fetched-backups/siteflow-20260608"
       },
       backupOffload: {
         status: "offloaded",
-        completedAt: "2026-06-08T10:50:00.000Z",
+        timestamp: "2026-06-08T10:50:00.000Z",
         offHostLocation: "s3://siteflow-prod-backups/siteflow-20260608",
         provider: "s3",
+        treeSha256: "b".repeat(64),
+        objectCount: 4,
+        totalBytes: 512,
         encrypted: true,
         kmsKeyRef: backupKmsKeyRef,
         providerKmsProof: true,
@@ -412,15 +557,18 @@ export function passedBackupEvidence() {
       },
       backupFetch: {
         status: "fetched",
-        completedAt: "2026-06-08T10:52:00.000Z",
+        timestamp: "2026-06-08T10:52:00.000Z",
         backupPath: "/tmp/siteflow-fetched-backups/siteflow-20260608",
         offHostLocation: "s3://siteflow-prod-backups/siteflow-20260608",
-        provider: "s3"
+        provider: "s3",
+        treeSha256: "b".repeat(64),
+        objectCount: 4,
+        totalBytes: 512
       },
       backupProviderSecurityAudit: backupProviderSecurityAuditEvidence(),
       backupPrune: {
         status: "completed",
-        completedAt: "2026-06-08T10:55:00.000Z",
+        timestamp: "2026-06-08T10:55:00.000Z",
         dryRun: false,
         retainedCurrentBackup: true
       }
@@ -432,76 +580,7 @@ export function passedBackupEvidence() {
   };
 }
 
-const observabilityRequiredChecks = [
-  "release_identity",
-  "target_environment",
-  "readiness_present",
-  "readiness_status",
-  "readiness_age",
-  "readiness_status_codes",
-  "readiness_traffic_removed",
-  "metrics_present",
-  "metrics_status",
-  "metrics_age",
-  "metrics_access_control",
-  "metrics_expected_names",
-  "backup_automation_run_present",
-  "backup_automation_run_identity",
-  "backup_automation_run_status",
-  "backup_automation_run_age",
-  "backup_automation_run_steps",
-  "backup_automation_checker_output",
-  "backup_automation_history_present",
-  "backup_automation_history_identity",
-  "backup_automation_history_latest_run",
-  "backup_automation_history_latest_status",
-  "backup_restore_drill_cadence_count",
-  "backup_restore_drill_cadence_gap",
-  "backup_history_checker_output",
-  "backup_scheduler_ownership_present",
-  "backup_scheduler_ownership_status",
-  "backup_scheduler_ownership_age",
-  "backup_scheduler_ownership_schema",
-  "backup_scheduler_ownership_source",
-  "backup_scheduler_ownership_target_environment",
-  "backup_scheduler_ownership_enabled",
-  "backup_scheduler_ownership_schedule",
-  "backup_scheduler_ownership_command",
-  "backup_scheduler_ownership_run_links",
-  "backup_scheduler_ownership_owner",
-  "observability_apply_proof_present",
-  "observability_apply_proof_status",
-  "observability_apply_proof_age",
-  "observability_apply_proof_schema",
-  "observability_apply_proof_source",
-  "observability_apply_proof_plan_schema",
-  "observability_apply_proof_assets",
-  "observability_target_stack_proof_present",
-  "observability_target_stack_proof_status",
-  "observability_target_stack_proof_age",
-  "observability_target_stack_proof_schema",
-  "observability_target_stack_proof_source",
-  "observability_target_stack_proof_release_identity",
-  "observability_target_stack_proof_target_environment",
-  "observability_target_stack_prometheus_rules",
-  "observability_target_stack_grafana_dashboard",
-  "observability_target_stack_alertmanager_receiver",
-  "alert_present",
-  "alert_status",
-  "alert_age",
-  "alert_delivered",
-  "dashboard_present",
-  "dashboard_status",
-  "dashboard_age",
-  "dashboard_reference",
-  "dashboard_owner",
-  "log_pipeline_present",
-  "log_pipeline_status",
-  "log_pipeline_age",
-  "log_retention",
-  "log_redaction_spot_check",
-  "no_sensitive_evidence_values"
-];
+const observabilityRequiredChecks = [...requiredObservabilityEvidenceCheckNames];
 
 export function passedObservabilityEvidence() {
   return {
@@ -538,52 +617,7 @@ export function passedObservabilityEvidence() {
   };
 }
 
-const operatorAccessRequiredChecks = [
-  "non_dry_run",
-  "not_template",
-  "status_final",
-  "release_identity",
-  "environment",
-  "public_base_url",
-  "session_create_present",
-  "session_create_status",
-  "session_cookie_flags",
-  "session_secret_not_returned",
-  "session_policy_present",
-  "session_policy_enforced",
-  "project_scope_present",
-  "project_scope_enforced",
-  "session_rotation_present",
-  "session_rotation_status",
-  "session_rotation_cookie_flags",
-  "session_rotation_secret_not_returned",
-  "session_rotation_csrf_enforced",
-  "session_rotation_old_cookie_rejected",
-  "session_revoke_present",
-  "session_revoke_status",
-  "csrf_present",
-  "csrf_enforced",
-  "bearer_precedence_present",
-  "bearer_precedence_enforced",
-  "actor_attribution_present",
-  "actor_attribution_enforced",
-  "emergency_cutoff_present",
-  "emergency_cutoff_global",
-  "emergency_cutoff_project",
-  "emergency_cutoff_cookie_only_rejected",
-  "emergency_cutoff_low_scope_bearer",
-  "emergency_cutoff_old_cookie_rejected",
-  "browser_token_fallback_present",
-  "browser_token_fallback_posture",
-  "browser_token_fallback_exception_documented",
-  "browser_token_fallback_local_storage_disabled",
-  "browser_token_fallback_age",
-  "negative_evidence_present",
-  "no_raw_secrets_stored",
-  "no_sensitive_evidence_values",
-  "operator",
-  "ticket"
-];
+const operatorAccessRequiredChecks = [...requiredOperatorAccessEvidenceCheckNames];
 
 export function passedOperatorAccessEvidence() {
   return {
@@ -597,16 +631,17 @@ export function passedOperatorAccessEvidence() {
       commitRef: "abc123def4567890",
       repository: "acme/siteflow",
       branch: "main",
-      sessionCreate: { status: "passed" },
-      projectScope: { status: "passed" },
-      sessionRotation: { status: "passed" },
-      sessionRevoke: { status: "revoked" },
-      csrf: { status: "enforced" },
-      bearerPrecedence: { status: "passed" },
-      actorAttribution: { status: "passed" },
-      emergencyCutoff: { status: "passed" },
+      sessionCreate: { status: "passed", timestamp: "2026-06-08T11:01:00.000Z" },
+      projectScope: { status: "passed", timestamp: "2026-06-08T11:02:00.000Z" },
+      sessionRotation: { status: "passed", timestamp: "2026-06-08T11:03:00.000Z" },
+      sessionRevoke: { status: "revoked", timestamp: "2026-06-08T11:04:00.000Z" },
+      csrf: { status: "enforced", timestamp: "2026-06-08T11:05:00.000Z" },
+      bearerPrecedence: { status: "passed", timestamp: "2026-06-08T11:06:00.000Z" },
+      actorAttribution: { status: "passed", timestamp: "2026-06-08T11:07:00.000Z" },
+      emergencyCutoff: { status: "passed", timestamp: "2026-06-08T11:08:00.000Z" },
       browserTokenFallback: {
         status: "passed",
+        timestamp: "2026-06-08T11:09:00.000Z",
         productionFallbackEnabled: false,
         localStorageFallbackDisabled: true
       }
@@ -618,31 +653,7 @@ export function passedOperatorAccessEvidence() {
   };
 }
 
-const nonSessionCredentialRequiredChecks = [
-  "non_dry_run",
-  "not_template",
-  "status_final",
-  "release_identity",
-  "environment",
-  "operator",
-  "ticket",
-  "credentials_present",
-  "credential_types_supported",
-  "credential_owners_and_tickets",
-  "credential_status",
-  "credential_age",
-  "credential_redacted_identifiers",
-  "no_raw_credentials_archived",
-  "no_sensitive_evidence_values",
-  "old_credentials_rejected",
-  "new_credentials_accepted",
-  "credential_specific_evidence",
-  "break_glass_present",
-  "break_glass_status",
-  "break_glass_age",
-  "break_glass_controls",
-  "automation_not_claimed"
-];
+const nonSessionCredentialRequiredChecks = [...requiredNonSessionCredentialEvidenceCheckNames];
 
 export function passedNonSessionCredentialEvidence() {
   return {
@@ -657,7 +668,7 @@ export function passedNonSessionCredentialEvidence() {
       branch: "main",
       credentialTypes: ["scoped_api_token"],
       credentialCount: 1,
-      breakGlass: { status: "passed" }
+      breakGlass: { status: "passed", timestamp: "2026-06-08T11:10:00.000Z" }
     },
     checks: [
       passingCheck("evidence_shape"),
@@ -684,13 +695,14 @@ export function passedIngressEvidence() {
         apiProcessCount: 2,
         ingressCount: 1
       },
-      directApiPort: { status: "blocked" },
-      forwardedHeaders: { status: "passed" },
+      directApiPort: { status: "blocked", timestamp: "2026-06-08T11:11:00.000Z" },
+      forwardedHeaders: { status: "passed", timestamp: "2026-06-08T11:12:00.000Z" },
       apiRateLimit: {
         status: "limited",
+        timestamp: "2026-06-08T11:13:00.000Z",
         edgeEnforced: true
       },
-      unthrottledRoutes: { status: "passed" }
+      unthrottledRoutes: { status: "passed", timestamp: "2026-06-08T11:14:00.000Z" }
     },
     checks: [
       passingCheck("evidence_shape"),
@@ -699,33 +711,7 @@ export function passedIngressEvidence() {
   };
 }
 
-const upgradeRollbackRequiredChecks = [
-  "non_dry_run",
-  "not_template",
-  "status_final",
-  "no_sensitive_evidence_values",
-  "drill_time_order",
-  "target_environment",
-  "release_identity",
-  "version_pair",
-  "rollback_version",
-  "api_image_digests",
-  "worker_image_digests",
-  "service_rollback_digest",
-  "migration_versions",
-  "schema_rollback_compatibility",
-  "backup_evidence_passed",
-  "release_operations",
-  "route_upgrade",
-  "route_rollback_restores_previous_artifact",
-  "http_rollback_verification",
-  "readiness_evidence",
-  "metrics_evidence",
-  "logs_evidence",
-  "alert_evidence",
-  "operator",
-  "ticket"
-];
+const upgradeRollbackRequiredChecks = [...requiredUpgradeRollbackDrillEvidenceCheckNames];
 
 export function passedUpgradeRollbackEvidence() {
   return {
@@ -742,7 +728,12 @@ export function passedUpgradeRollbackEvidence() {
       toVersion: "0.1.1",
       rollbackVersion: "0.1.0",
       upgradeOperationId: "op_upgrade_1",
-      rollbackOperationId: "op_rollback_1"
+      rollbackOperationId: "op_rollback_1",
+      backupEvidence: { status: "passed", timestamp: "2026-06-08T11:20:00.000Z" },
+      routeUpgrade: { status: "passed", timestamp: "2026-06-08T11:21:00.000Z" },
+      routeRollback: { status: "passed", timestamp: "2026-06-08T11:22:00.000Z" },
+      readiness: { status: "passed", timestamp: "2026-06-08T11:23:00.000Z" },
+      observability: { status: "passed", timestamp: "2026-06-08T11:24:00.000Z" }
     },
     checks: [
       passingCheck("evidence_shape"),
@@ -765,7 +756,29 @@ export function passedTargetRuntimeEvidence() {
       commitRef: "abc123def4567890",
       repository: "acme/siteflow",
       branch: "main",
+      targetIdentity: { status: "passed", timestamp: "2026-06-08T11:19:00.000Z" },
       composeConfig: { status: "passed", timestamp: "2026-06-08T11:20:00.000Z" },
+      workerRuntimePosture: {
+        status: "passed",
+        timestamp: "2026-06-08T11:20:00.000Z",
+        dockerSocketMounted: true,
+        groupAddConfigured: true,
+        hostDockerSocketGid: 998,
+        groupAddMatchesHostDockerSocketGid: true,
+        privileged: false,
+        capAddEmpty: true,
+        dangerousSecurityOptConfigured: false,
+        hostNetworkMode: false,
+        buildRunnerDocker: true,
+        buildNetworkNone: true,
+        buildMemoryConfigured: true,
+        buildCpusConfigured: true,
+        buildPidsLimitConfigured: true,
+        dockerCliPreflightPresent: true,
+        dockerInfoPreflightPresent: true,
+        gitSshKeyPathEnvPresent: true,
+        gitKnownHostsPathEnvPresent: true
+      },
       startup: { status: "passed", timestamp: "2026-06-08T11:21:00.000Z" },
       serviceHealth: { status: "passed", timestamp: "2026-06-08T11:22:00.000Z" },
       readiness: { status: "passed", timestamp: "2026-06-08T11:23:00.000Z" },
@@ -792,7 +805,7 @@ function evidenceAttachment(sourcePath: string, evidence: unknown) {
 }
 
 export function passedReleaseEvidenceBundle(pack: ReleaseEvidencePack) {
-  return {
+  const bundle = {
     schemaVersion: "siteflow.releaseEvidence.v1",
     name: "siteflow-release-evidence-bundle",
     checkedAt: "2026-06-08T11:45:00.000Z",
@@ -821,6 +834,11 @@ export function passedReleaseEvidenceBundle(pack: ReleaseEvidencePack) {
     ingressEvidence: evidenceAttachment(pack.evidenceFiles.ingress, passedIngressEvidence()),
     upgradeRollbackEvidence: evidenceAttachment(pack.evidenceFiles.upgradeRollback, passedUpgradeRollbackEvidence())
   };
+
+  return bundleWithReleaseEvidenceAttestation(bundle, "2026-06-08T11:45:00.000Z", {
+    attestationSigningKey: passedReleaseEvidenceAttestationSigningKey,
+    attestationSigningKeyId: passedReleaseEvidenceAttestationKeyId
+  });
 }
 
 export function passedReleaseEvidenceCheck(pack: ReleaseEvidencePack) {
@@ -830,6 +848,8 @@ export function passedReleaseEvidenceCheck(pack: ReleaseEvidencePack) {
     repo: pack.release.repository,
     branch: pack.release.branch,
     targetEnvironment: pack.release.targetEnvironment,
+    attestationSigningKey: passedReleaseEvidenceAttestationSigningKey,
+    requiredAttestationKeyId: passedReleaseEvidenceAttestationKeyId,
     now
   });
 }
@@ -840,9 +860,9 @@ export function passingEvidenceForCommandArgs(args: string[], pack: ReleaseEvide
   if (args.includes("rehearsal:postgres")) return passedPostgresRehearsal();
   if (args.includes("release:artifacts:evidence")) return passedReleaseArtifactEvidence();
   if (args.includes("release:target-runtime:evidence")) return passedTargetRuntimeEvidence();
-  if (args.includes("source-provider:evidence")) return passedSourceProviderEvidence();
-  if (args.includes("operator-access:evidence")) return passedOperatorAccessEvidence();
-  if (args.includes("non-session-credential:evidence")) return passedNonSessionCredentialEvidence();
+  if (args.includes("source-provider:evidence") || args.includes("source-provider:evidence:collect")) return passedSourceProviderEvidence();
+  if (args.includes("operator-access:evidence:collect") || args.includes("operator-access:evidence")) return passedOperatorAccessEvidence();
+  if (args.includes("non-session-credential:evidence:collect") || args.includes("non-session-credential:evidence")) return passedNonSessionCredentialEvidence();
   if (args.includes("upgrade-rollback:evidence")) return passedUpgradeRollbackEvidence();
   if (args.includes("release:evidence:compose")) return passedReleaseEvidenceBundle(pack);
   if (args.includes("release:evidence")) return passedReleaseEvidenceCheck(pack);
@@ -857,6 +877,7 @@ export async function writePassingReleaseEvidenceOutputs(pack: ReleaseEvidencePa
   await writeJson(pack.evidenceFiles.releaseArtifact, passedReleaseArtifactEvidence());
   await writeJson(pack.evidenceFiles.releaseImage, passedReleaseImageEvidence());
   await writeJson(pack.evidenceFiles.targetRuntime, passedTargetRuntimeEvidence());
+  await writeJson(pack.evidenceFiles.sourceProviderRaw, passedSourceProviderRawEvidence());
   await writeJson(pack.evidenceFiles.sourceProvider, passedSourceProviderEvidence());
   await writeJson(pack.evidenceFiles.backup, passedBackupEvidence());
   await writeJson(pack.evidenceFiles.observability, passedObservabilityEvidence());

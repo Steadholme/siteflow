@@ -60,6 +60,8 @@ const buildImage = `node:20-bookworm-slim@sha256:${"c".repeat(64)}`;
 const version = "0.1.0-test";
 const baseDomain = "w33d.xyz";
 const controlPlaneHost = "siteflow.w33d.xyz";
+const workerUser = "1000:1000";
+const dockerSocketGid = "998";
 
 function isEntrypoint() {
   const entryPath = process.argv[1];
@@ -87,6 +89,58 @@ function countOf(content: string, value: string) {
   return content.split(value).length - 1;
 }
 
+function composeServiceBlock(content: string, serviceName: string) {
+  const lines = content.split("\n");
+  const start = lines.findIndex((line) => line === `  ${serviceName}:`);
+
+  if (start === -1) {
+    return "";
+  }
+
+  const end = lines.findIndex((line, index) => index > start && /^(?:  [a-zA-Z0-9_-]+|[a-zA-Z0-9_-]+):\s*$/.test(line));
+  return lines.slice(start, end === -1 ? undefined : end).join("\n");
+}
+
+function nginxServerBlock(content: string, serverName: string) {
+  const lines = content.split("\n");
+  const serverNameLine = lines.findIndex((line) => line.trim() === `server_name ${serverName};`);
+
+  if (serverNameLine === -1) {
+    return "";
+  }
+
+  let start = serverNameLine;
+
+  while (start >= 0 && lines[start].trim() !== "server {") {
+    start -= 1;
+  }
+
+  if (start < 0) {
+    return "";
+  }
+
+  let depth = 0;
+  const block: string[] = [];
+
+  for (const line of lines.slice(start)) {
+    block.push(line);
+
+    if (line.trim().endsWith("{")) {
+      depth += 1;
+    }
+
+    if (line.trim() === "}") {
+      depth -= 1;
+
+      if (depth === 0) {
+        break;
+      }
+    }
+  }
+
+  return block.join("\n");
+}
+
 export function renderReferenceInstallProfile(): InstallProfileAssets {
   return {
     env: renderSiteFlowEnvFile({
@@ -96,6 +150,8 @@ export function renderReferenceInstallProfile(): InstallProfileAssets {
       version,
       image,
       buildImage,
+      workerUser,
+      dockerSocketGid,
       baseDomain
     }),
     compose: renderComposeFile({
@@ -105,6 +161,8 @@ export function renderReferenceInstallProfile(): InstallProfileAssets {
       version,
       image,
       buildImage,
+      workerUser,
+      dockerSocketGid,
       baseDomain,
       dataDir,
       configDir,
@@ -112,6 +170,7 @@ export function renderReferenceInstallProfile(): InstallProfileAssets {
     }),
     systemd: renderSystemdUnit({
       composeFile: "/opt/siteflow/compose.yaml",
+      envFile: "/etc/siteflow/siteflow.env",
       workingDirectory: "/opt/siteflow",
       unitName: "siteflow.service"
     }),
@@ -133,6 +192,10 @@ export function evaluateInstallProfileAssets(
   const compose = assets.compose.content;
   const systemd = assets.systemd.content;
   const nginx = assets.nginx.content;
+  const postgresCompose = composeServiceBlock(compose, "postgres");
+  const apiCompose = composeServiceBlock(compose, "api");
+  const workerCompose = composeServiceBlock(compose, "worker");
+  const wildcardNginx = nginxServerBlock(nginx, "*.w33d.xyz");
 
   checks.push(check(
     "install_profile_rendered_assets",
@@ -154,17 +217,27 @@ export function evaluateInstallProfileAssets(
     containsAll(env, [
       "SITEFLOW_ENV=production",
       `SITEFLOW_API_PORT=${apiPort}`,
-      "SITEFLOW_TRUST_PROXY=loopback",
+      "SITEFLOW_TRUST_PROXY=",
+      `SITEFLOW_WORKER_USER=${workerUser}`,
+      `SITEFLOW_DOCKER_SOCKET_GID=${dockerSocketGid}`,
       "SITEFLOW_BUILD_RUNNER=docker",
       "SITEFLOW_BUILD_NETWORK=none",
       "SITEFLOW_BUILD_MAX_ARTIFACT_BYTES=536870912",
       "SITEFLOW_BUILD_MAX_ARTIFACT_FILES=20000",
       "SITEFLOW_BUILD_MIN_FREE_BYTES=1073741824",
+      "SITEFLOW_BUILD_STEP_TIMEOUT_MS=900000",
+      "SITEFLOW_GIT_TIMEOUT_MS=300000",
       "SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES=536870912",
       "SITEFLOW_PREBUILT_MAX_FILES=20000",
       `SITEFLOW_BUILD_IMAGE=${buildImage}`
     ]) && absentAll(env, ["TOKEN", "SECRET", "WEBHOOK"]),
-    "Non-secret env file must set production runtime posture without raw token, secret, or webhook values."
+    "Non-secret env file must set production runtime posture without raw token, secret, webhook values, or default trusted proxy opt-in."
+  ));
+
+  checks.push(check(
+    "install_env_trusted_proxy_opt_in",
+    env.includes("SITEFLOW_TRUST_PROXY=") && !env.includes("SITEFLOW_TRUST_PROXY=loopback"),
+    "Install env must leave SITEFLOW_TRUST_PROXY disabled by default; operators opt in only with target ingress evidence."
   ));
 
   checks.push(check(
@@ -199,7 +272,7 @@ export function evaluateInstallProfileAssets(
 
   checks.push(check(
     "install_nginx_wildcard_runtime_routes_blocked",
-    containsAll(nginx, [
+    containsAll(wildcardNginx, [
       "server_name *.w33d.xyz;",
       "location = /healthz",
       "location = /readyz",
@@ -210,61 +283,101 @@ export function evaluateInstallProfileAssets(
 
   checks.push(check(
     "install_compose_api_loopback_port",
-    compose.includes(`- "127.0.0.1:${apiPort}:${apiPort}"`) &&
-      absentAll(compose, [`- "${apiPort}:${apiPort}"`, `- "0.0.0.0:${apiPort}:${apiPort}"`]),
+    apiCompose.includes(`- "127.0.0.1:${apiPort}:${apiPort}"`) &&
+      absentAll(apiCompose, [`- "${apiPort}:${apiPort}"`, `- "0.0.0.0:${apiPort}:${apiPort}"`]),
     "Compose API service must publish the API port on loopback only."
   ));
 
   checks.push(check(
     "install_compose_service_readiness",
-    containsAll(compose, [
+    containsAll(postgresCompose, [
       "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}",
-      "condition: service_healthy",
-      "healthcheck:",
-      "fetch('http://127.0.0.1:8787/readyz')"
-    ]) && countOf(compose, "condition: service_healthy") >= 3,
+      "healthcheck:"
+    ]) &&
+      containsAll(apiCompose, [
+        "depends_on:",
+        "postgres:",
+        "condition: service_healthy",
+        "healthcheck:",
+        "fetch('http://127.0.0.1:8787/readyz')"
+      ]) &&
+      containsAll(workerCompose, [
+        "depends_on:",
+        "postgres:",
+        "api:",
+        "condition: service_healthy"
+      ]) &&
+      countOf(compose, "condition: service_healthy") >= 3,
     "Compose services must gate startup on Postgres/API readiness and expose an API /readyz healthcheck."
   ));
 
   checks.push(check(
     "install_compose_container_hardening",
-    containsAll(compose, [
+    containsAll(apiCompose, [
       'user: "1000:1000"',
-      'user: "${SITEFLOW_WORKER_USER:-0:0}"',
-      "group_add:",
-      '"${SITEFLOW_DOCKER_SOCKET_GID:-0}"',
+      "init: true",
+      "read_only: true",
       "cap_drop:",
+      "- ALL",
       "no-new-privileges:true",
-      "/tmp:rw,noexec,nosuid,nodev,size=64m",
-      "/tmp:rw,noexec,nosuid,nodev,size=512m"
+      "/tmp:rw,noexec,nosuid,nodev,size=64m"
     ]) &&
+      containsAll(workerCompose, [
+        'user: "${SITEFLOW_WORKER_USER:-1000:1000}"',
+        "group_add:",
+        '"${SITEFLOW_DOCKER_SOCKET_GID:?SITEFLOW_DOCKER_SOCKET_GID must match /var/run/docker.sock group id}"',
+        "init: true",
+        "read_only: true",
+        "cap_drop:",
+        "- ALL",
+        "no-new-privileges:true",
+        "/tmp:rw,noexec,nosuid,nodev,size=512m"
+      ]) &&
       countOf(compose, "init: true") >= 2 &&
       countOf(compose, "read_only: true") >= 2 &&
       countOf(compose, "cap_drop:") >= 2 &&
+      countOf(compose, "- ALL") >= 2 &&
       countOf(compose, "no-new-privileges:true") >= 2,
     "Compose API and worker services must run with the production hardening posture."
   ));
 
   checks.push(check(
     "install_compose_secret_files",
-    containsAll(compose, [
+    containsAll(apiCompose, [
       'DATABASE_URL: "postgres://siteflow@postgres:5432/siteflow"',
       "SITEFLOW_APP_SECRET_FILE: /run/secrets/siteflow_app_secret",
       "SITEFLOW_API_TOKEN_FILE: /run/secrets/siteflow_api_token",
       "SITEFLOW_METRICS_TOKEN_FILE: /run/secrets/siteflow_metrics_token",
+      "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE: /run/secrets/siteflow_release_evidence_signing_key",
       "SITEFLOW_POSTGRES_PASSWORD_FILE: /run/secrets/siteflow_postgres_password",
       "SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_github_webhook_secret",
-      "file: /etc/siteflow/secrets/app-secret.secret",
-      "file: /etc/siteflow/secrets/api-token.secret",
-      "file: /etc/siteflow/secrets/metrics-token.secret",
-      "file: /etc/siteflow/secrets/postgres-password.secret"
-    ]) && absentAll(compose, ["export SITEFLOW_", "$(cat /run/secrets/"]),
+      "SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_gitlab_webhook_secret",
+      "SITEFLOW_GITEA_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_gitea_webhook_secret",
+      "SITEFLOW_GENERIC_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_generic_webhook_secret"
+    ]) &&
+      containsAll(workerCompose, [
+        'DATABASE_URL: "postgres://siteflow@postgres:5432/siteflow"',
+        "SITEFLOW_APP_SECRET_FILE: /run/secrets/siteflow_app_secret",
+        "SITEFLOW_POSTGRES_PASSWORD_FILE: /run/secrets/siteflow_postgres_password"
+      ]) &&
+      containsAll(compose, [
+        "- siteflow_release_evidence_signing_key",
+        "file: /etc/siteflow/secrets/app-secret.secret",
+        "file: /etc/siteflow/secrets/api-token.secret",
+        "file: /etc/siteflow/secrets/metrics-token.secret",
+        "file: /etc/siteflow/secrets/release-evidence-signing-key.secret",
+        "file: /etc/siteflow/secrets/postgres-password.secret",
+        "file: /etc/siteflow/secrets/github-webhook.secret",
+        "file: /etc/siteflow/secrets/gitlab-webhook.secret",
+        "file: /etc/siteflow/secrets/gitea-webhook.secret",
+        "file: /etc/siteflow/secrets/generic-webhook.secret"
+      ]) && absentAll(compose, ["export SITEFLOW_", "$(cat /run/secrets/"]),
     "Compose profile must expose Docker secret file paths to the application without exporting secret values into the process environment."
   ));
 
   checks.push(check(
     "install_compose_metrics_token_required",
-    compose.includes("SITEFLOW_METRICS_TOKEN_FILE: /run/secrets/siteflow_metrics_token") &&
+    apiCompose.includes("SITEFLOW_METRICS_TOKEN_FILE: /run/secrets/siteflow_metrics_token") &&
       !compose.includes("export SITEFLOW_METRICS_TOKEN=") &&
       !compose.includes("SITEFLOW_ALLOW_UNAUTHENTICATED_METRICS"),
     "Compose profile must require metrics token file injection and must not enable unauthenticated metrics."
@@ -282,18 +395,23 @@ export function evaluateInstallProfileAssets(
 
   checks.push(check(
     "install_compose_worker_docker_runner",
-    containsAll(compose, [
-      'user: "${SITEFLOW_WORKER_USER:-0:0}"',
+    containsAll(workerCompose, [
+      'user: "${SITEFLOW_WORKER_USER:-1000:1000}"',
       "group_add:",
-      '"${SITEFLOW_DOCKER_SOCKET_GID:-0}"',
+      '"${SITEFLOW_DOCKER_SOCKET_GID:?SITEFLOW_DOCKER_SOCKET_GID must match /var/run/docker.sock group id}"',
       'SITEFLOW_BUILD_RUNNER: "docker"',
       'SITEFLOW_BUILD_NETWORK: "none"',
       'SITEFLOW_BUILD_MAX_ARTIFACT_BYTES: "536870912"',
       'SITEFLOW_BUILD_MAX_ARTIFACT_FILES: "20000"',
+      'SITEFLOW_BUILD_STEP_TIMEOUT_MS: "900000"',
+      'SITEFLOW_GIT_TIMEOUT_MS: "300000"',
+      'SITEFLOW_GIT_SSH_KEY_PATH: "${SITEFLOW_GIT_SSH_KEY_PATH:-}"',
+      'SITEFLOW_GIT_KNOWN_HOSTS_PATH: "${SITEFLOW_GIT_KNOWN_HOSTS_PATH:-}"',
       `SITEFLOW_BUILD_IMAGE: "${buildImage}"`,
       "command -v docker",
       "docker info",
       "/var/run/docker.sock:/var/run/docker.sock",
+      "requires access to the trusted single-host Docker socket",
       "Trusted single-host operator profile",
       "not a multi-tenant sandbox boundary",
       "exec node dist-worker/worker/index.js"
@@ -303,10 +421,10 @@ export function evaluateInstallProfileAssets(
 
   checks.push(check(
     "install_compose_worker_healthcheck",
-    containsAll(compose, [
+    containsAll(workerCompose, [
       'test: ["CMD", "node", "dist-worker/worker/index.js", "--healthcheck"]',
       "interval: 30s",
-      "timeout: 5s",
+      "timeout: 10s",
       "retries: 5",
       "start_period: 30s"
     ]),
@@ -315,7 +433,8 @@ export function evaluateInstallProfileAssets(
 
   checks.push(check(
     "install_compose_backup_evidence_mount",
-    containsAll(compose, [
+    containsAll(apiCompose, [
+      'SITEFLOW_EVIDENCE_ROOT: "/var/lib/siteflow/evidence"',
       'SITEFLOW_BACKUP_AUTOMATION_RUN_RECORD: "/var/lib/siteflow/evidence/backup-automation-run.json"',
       "- /var/lib/siteflow/evidence:/var/lib/siteflow/evidence:ro"
     ]),
@@ -327,8 +446,8 @@ export function evaluateInstallProfileAssets(
     containsAll(systemd, [
       "Requires=docker.service",
       "After=docker.service network-online.target",
-      "ExecStart=/usr/bin/docker compose -f /opt/siteflow/compose.yaml up -d",
-      "ExecStop=/usr/bin/docker compose -f /opt/siteflow/compose.yaml down",
+      "ExecStart=/usr/bin/docker compose --env-file /etc/siteflow/siteflow.env -f /opt/siteflow/compose.yaml up -d",
+      "ExecStop=/usr/bin/docker compose --env-file /etc/siteflow/siteflow.env -f /opt/siteflow/compose.yaml down",
       "WantedBy=multi-user.target"
     ]),
     "Systemd unit must manage the Compose stack and require Docker."

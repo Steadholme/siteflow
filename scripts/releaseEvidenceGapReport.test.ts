@@ -6,16 +6,26 @@ import {
   runReleaseEvidenceGapReportCli
 } from "./releaseEvidenceGapReport";
 import { requiredOffHostBackupEvidenceCheckNames } from "./backupEvidenceCheck";
-import { evaluateReleaseEvidenceBundle } from "./releaseEvidenceBundleCheck";
+import {
+  bundleWithReleaseEvidenceAttestation,
+  evaluateReleaseEvidenceBundle,
+  releaseEvidenceBundleAttestationKeyId
+} from "./releaseEvidenceBundleCheck";
 import { createReleaseEvidenceRehearsalPack } from "./releaseEvidenceRehearsalPack";
 import { requiredIngressEvidenceCheckNames } from "./ingressEvidenceCheck";
+import { requiredNonSessionCredentialEvidenceCheckNames } from "./nonSessionCredentialEvidenceCheck";
+import { requiredObservabilityEvidenceCheckNames } from "./observabilityEvidenceCheck";
+import { requiredOperatorAccessEvidenceCheckNames } from "./operatorAccessEvidenceCheck";
 import { requiredReleaseArtifactCheckNames } from "./releaseArtifactContracts";
 import { requiredSourceProviderEvidenceCheckNames } from "./sourceProviderEvidenceCheck";
 import { requiredTargetRuntimeEvidenceCheckNames } from "./releaseTargetRuntimeEvidenceCheck";
+import { requiredUpgradeRollbackDrillEvidenceCheckNames } from "./upgradeRollbackDrillEvidenceCheck";
 
 const now = () => new Date("2026-06-08T12:00:00.000Z");
+const releaseEvidenceAttestationSigningKey = "release-evidence-test-signing-key-with-enough-entropy";
 const pinnedBuildImage = "registry.local/siteflow/build-node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const backupKmsKeyRef = "arn:aws:kms:us-east-1:111122223333:key/siteflow-prod-backups";
+const postgresImageDigest = "b".repeat(64);
 
 function basePack(
   outputDir: string,
@@ -29,6 +39,7 @@ function basePack(
     publicBaseUrl: "https://siteflow.example.com",
     operatorName: "release-operator",
     releaseTicket: "REL-2026-0608",
+    observabilityTargetStackApiUrl: "https://observability.example.com/siteflow-proof",
     outputDir,
     now,
     ...overrides
@@ -38,6 +49,46 @@ function basePack(
 async function writeJson(filePath: string, value: unknown) {
   await mkdir(path.dirname(filePath), { recursive: true });
   await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function validTargetEnvFileContents() {
+  return [
+    "SITEFLOW_ENV=production",
+    "DATABASE_URL=postgres://siteflow@postgres:5432/siteflow",
+    "SITEFLOW_API_PORT=8787",
+    "SITEFLOW_ARTIFACT_ROOT=/var/lib/siteflow/artifacts",
+    "SITEFLOW_EVIDENCE_ROOT=/var/lib/siteflow/evidence",
+    "SITEFLOW_PUBLIC_SCHEME=https",
+    "SITEFLOW_BASE_DOMAIN=siteflow.example.com",
+    "SITEFLOW_WORKER_USER=1000:1000",
+    "SITEFLOW_DOCKER_SOCKET_GID=999",
+    "SITEFLOW_API_TOKEN_FILE=/etc/siteflow/secrets/api-token.secret",
+    "SITEFLOW_METRICS_TOKEN_FILE=/etc/siteflow/secrets/metrics-token.secret",
+    "SITEFLOW_APP_SECRET_FILE=/etc/siteflow/secrets/app-secret.secret",
+    "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE=/etc/siteflow/secrets/release-evidence-signing-key.secret",
+    "SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID=release-evidence-key-id",
+    "SITEFLOW_POSTGRES_PASSWORD_FILE=/etc/siteflow/secrets/postgres-password.secret",
+    "SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE=/etc/siteflow/secrets/github-webhook.secret",
+    "SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE=/etc/siteflow/secrets/gitlab-webhook.secret",
+    "SITEFLOW_GITEA_WEBHOOK_SECRET_FILE=/etc/siteflow/secrets/gitea-webhook.secret",
+    "SITEFLOW_GENERIC_WEBHOOK_SECRET_FILE=/etc/siteflow/secrets/generic-webhook.secret",
+    "SITEFLOW_IMAGE=ghcr.io/siteflow/siteflow@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    `SITEFLOW_POSTGRES_IMAGE=postgres@sha256:${postgresImageDigest}`,
+    "SITEFLOW_BUILD_RUNNER=docker",
+    `SITEFLOW_BUILD_IMAGE=${pinnedBuildImage}`,
+    "SITEFLOW_BUILD_NETWORK=none",
+    "SITEFLOW_BUILD_MIN_FREE_BYTES=1073741824",
+    "SITEFLOW_BUILD_STEP_TIMEOUT_MS=900000",
+    "SITEFLOW_GIT_TIMEOUT_MS=300000",
+    "SITEFLOW_BUILD_MEMORY=1g",
+    "SITEFLOW_BUILD_CPUS=2",
+    "SITEFLOW_BUILD_PIDS_LIMIT=256",
+    "SITEFLOW_BUILD_MAX_ARTIFACT_BYTES=536870912",
+    "SITEFLOW_BUILD_MAX_ARTIFACT_FILES=20000",
+    "SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES=536870912",
+    "SITEFLOW_PREBUILT_MAX_FILES=20000",
+    ""
+  ].join("\n");
 }
 
 function passedChecker(name: string) {
@@ -127,6 +178,13 @@ function passedReleaseGateEvidence() {
   return {
     status: "pass",
     checkedAt: "2026-06-08T11:30:00.000Z",
+    checks: [
+      passingCheck("local.gitStatus"),
+      passingCheck("local.requiredEnv"),
+      passingCheck("external.githubBranchProtection"),
+      passingCheck("external.githubProtectedBranchCommit"),
+      passingCheck("external.githubCommitStatus")
+    ],
     promotionEvidence: {
       gateStatus: "pass",
       checkedAt: "2026-06-08T11:30:00.000Z",
@@ -198,7 +256,11 @@ function passedReleaseGateEvidence() {
         gitTimeoutStatus: "pass",
         gitTimeoutMs: 300000,
         buildNetworkStatus: "pass",
-        buildNetwork: "none"
+        buildNetwork: "none",
+        workerUserStatus: "pass",
+        workerUser: "1000:1000",
+        dockerSocketGidStatus: "pass",
+        dockerSocketGid: 998
       },
       dirtyWorktree: {
         status: "pass",
@@ -354,7 +416,36 @@ function passedSourceProviderEvidence() {
       branch: "main",
       provider: "github",
       webhookDeliveryId: "delivery-123",
-      deployKeyMode: "not_required"
+      deployKeyMode: "not_required",
+      checkout: {
+        status: "passed",
+        timestamp: "2026-06-08T11:25:00.000Z",
+        commitRef: "abc123def4567890",
+        headSha: "abc123def4567890",
+        exactCommitVerified: true
+      },
+      signedWebhook: {
+        status: "passed",
+        timestamp: "2026-06-08T11:26:00.000Z",
+        deliveryId: "delivery-123",
+        event: "push",
+        signatureVerified: true
+      },
+      deployKey: {
+        status: "not_required",
+        timestamp: "2026-06-08T11:27:00.000Z"
+      },
+      hostKey: {
+        status: "not_required",
+        timestamp: "2026-06-08T11:28:00.000Z"
+      },
+      releaseProvenance: {
+        status: "passed",
+        timestamp: "2026-06-08T11:29:00.000Z",
+        commitRef: "abc123def4567890",
+        repository: "acme/siteflow",
+        branch: "main"
+      }
     },
     checks: [
       passingCheck("evidence_shape"),
@@ -386,9 +477,25 @@ function passedTargetRuntimeEvidence() {
       commitRef: "abc123def4567890",
       repository: "acme/siteflow",
       branch: "main",
+      targetIdentity: {
+        status: "passed",
+        timestamp: "2026-06-08T11:20:30.000Z"
+      },
       composeConfig: {
         status: "passed",
         timestamp: "2026-06-08T11:21:00.000Z"
+      },
+      workerRuntimePosture: {
+        status: "passed",
+        timestamp: "2026-06-08T11:21:00.000Z",
+        dockerSocketMounted: true,
+        groupAddConfigured: true,
+        buildRunnerDocker: true,
+        buildNetworkNone: true,
+        dockerCliPreflightPresent: true,
+        dockerInfoPreflightPresent: true,
+        gitSshKeyPathEnvPresent: true,
+        gitKnownHostsPathEnvPresent: true
       },
       startup: {
         status: "passed",
@@ -470,6 +577,10 @@ function passedReleaseArtifactEvidence() {
   };
 }
 
+function standaloneLocalReleaseArtifactManifest() {
+  return { ...passedReleaseArtifactEvidence().manifest };
+}
+
 function sameProcessFunctionReleaseArtifactEvidence() {
   const evidence = passedReleaseArtifactEvidence() as ReturnType<typeof passedReleaseArtifactEvidence> & Record<string, unknown>;
   const artifactManifest = evidence.artifactManifest as Record<string, unknown>;
@@ -507,6 +618,8 @@ function functionReleaseArtifactEvidenceWithRuntimeIsolation(runtimeIsolation?: 
 }
 
 function passedReleaseImageEvidence() {
+  const imageDigest = `sha256:${"f".repeat(64)}`;
+
   return {
     schemaVersion: "siteflow.releaseImageEvidence.v1",
     name: "siteflow-release-image-evidence",
@@ -514,7 +627,7 @@ function passedReleaseImageEvidence() {
       name: "ghcr.io/siteflow/siteflow",
       versionTag: "ghcr.io/siteflow/siteflow:0.1.0",
       commitTag: "ghcr.io/siteflow/siteflow:sha-abc123def4567890",
-      digest: `sha256:${"f".repeat(64)}`
+      digest: imageDigest
     },
     source: {
       repository: "acme/siteflow",
@@ -527,20 +640,40 @@ function passedReleaseImageEvidence() {
     },
     attestations: {
       mode: "registry",
-      subjectDigest: `sha256:${"f".repeat(64)}`,
+      subjectDigest: imageDigest,
       inspector: "docker buildx imagetools inspect --raw",
       inspectedAt: "2026-06-08T11:30:35.000Z",
       provenance: {
         requested: true,
         present: true,
         predicateType: "https://slsa.dev/provenance/v1",
-        manifestDigest: `sha256:${"e".repeat(64)}`
+        manifestDigest: `sha256:${"e".repeat(64)}`,
+        statementDigest: `sha256:${"c".repeat(64)}`,
+        subjectDigest: imageDigest,
+        builder: {
+          id: "https://github.com/actions/runner/github-hosted"
+        },
+        materials: [
+          {
+            uri: "git+https://github.com/acme/siteflow",
+            digest: {
+              sha1: "abc123def4567890"
+            }
+          }
+        ],
+        source: {
+          repository: "acme/siteflow",
+          commitRef: "abc123def4567890",
+          refName: "v0.1.0"
+        }
       },
       sbom: {
         requested: true,
         present: true,
         predicateType: "https://spdx.dev/Document",
-        manifestDigest: `sha256:${"d".repeat(64)}`
+        manifestDigest: `sha256:${"d".repeat(64)}`,
+        statementDigest: `sha256:${"b".repeat(64)}`,
+        subjectDigest: imageDigest
       }
     },
     checkedAt: "2026-06-08T11:30:30.000Z"
@@ -550,175 +683,11 @@ function passedReleaseImageEvidence() {
 const backupRequiredChecks = [...requiredOffHostBackupEvidenceCheckNames];
 const releaseArtifactRequiredChecks = [...requiredReleaseArtifactCheckNames];
 const sourceProviderRequiredChecks = [...requiredSourceProviderEvidenceCheckNames];
-const observabilityRequiredChecks = [
-  "release_identity",
-  "target_environment",
-  "readiness_present",
-  "readiness_status",
-  "readiness_age",
-  "readiness_status_codes",
-  "readiness_traffic_removed",
-  "metrics_present",
-  "metrics_status",
-  "metrics_age",
-  "metrics_access_control",
-  "metrics_expected_names",
-  "backup_automation_run_present",
-  "backup_automation_run_identity",
-  "backup_automation_run_status",
-  "backup_automation_run_age",
-  "backup_automation_run_steps",
-  "backup_automation_checker_output",
-  "backup_automation_history_present",
-  "backup_automation_history_identity",
-  "backup_automation_history_latest_run",
-  "backup_automation_history_latest_status",
-  "backup_restore_drill_cadence_count",
-  "backup_restore_drill_cadence_gap",
-  "backup_history_checker_output",
-  "backup_scheduler_ownership_present",
-  "backup_scheduler_ownership_status",
-  "backup_scheduler_ownership_age",
-  "backup_scheduler_ownership_schema",
-  "backup_scheduler_ownership_source",
-  "backup_scheduler_ownership_target_environment",
-  "backup_scheduler_ownership_enabled",
-  "backup_scheduler_ownership_schedule",
-  "backup_scheduler_ownership_command",
-  "backup_scheduler_ownership_run_links",
-  "backup_scheduler_ownership_owner",
-  "observability_apply_proof_present",
-  "observability_apply_proof_status",
-  "observability_apply_proof_age",
-  "observability_apply_proof_schema",
-  "observability_apply_proof_source",
-  "observability_apply_proof_plan_schema",
-  "observability_apply_proof_assets",
-  "observability_target_stack_proof_present",
-  "observability_target_stack_proof_status",
-  "observability_target_stack_proof_age",
-  "observability_target_stack_proof_schema",
-  "observability_target_stack_proof_source",
-  "observability_target_stack_proof_release_identity",
-  "observability_target_stack_proof_target_environment",
-  "observability_target_stack_prometheus_rules",
-  "observability_target_stack_grafana_dashboard",
-  "observability_target_stack_alertmanager_receiver",
-  "alert_present",
-  "alert_status",
-  "alert_age",
-  "alert_delivered",
-  "dashboard_present",
-  "dashboard_status",
-  "dashboard_age",
-  "dashboard_reference",
-  "dashboard_owner",
-  "log_pipeline_present",
-  "log_pipeline_status",
-  "log_pipeline_age",
-  "log_retention",
-  "log_redaction_spot_check",
-  "no_sensitive_evidence_values"
-];
-const operatorAccessRequiredChecks = [
-  "non_dry_run",
-  "not_template",
-  "status_final",
-  "release_identity",
-  "environment",
-  "public_base_url",
-  "session_create_present",
-  "session_create_status",
-  "session_cookie_flags",
-  "session_secret_not_returned",
-  "session_policy_present",
-  "session_policy_enforced",
-  "project_scope_present",
-  "project_scope_enforced",
-  "session_rotation_present",
-  "session_rotation_status",
-  "session_rotation_cookie_flags",
-  "session_rotation_secret_not_returned",
-  "session_rotation_csrf_enforced",
-  "session_rotation_old_cookie_rejected",
-  "session_revoke_present",
-  "session_revoke_status",
-  "csrf_present",
-  "csrf_enforced",
-  "bearer_precedence_present",
-  "bearer_precedence_enforced",
-  "actor_attribution_present",
-  "actor_attribution_enforced",
-  "emergency_cutoff_present",
-  "emergency_cutoff_global",
-  "emergency_cutoff_project",
-  "emergency_cutoff_cookie_only_rejected",
-  "emergency_cutoff_low_scope_bearer",
-  "emergency_cutoff_old_cookie_rejected",
-  "browser_token_fallback_present",
-  "browser_token_fallback_posture",
-  "browser_token_fallback_exception_documented",
-  "browser_token_fallback_local_storage_disabled",
-  "browser_token_fallback_age",
-  "negative_evidence_present",
-  "no_raw_secrets_stored",
-  "no_sensitive_evidence_values",
-  "operator",
-  "ticket"
-];
-const nonSessionCredentialRequiredChecks = [
-  "non_dry_run",
-  "not_template",
-  "status_final",
-  "release_identity",
-  "environment",
-  "operator",
-  "ticket",
-  "credentials_present",
-  "credential_types_supported",
-  "credential_owners_and_tickets",
-  "credential_status",
-  "credential_age",
-  "credential_redacted_identifiers",
-  "no_raw_credentials_archived",
-  "no_sensitive_evidence_values",
-  "old_credentials_rejected",
-  "new_credentials_accepted",
-  "credential_specific_evidence",
-  "break_glass_present",
-  "break_glass_status",
-  "break_glass_age",
-  "break_glass_controls",
-  "automation_not_claimed"
-];
+const observabilityRequiredChecks = [...requiredObservabilityEvidenceCheckNames];
+const operatorAccessRequiredChecks = [...requiredOperatorAccessEvidenceCheckNames];
+const nonSessionCredentialRequiredChecks = [...requiredNonSessionCredentialEvidenceCheckNames];
 const ingressRequiredChecks = [...requiredIngressEvidenceCheckNames];
-const upgradeRollbackRequiredChecks = [
-  "non_dry_run",
-  "not_template",
-  "status_final",
-  "no_sensitive_evidence_values",
-  "drill_time_order",
-  "target_environment",
-  "release_identity",
-  "version_pair",
-  "rollback_version",
-  "api_image_digests",
-  "worker_image_digests",
-  "service_rollback_digest",
-  "migration_versions",
-  "schema_rollback_compatibility",
-  "backup_evidence_passed",
-  "release_operations",
-  "route_upgrade",
-  "route_rollback_restores_previous_artifact",
-  "http_rollback_verification",
-  "readiness_evidence",
-  "metrics_evidence",
-  "logs_evidence",
-  "alert_evidence",
-  "operator",
-  "ticket"
-];
+const upgradeRollbackRequiredChecks = [...requiredUpgradeRollbackDrillEvidenceCheckNames];
 
 function passedBackupEvidence() {
   return {
@@ -726,6 +695,12 @@ function passedBackupEvidence() {
     status: "passed",
     checkedAt: "2026-06-08T11:30:00.000Z",
     exitCode: 0,
+    release: {
+      commitRef: "abc123def4567890",
+      repository: "acme/siteflow",
+      branch: "main",
+      targetEnvironment: "production"
+    },
     thresholds: {
       maxBackupAgeHours: 24,
       maxRestoreDrillAgeHours: 168,
@@ -741,14 +716,18 @@ function passedBackupEvidence() {
       },
       restoreDrill: {
         status: "restored",
-        completedAt: "2026-06-08T10:40:00.000Z",
-        restoreDrill: true
+        timestamp: "2026-06-08T10:40:00.000Z",
+        restoreDrill: true,
+        backupPath: "/tmp/siteflow-fetched-backups/siteflow-20260608"
       },
       backupOffload: {
         status: "offloaded",
-        completedAt: "2026-06-08T10:50:00.000Z",
+        timestamp: "2026-06-08T10:50:00.000Z",
         offHostLocation: "s3://siteflow-prod-backups/siteflow-20260608",
         provider: "s3",
+        treeSha256: "b".repeat(64),
+        objectCount: 4,
+        totalBytes: 512,
         encrypted: true,
         kmsKeyRef: backupKmsKeyRef,
         providerKmsProof: true,
@@ -759,15 +738,18 @@ function passedBackupEvidence() {
       },
       backupFetch: {
         status: "fetched",
-        completedAt: "2026-06-08T10:52:00.000Z",
+        timestamp: "2026-06-08T10:52:00.000Z",
         backupPath: "/tmp/siteflow-fetched-backups/siteflow-20260608",
         offHostLocation: "s3://siteflow-prod-backups/siteflow-20260608",
-        provider: "s3"
+        provider: "s3",
+        treeSha256: "b".repeat(64),
+        objectCount: 4,
+        totalBytes: 512
       },
       backupProviderSecurityAudit: backupProviderSecurityAuditEvidence(),
       backupPrune: {
         status: "completed",
-        completedAt: "2026-06-08T10:55:00.000Z",
+        timestamp: "2026-06-08T10:55:00.000Z",
         dryRun: false,
         retainedCurrentBackup: true
       }
@@ -864,16 +846,17 @@ function passedOperatorAccessEvidence() {
       commitRef: "abc123def4567890",
       repository: "acme/siteflow",
       branch: "main",
-      sessionCreate: { status: "passed" },
-      projectScope: { status: "passed" },
-      sessionRotation: { status: "passed" },
-      sessionRevoke: { status: "revoked" },
-      csrf: { status: "enforced" },
-      bearerPrecedence: { status: "passed" },
-      actorAttribution: { status: "passed" },
-      emergencyCutoff: { status: "passed" },
+      sessionCreate: { status: "passed", timestamp: "2026-06-08T11:01:00.000Z" },
+      projectScope: { status: "passed", timestamp: "2026-06-08T11:02:00.000Z" },
+      sessionRotation: { status: "passed", timestamp: "2026-06-08T11:03:00.000Z" },
+      sessionRevoke: { status: "revoked", timestamp: "2026-06-08T11:04:00.000Z" },
+      csrf: { status: "enforced", timestamp: "2026-06-08T11:05:00.000Z" },
+      bearerPrecedence: { status: "passed", timestamp: "2026-06-08T11:06:00.000Z" },
+      actorAttribution: { status: "passed", timestamp: "2026-06-08T11:07:00.000Z" },
+      emergencyCutoff: { status: "passed", timestamp: "2026-06-08T11:08:00.000Z" },
       browserTokenFallback: {
         status: "passed",
+        timestamp: "2026-06-08T11:09:00.000Z",
         productionFallbackEnabled: false,
         localStorageFallbackDisabled: true
       }
@@ -898,7 +881,7 @@ function passedNonSessionCredentialEvidence() {
       branch: "main",
       credentialTypes: ["scoped_api_token"],
       credentialCount: 1,
-      breakGlass: { status: "passed" }
+      breakGlass: { status: "passed", timestamp: "2026-06-08T11:10:00.000Z" }
     },
     checks: [
       passingCheck("evidence_shape"),
@@ -925,13 +908,14 @@ function passedIngressEvidence() {
         apiProcessCount: 2,
         ingressCount: 1
       },
-      directApiPort: { status: "blocked" },
-      forwardedHeaders: { status: "passed" },
+      directApiPort: { status: "blocked", timestamp: "2026-06-08T11:11:00.000Z" },
+      forwardedHeaders: { status: "passed", timestamp: "2026-06-08T11:12:00.000Z" },
       apiRateLimit: {
         status: "limited",
+        timestamp: "2026-06-08T11:13:00.000Z",
         edgeEnforced: true
       },
-      unthrottledRoutes: { status: "passed" }
+      unthrottledRoutes: { status: "passed", timestamp: "2026-06-08T11:14:00.000Z" }
     },
     checks: [
       passingCheck("evidence_shape"),
@@ -955,7 +939,12 @@ function passedUpgradeRollbackEvidence() {
       toVersion: "0.1.1",
       rollbackVersion: "0.1.0",
       upgradeOperationId: "op_upgrade_1",
-      rollbackOperationId: "op_rollback_1"
+      rollbackOperationId: "op_rollback_1",
+      backupEvidence: { status: "passed", timestamp: "2026-06-08T11:20:00.000Z" },
+      routeUpgrade: { status: "passed", timestamp: "2026-06-08T11:21:00.000Z" },
+      routeRollback: { status: "passed", timestamp: "2026-06-08T11:22:00.000Z" },
+      readiness: { status: "passed", timestamp: "2026-06-08T11:23:00.000Z" },
+      observability: { status: "passed", timestamp: "2026-06-08T11:24:00.000Z" }
     },
     checks: [
       passingCheck("evidence_shape"),
@@ -974,7 +963,7 @@ function evidenceAttachment(sourcePath: string, evidence: unknown) {
 }
 
 function passedReleaseEvidenceBundle(pack: ReturnType<typeof createReleaseEvidenceRehearsalPack>) {
-  return {
+  const bundle = {
     schemaVersion: "siteflow.releaseEvidence.v1",
     name: "siteflow-release-evidence-bundle",
     checkedAt: "2026-06-08T11:45:00.000Z",
@@ -1003,6 +992,10 @@ function passedReleaseEvidenceBundle(pack: ReturnType<typeof createReleaseEviden
     ingressEvidence: evidenceAttachment(pack.evidenceFiles.ingress, passedIngressEvidence()),
     upgradeRollbackEvidence: evidenceAttachment(pack.evidenceFiles.upgradeRollback, passedUpgradeRollbackEvidence())
   };
+
+  return bundleWithReleaseEvidenceAttestation(bundle, "2026-06-08T11:45:00.000Z", {
+    attestationSigningKey: releaseEvidenceAttestationSigningKey
+  });
 }
 
 function releaseEvidenceBundleResult(
@@ -1015,6 +1008,7 @@ function releaseEvidenceBundleResult(
     repo: pack.release.repository,
     branch: pack.release.branch,
     targetEnvironment: pack.release.targetEnvironment,
+    attestationSigningKey: releaseEvidenceAttestationSigningKey,
     now
   });
 }
@@ -1055,7 +1049,13 @@ describe("releaseEvidenceGapReport", () => {
 
       await writeJson(packPath, pack);
 
-      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const result = await createReleaseEvidenceGapReport({
+        packPath,
+        env: {
+          SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY: releaseEvidenceAttestationSigningKey
+        },
+        now
+      });
       const releaseGate = result.items.find((item) => item.id === "release_gate");
 
       expect(result.status).toBe("blocked");
@@ -1109,7 +1109,13 @@ describe("releaseEvidenceGapReport", () => {
         ]
       });
 
-      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const result = await createReleaseEvidenceGapReport({
+        packPath,
+        env: {
+          SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY: releaseEvidenceAttestationSigningKey
+        },
+        now
+      });
 
       expect(result.summary.manualRequired).toBe(1);
       expect(result.summary.blocked).toBe(1);
@@ -1167,6 +1173,72 @@ describe("releaseEvidenceGapReport", () => {
         failedChecks: expect.arrayContaining([
           expect.objectContaining({
             name: "release_gate_passed",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks passing gap evidence when the file still contains raw secret-like values", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-raw-secret-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const gate = passedReleaseGateEvidence() as Record<string, unknown>;
+
+      gate.rawSecret = "super-secret-value";
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.releaseGate, gate);
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const releaseGate = result.items.find((item) => item.id === "release_gate");
+      const serialized = JSON.stringify(result);
+
+      expect(result.status).toBe("blocked");
+      expect(releaseGate).toMatchObject({
+        status: "blocked",
+        message: expect.stringContaining("raw secret-like values"),
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "no_sensitive_evidence_values",
+            status: "fail"
+          })
+        ])
+      });
+      expect(serialized).not.toContain("super-secret-value");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks template gap evidence even when checker rows claim to pass", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-template-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const operatorAccess = passedOperatorAccessEvidence() as Record<string, unknown>;
+
+      operatorAccess.template = true;
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.operatorAccess, operatorAccess);
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const item = result.items.find((entry) => entry.id === "operator_access_evidence");
+
+      expect(result.status).toBe("blocked");
+      expect(item).toMatchObject({
+        status: "blocked",
+        message: expect.stringContaining("template"),
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "not_template",
             status: "fail"
           })
         ])
@@ -1314,6 +1386,39 @@ describe("releaseEvidenceGapReport", () => {
     }
   });
 
+  it("blocks release-gate evidence that omits worker socket posture", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-release-gate-worker-socket-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const gate = passedReleaseGateEvidence();
+      const runtimeEnv = gate.promotionEvidence.runtimeEnv as Record<string, unknown>;
+
+      delete runtimeEnv.workerUserStatus;
+      delete runtimeEnv.workerUser;
+      delete runtimeEnv.dockerSocketGidStatus;
+      delete runtimeEnv.dockerSocketGid;
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.releaseGate, gate);
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+
+      expect(result.items.find((item) => item.id === "release_gate")).toMatchObject({
+        status: "blocked",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "release_gate_worker_socket_posture",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("reports missing command input files and env prerequisites without changing output item counts", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-inputs-"));
 
@@ -1329,6 +1434,7 @@ describe("releaseEvidenceGapReport", () => {
         now
       });
       const releaseGate = result.items.find((item) => item.id === "release_gate");
+      const releaseArtifact = result.items.find((item) => item.id === "release_artifact_evidence");
       const backupEvidence = result.items.find((item) => item.id === "backup_evidence");
       const sourceProviderEvidence = result.items.find((item) => item.id === "source_provider_evidence");
       const observabilityEvidence = result.items.find((item) => item.id === "observability_evidence");
@@ -1353,6 +1459,16 @@ describe("releaseEvidenceGapReport", () => {
           })
         ])
       );
+      expect(releaseArtifact?.inputGaps).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "operator_input",
+            value: "candidate-deployment-detail-path",
+            status: "operator_required",
+            placeholder: "<candidate-deployment-detail-path>"
+          })
+        ])
+      );
       expect(backupEvidence?.inputGaps).toEqual(
         expect.arrayContaining([
           expect.objectContaining({ kind: "file", value: pack.evidenceFiles.backupVerify, status: "missing" }),
@@ -1372,19 +1488,109 @@ describe("releaseEvidenceGapReport", () => {
       );
       expect(sourceProviderEvidence?.inputGaps).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ kind: "file", value: pack.evidenceFiles.sourceProviderRaw, status: "missing" })
+          expect.objectContaining({ kind: "operator_input", value: "webhook-delivery-id", status: "operator_required" }),
+          expect.objectContaining({ kind: "operator_input", value: "deploy-key-path", status: "operator_required" }),
+          expect.objectContaining({ kind: "operator_input", value: "known-hosts-path", status: "operator_required" }),
+          expect.objectContaining({ kind: "env", value: "GITHUB_TOKEN", status: "missing" })
+        ])
+      );
+      expect(sourceProviderEvidence?.inputGaps).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ kind: "file", value: pack.evidenceFiles.sourceProviderRaw })
         ])
       );
       expect(observabilityEvidence?.inputGaps).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ kind: "file", value: pack.evidenceFiles.backupAutomationRun, status: "missing" })
+          expect.objectContaining({ kind: "file", value: pack.evidenceFiles.backupAutomationRun, status: "missing" }),
+          expect.objectContaining({ kind: "env", value: "SITEFLOW_OBSERVABILITY_STACK_TOKEN", status: "missing" })
         ])
       );
       expect(operatorAccess?.inputGaps).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ kind: "file", value: pack.evidenceFiles.operatorAccessRaw, status: "missing" })
+          expect.objectContaining({ kind: "operator_input", value: "operator-access-project-id", status: "operator_required" }),
+          expect.objectContaining({ kind: "operator_input", value: "operator-access-denied-project-id", status: "operator_required" }),
+          expect.objectContaining({ kind: "env", value: "SITEFLOW_API_TOKEN", status: "missing" }),
+          expect.objectContaining({ kind: "env", value: "SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN", status: "missing" })
         ])
       );
+      expect(operatorAccess?.inputGaps).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ kind: "file", value: pack.evidenceFiles.operatorAccessRaw })
+        ])
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports production target env files that violate the static contract without leaking values", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-target-env-contract-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const invalidTargetEnv = validTargetEnvFileContents()
+        .replace("SITEFLOW_DOCKER_SOCKET_GID=999", "SITEFLOW_DOCKER_SOCKET_GID=not-a-gid")
+        .replace("SITEFLOW_BUILD_NETWORK=none", "SITEFLOW_BUILD_NETWORK=bridge")
+        .replace("SITEFLOW_IMAGE=ghcr.io/siteflow/siteflow@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "SITEFLOW_IMAGE=ghcr.io/siteflow/siteflow:latest")
+        .replace("SITEFLOW_API_TOKEN_FILE=/etc/siteflow/secrets/api-token.secret", "SITEFLOW_API_TOKEN=super-api-token-do-not-leak")
+        .replace("DATABASE_URL=postgres://siteflow@postgres:5432/siteflow", "DATABASE_URL=postgres://siteflow:super-db-password-do-not-leak@postgres:5432/siteflow");
+
+      await writeJson(packPath, pack);
+      await writeFile(pack.release.targetEnvFile, invalidTargetEnv, "utf8");
+
+      const result = await createReleaseEvidenceGapReport({
+        packPath,
+        env: {
+          GITHUB_TOKEN: "present"
+        },
+        now
+      });
+      const releaseGate = result.items.find((item) => item.id === "release_gate");
+      const targetRuntime = result.items.find((item) => item.id === "target_runtime_evidence");
+
+      expect(releaseGate?.inputGaps).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "env",
+            value: "SITEFLOW_DOCKER_SOCKET_GID",
+            status: "mismatch",
+            source: "command_arg"
+          }),
+          expect.objectContaining({
+            kind: "env",
+            value: "SITEFLOW_IMAGE",
+            status: "mismatch",
+            source: "command_arg"
+          }),
+          expect.objectContaining({
+            kind: "env",
+            value: "SITEFLOW_BUILD_NETWORK",
+            status: "mismatch",
+            source: "command_arg"
+          }),
+          expect.objectContaining({
+            kind: "env",
+            value: "SITEFLOW_API_TOKEN",
+            status: "mismatch",
+            source: "command_arg"
+          })
+        ])
+      );
+      expect(targetRuntime?.inputGaps).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "env",
+            value: "SITEFLOW_DOCKER_SOCKET_GID",
+            status: "mismatch",
+            source: "command_arg"
+          })
+        ])
+      );
+      expect(JSON.stringify(result)).not.toContain("super-api-token-do-not-leak");
+      expect(JSON.stringify(result)).not.toContain("super-db-password-do-not-leak");
+      expect(JSON.stringify(result)).not.toContain("bridge");
+      expect(JSON.stringify(result)).not.toContain("latest");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1399,6 +1605,8 @@ describe("releaseEvidenceGapReport", () => {
       const pack = basePack(path.join(root, "evidence"));
       const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
       const replacements = {
+        "candidate-deployment-detail-path": path.join(root, "private", "deployment-detail.json"),
+        "release-image-digest": `sha256:${"a".repeat(64)}`,
         "release-image-run-id": "run-id-do-not-leak",
         "direct-api-url": "https://api.internal/do-not-leak/readyz",
         SITEFLOW_TRUST_PROXY: "proxy-policy-do-not-leak",
@@ -1416,9 +1624,21 @@ describe("releaseEvidenceGapReport", () => {
         env: {},
         now
       });
+      const unresolvedReleaseArtifact = unresolved.items.find((item) => item.id === "release_artifact_evidence");
       const unresolvedReleaseImage = unresolved.items.find((item) => item.id === "release_image_evidence");
       const unresolvedIngress = unresolved.items.find((item) => item.id === "ingress_evidence");
 
+      expect(unresolvedReleaseArtifact?.inputGaps).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "operator_input",
+            source: "command_arg",
+            status: "operator_required",
+            value: "candidate-deployment-detail-path",
+            placeholder: "<candidate-deployment-detail-path>"
+          })
+        ])
+      );
       expect(unresolvedReleaseImage?.inputGaps).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
@@ -1444,12 +1664,25 @@ describe("releaseEvidenceGapReport", () => {
         env: {},
         now
       });
+      const rehearsedReleaseArtifact = rehearsed.items.find((item) => item.id === "release_artifact_evidence");
       const rehearsedReleaseImage = rehearsed.items.find((item) => item.id === "release_image_evidence");
       const rehearsedIngress = rehearsed.items.find((item) => item.id === "ingress_evidence");
       const serialized = JSON.stringify(rehearsed);
 
+      expect(rehearsedReleaseArtifact?.inputGaps).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "file",
+            source: "command_arg",
+            status: "missing",
+            value: "candidate-deployment-detail-path",
+            placeholder: "<candidate-deployment-detail-path>"
+          })
+        ])
+      );
       expect(rehearsedReleaseImage?.inputGaps).not.toEqual(
         expect.arrayContaining([
+          expect.objectContaining({ source: "command_arg", value: "release-image-digest" }),
           expect.objectContaining({ source: "command_arg", value: "release-image-run-id" })
         ])
       );
@@ -1494,6 +1727,7 @@ describe("releaseEvidenceGapReport", () => {
       const pack = basePack(path.join(root, "evidence"));
       const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
       const envReplacements = {
+        "release-image-digest": "SITEFLOW_RELEASE_IMAGE_DIGEST",
         "release-image-run-id": "SITEFLOW_RELEASE_IMAGE_RUN_ID",
         "direct-api-url": "SITEFLOW_DIRECT_API_URL",
         SITEFLOW_TRUST_PROXY: "SITEFLOW_TRUST_PROXY",
@@ -1504,6 +1738,7 @@ describe("releaseEvidenceGapReport", () => {
         "api-rate-limit-enforcement-point": "SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT"
       };
       const envValues = {
+        SITEFLOW_RELEASE_IMAGE_DIGEST: `sha256:${"a".repeat(64)}`,
         SITEFLOW_RELEASE_IMAGE_RUN_ID: "run-id-do-not-leak",
         SITEFLOW_DIRECT_API_URL: "https://api.internal/do-not-leak/readyz",
         SITEFLOW_TRUST_PROXY: "proxy-policy-do-not-leak",
@@ -1531,6 +1766,7 @@ describe("releaseEvidenceGapReport", () => {
       );
       expect(releaseImage?.inputGaps).not.toEqual(
         expect.arrayContaining([
+          expect.objectContaining({ source: "command_arg", value: "release-image-digest" }),
           expect.objectContaining({ source: "command_arg", value: "release-image-run-id" })
         ])
       );
@@ -1713,6 +1949,173 @@ describe("releaseEvidenceGapReport", () => {
     }
   });
 
+  it("blocks target runtime evidence without selected target identity summary", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-target-runtime-identity-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const targetRuntime = passedTargetRuntimeEvidence();
+
+      delete (targetRuntime.selectedEvidence as Record<string, unknown>).targetIdentity;
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.targetRuntime, targetRuntime);
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const targetRuntimeItem = result.items.find((item) => item.id === "target_runtime_evidence");
+
+      expect(targetRuntimeItem).toMatchObject({
+        status: "blocked",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "target_runtime_selected_evidence",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks target runtime evidence without selected worker runtime posture summary", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-target-runtime-worker-posture-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const targetRuntime = passedTargetRuntimeEvidence();
+
+      delete (targetRuntime.selectedEvidence as Record<string, unknown>).workerRuntimePosture;
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.targetRuntime, targetRuntime);
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const targetRuntimeItem = result.items.find((item) => item.id === "target_runtime_evidence");
+
+      expect(targetRuntimeItem).toMatchObject({
+        status: "blocked",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "target_runtime_selected_evidence",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks source provider, backup, and upgrade evidence with shallow selected summaries", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-release-layer-summary-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const sourceProvider = passedSourceProviderEvidence();
+      const backup = passedBackupEvidence();
+      const upgradeRollback = passedUpgradeRollbackEvidence();
+
+      (sourceProvider.selectedEvidence as Record<string, unknown>).checkout = { status: "passed" };
+      (backup.selectedEvidence as Record<string, unknown>).backupOffload = { status: "offloaded" };
+      (upgradeRollback.selectedEvidence as Record<string, unknown>).routeRollback = { status: "passed" };
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.sourceProvider, sourceProvider);
+      await writeJson(pack.evidenceFiles.backup, backup);
+      await writeJson(pack.evidenceFiles.upgradeRollback, upgradeRollback);
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const sourceProviderItem = result.items.find((item) => item.id === "source_provider_evidence");
+      const backupItem = result.items.find((item) => item.id === "backup_evidence");
+      const upgradeRollbackItem = result.items.find((item) => item.id === "upgrade_rollback_evidence");
+
+      expect(sourceProviderItem).toMatchObject({
+        status: "blocked",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({ name: "source_provider_selected_evidence", status: "fail" })
+        ])
+      });
+      expect(backupItem).toMatchObject({
+        status: "blocked",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({ name: "backup_selected_evidence", status: "fail" })
+        ])
+      });
+      expect(upgradeRollbackItem).toMatchObject({
+        status: "blocked",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({ name: "upgrade_rollback_selected_evidence", status: "fail" })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks backup evidence when restore drill does not use the fetched off-host backup", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-backup-fetch-binding-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const backup = passedBackupEvidence();
+
+      (backup.selectedEvidence.restoreDrill as Record<string, unknown>).backupPath = "/tmp/siteflow-fetched-backups/other-backup";
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.backup, backup);
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const backupItem = result.items.find((item) => item.id === "backup_evidence");
+
+      expect(backupItem).toMatchObject({
+        status: "blocked",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "backup_selected_evidence",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks backup evidence when fetched backup integrity does not match offload integrity", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-backup-fetch-integrity-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const backup = passedBackupEvidence();
+
+      (backup.selectedEvidence.backupFetch as Record<string, unknown>).treeSha256 = "c".repeat(64);
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.backup, backup);
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const backupItem = result.items.find((item) => item.id === "backup_evidence");
+
+      expect(backupItem).toMatchObject({
+        status: "blocked",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "backup_selected_evidence",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("blocks target runtime evidence with blocked selected section summaries", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-target-runtime-blocked-summary-"));
 
@@ -1737,6 +2140,99 @@ describe("releaseEvidenceGapReport", () => {
         failedChecks: expect.arrayContaining([
           expect.objectContaining({
             name: "target_runtime_selected_evidence",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks operator access evidence with shallow selected section summaries", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-operator-summary-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const operatorAccess = passedOperatorAccessEvidence();
+
+      (operatorAccess.selectedEvidence as Record<string, unknown>).sessionCreate = { status: "passed" };
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.operatorAccess, operatorAccess);
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const item = result.items.find((entry) => entry.id === "operator_access_evidence");
+
+      expect(item).toMatchObject({
+        status: "blocked",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "operator_access_selected_evidence",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks non-session credential evidence with shallow break-glass summary", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-credential-summary-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const nonSessionCredential = passedNonSessionCredentialEvidence();
+
+      (nonSessionCredential.selectedEvidence as Record<string, unknown>).breakGlass = { status: "passed" };
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.nonSessionCredential, nonSessionCredential);
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const item = result.items.find((entry) => entry.id === "non_session_credential_evidence");
+
+      expect(item).toMatchObject({
+        status: "blocked",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "non_session_credential_selected_evidence",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks ingress evidence with failed selected section summaries", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-ingress-summary-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const ingress = passedIngressEvidence();
+
+      (ingress.selectedEvidence as Record<string, unknown>).forwardedHeaders = {
+        status: "failed",
+        timestamp: "2026-06-08T11:12:00.000Z"
+      };
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.ingress, ingress);
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const item = result.items.find((entry) => entry.id === "ingress_evidence");
+
+      expect(item).toMatchObject({
+        status: "blocked",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "ingress_selected_evidence",
             status: "fail"
           })
         ])
@@ -2449,6 +2945,151 @@ describe("releaseEvidenceGapReport", () => {
     }
   });
 
+  it("blocks final release evidence checks that add extra check rows", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-final-check-extra-rows-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const bundle = passedReleaseEvidenceBundle(pack);
+      const finalCheck = passedReleaseEvidenceCheck(pack, bundle);
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.releaseEvidence, bundle);
+      await writeJson(pack.evidenceFiles.releaseEvidenceCheck, {
+        ...finalCheck,
+        checks: [
+          ...finalCheck.checks,
+          passingCheck("unexpected_extra_check")
+        ]
+      });
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const finalCheckItem = result.items.find((item) => item.id === "release_evidence_check");
+
+      expect(finalCheckItem).toMatchObject({
+        status: "blocked",
+        message: "Evidence output is missing required production diagnostics.",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "final_release_evidence_check_rows_match_bundle",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks final release evidence checks that rewrite recomputed check messages", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-final-check-message-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const bundle = passedReleaseEvidenceBundle(pack);
+      const finalCheck = passedReleaseEvidenceCheck(pack, bundle);
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.releaseEvidence, bundle);
+      await writeJson(pack.evidenceFiles.releaseEvidenceCheck, {
+        ...finalCheck,
+        checks: [
+          {
+            ...finalCheck.checks[0],
+            message: "rewritten message"
+          },
+          ...finalCheck.checks.slice(1)
+        ]
+      });
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const finalCheckItem = result.items.find((item) => item.id === "release_evidence_check");
+
+      expect(finalCheckItem).toMatchObject({
+        status: "blocked",
+        message: "Evidence output is missing required production diagnostics.",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "final_release_evidence_check_rows_match_bundle",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks final release evidence checks with a stale payload digest", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-final-check-digest-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const bundle = passedReleaseEvidenceBundle(pack);
+      const finalCheck = {
+        ...passedReleaseEvidenceCheck(pack, bundle),
+        payloadDigest: `sha256:${"e".repeat(64)}`
+      };
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.releaseEvidence, bundle);
+      await writeJson(pack.evidenceFiles.releaseEvidenceCheck, finalCheck);
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const finalCheckItem = result.items.find((item) => item.id === "release_evidence_check");
+
+      expect(finalCheckItem).toMatchObject({
+        status: "blocked",
+        message: "Evidence output is missing required production diagnostics.",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "final_release_evidence_check_payload_digest",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks final release evidence checks created before the bundle checkedAt", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-final-check-time-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const bundle = passedReleaseEvidenceBundle(pack);
+      const finalCheck = {
+        ...passedReleaseEvidenceCheck(pack, bundle),
+        checkedAt: "2026-06-08T11:44:59.000Z"
+      };
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.releaseEvidence, bundle);
+      await writeJson(pack.evidenceFiles.releaseEvidenceCheck, finalCheck);
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const finalCheckItem = result.items.find((item) => item.id === "release_evidence_check");
+
+      expect(finalCheckItem).toMatchObject({
+        status: "blocked",
+        message: "Evidence output is missing required production diagnostics.",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "final_release_evidence_check_checked_at_after_bundle",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("blocks fake-passing final release evidence check outputs without checker shape", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-final-check-shape-"));
 
@@ -2538,6 +3179,40 @@ describe("releaseEvidenceGapReport", () => {
       expect(releaseArtifact).toMatchObject({
         status: "blocked",
         failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "release_artifact_function_runtime_isolation",
+            status: "fail",
+            message: expect.stringContaining("deployment artifact manifest")
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports standalone local artifact manifests as a release artifact evidence gap", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-local-artifact-manifest-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.releaseArtifact, standaloneLocalReleaseArtifactManifest());
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const releaseArtifact = result.items.find((item) => item.id === "release_artifact_evidence");
+
+      expect(releaseArtifact).toMatchObject({
+        status: "blocked",
+        message: "Evidence output is not passing.",
+        nextCommand: expect.stringContaining("release:artifact"),
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({ name: "release_artifact_name", status: "fail" }),
+          expect.objectContaining({ name: "release_artifact_passed", status: "fail" }),
+          expect.objectContaining({ name: "release_artifact_selected_evidence", status: "fail" }),
+          expect.objectContaining({ name: "release_artifact_manifest", status: "fail" }),
           expect.objectContaining({
             name: "release_artifact_function_runtime_isolation",
             status: "fail",
@@ -2654,6 +3329,73 @@ describe("releaseEvidenceGapReport", () => {
     }
   });
 
+  it("blocks backup evidence output from the wrong checker", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-backup-name-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.backup, {
+        ...passedBackupEvidence(),
+        name: "siteflow-backup-automation-run"
+      });
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const backupEvidence = result.items.find((item) => item.id === "backup_evidence");
+
+      expect(backupEvidence).toMatchObject({
+        status: "blocked",
+        message: "Evidence output is missing required production diagnostics.",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "backup_name",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks backup evidence bound to another target environment", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-backup-target-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.backup, {
+        ...passedBackupEvidence(),
+        release: {
+          commitRef: "abc123def4567890",
+          repository: "acme/siteflow",
+          branch: "main",
+          targetEnvironment: "staging"
+        }
+      });
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const backupEvidence = result.items.find((item) => item.id === "backup_evidence");
+
+      expect(backupEvidence).toMatchObject({
+        status: "blocked",
+        message: "Evidence output is missing required production diagnostics.",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "backup_target_environment",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("blocks generic-passing observability evidence without selected target diagnostics", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-observability-"));
 
@@ -2729,6 +3471,39 @@ describe("releaseEvidenceGapReport", () => {
     }
   });
 
+  it("blocks observability evidence missing exported non-dry-run required checks", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-observability-required-check-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const evidence = passedObservabilityEvidence();
+
+      evidence.checks = evidence.checks.filter((check) =>
+        check.name !== "observability_target_stack_proof_non_dry_run"
+      );
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.observability, evidence);
+
+      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const observability = result.items.find((item) => item.id === "observability_evidence");
+
+      expect(observability).toMatchObject({
+        status: "blocked",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "observability_required_checks",
+            status: "fail",
+            message: expect.stringContaining("observability_target_stack_proof_non_dry_run")
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("blocks generic-passing upgrade/rollback evidence without required drill diagnostics", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-upgrade-rollback-"));
 
@@ -2775,8 +3550,12 @@ describe("releaseEvidenceGapReport", () => {
     try {
       const pack = basePack(path.join(root, "evidence"));
       const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+      const signingKeyPath = path.join(root, "release-evidence-signing-key");
+      const signingKeyIdPath = path.join(root, "release-evidence-signing-key-id");
 
       await writeJson(packPath, pack);
+      await writeFile(signingKeyPath, `${releaseEvidenceAttestationSigningKey}\n`, "utf8");
+      await writeFile(signingKeyIdPath, `${releaseEvidenceBundleAttestationKeyId(releaseEvidenceAttestationSigningKey)}\n`, "utf8");
       await writeJson(pack.evidenceFiles.releaseGate, passedReleaseGateEvidence());
 
       for (const step of pack.steps.filter((entry) => entry.id !== "release_gate")) {
@@ -2813,7 +3592,14 @@ describe("releaseEvidenceGapReport", () => {
       await writeJson(pack.evidenceFiles.releaseEvidence, passedReleaseEvidenceBundle(pack));
       await writeJson(pack.evidenceFiles.releaseEvidenceCheck, passedReleaseEvidenceCheck(pack));
 
-      const result = await createReleaseEvidenceGapReport({ packPath, now });
+      const result = await createReleaseEvidenceGapReport({
+        packPath,
+        env: {
+          SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE: signingKeyPath,
+          SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID_FILE: signingKeyIdPath
+        },
+        now
+      });
 
       expect(result.status).toBe("passed");
       expect(result.exitCode).toBe(0);
@@ -2823,6 +3609,86 @@ describe("releaseEvidenceGapReport", () => {
         gaps: 0
       });
       expect(result.items.every((item) => item.status === "passed")).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses env attestation key id pinning for final bundle gap diagnostics", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-key-id-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.releaseEvidence, passedReleaseEvidenceBundle(pack));
+
+      const result = await createReleaseEvidenceGapReport({
+        packPath,
+        env: {
+          SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY: releaseEvidenceAttestationSigningKey,
+          SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID: "sha256:0000000000000000"
+        },
+        now
+      });
+      const finalBundle = result.items.find((item) => item.id === "release_evidence_bundle");
+
+      expect(finalBundle).toMatchObject({
+        status: "blocked",
+        message: "Release evidence bundle does not pass final bundle checks.",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "bundle_attestation_signature",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks final bundle and check diagnostics when signing key is configured without required key id pinning", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gaps-missing-key-id-"));
+
+    try {
+      const pack = basePack(path.join(root, "evidence"));
+      const packPath = path.join(pack.outputDir, "release-evidence-rehearsal-pack.json");
+
+      await writeJson(packPath, pack);
+      await writeJson(pack.evidenceFiles.releaseEvidence, passedReleaseEvidenceBundle(pack));
+      await writeJson(pack.evidenceFiles.releaseEvidenceCheck, passedReleaseEvidenceCheck(pack));
+
+      const result = await createReleaseEvidenceGapReport({
+        packPath,
+        env: {
+          SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY: releaseEvidenceAttestationSigningKey
+        },
+        now
+      });
+      const finalBundle = result.items.find((item) => item.id === "release_evidence_bundle");
+      const finalCheck = result.items.find((item) => item.id === "release_evidence_check");
+
+      expect(result.status).toBe("blocked");
+      expect(finalBundle).toMatchObject({
+        status: "blocked",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "release_evidence_required_attestation_key_id",
+            status: "fail"
+          })
+        ])
+      });
+      expect(finalCheck).toMatchObject({
+        status: "blocked",
+        failedChecks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "final_release_evidence_required_attestation_key_id",
+            status: "fail"
+          })
+        ])
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

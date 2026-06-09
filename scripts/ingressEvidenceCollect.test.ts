@@ -75,6 +75,15 @@ function operatorIngressEvidence() {
     apiRateLimit: {
       edgeEnforced: true,
       enforcementPoint: "ingress"
+    },
+    metricsAccessControl: {
+      status: "passed",
+      checkedAt: "2026-06-08T12:00:00.000Z",
+      privateScrapeException: true,
+      scrapePath: "/metrics",
+      protection: "reverse_proxy_allowlist",
+      publicAccessBlocked: true,
+      evidenceLocation: "CHG-123#metrics-private-scrape"
     }
   };
 }
@@ -236,6 +245,11 @@ describe("ingressEvidenceCollect", () => {
         apiRateLimit: {
           edgeEnforced: true,
           enforcementPoint: "ingress"
+        },
+        metricsAccessControl: {
+          privateScrapeException: true,
+          protection: "reverse_proxy_allowlist",
+          publicAccessBlocked: true
         }
       });
     } finally {

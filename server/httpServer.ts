@@ -19,6 +19,7 @@ import {
 import { assertReleaseChannel, SiteFlowNotFoundError, type ArtifactRoute, type LogDrainDeliveryPlan, type SiteFlowAuthPrincipal, type SiteFlowReadRepository } from "./readRepository.js";
 import {
   evaluateReleaseEvidenceBundle,
+  releaseEvidenceBundleAttestationSignatureVerified,
   type ReleaseEvidenceBundleCheckOptions,
   type ReleaseEvidenceBundleResult
 } from "../scripts/releaseEvidenceBundleCheck.js";
@@ -51,6 +52,8 @@ export interface SiteFlowServerOptions {
   secureCookies?: boolean;
   trustProxy?: SiteFlowTrustedProxyPolicy;
   releaseEvidenceEvaluator?: ReleaseEvidenceEvaluator;
+  releaseEvidenceAttestationSigningKey?: string;
+  releaseEvidenceRequiredAttestationKeyId?: string;
   productionRuntime?: boolean;
   allowSameProcessFunctionRuntime?: boolean;
 }
@@ -90,6 +93,11 @@ export interface SiteFlowRuntimeMetrics {
   staleBuildJobs?: number;
   oldestQueuedBuildAgeSeconds?: number;
   oldestRunningBuildHeartbeatAgeSeconds?: number;
+  storageArtifactFreeBytes?: number;
+  storageEvidenceFreeBytes?: number;
+  storageTempFreeBytes?: number;
+  storageMissingPaths?: number;
+  storageMetricsCollectionError?: number;
   backupAutomationLastSuccessAgeSeconds?: number;
   backupRestoreDrillLastSuccessAgeSeconds?: number;
   backupOffloadLastSuccessAgeSeconds?: number;
@@ -311,6 +319,10 @@ function metricAgeSeconds(value: number | undefined) {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : -1;
 }
 
+function metricBytes(value: number | undefined) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : -1;
+}
+
 function metricFlag(value: number | boolean | undefined) {
   if (typeof value === "boolean") {
     return value ? 1 : 0;
@@ -359,6 +371,16 @@ function renderRuntimeMetrics(metrics: SiteFlowRuntimeMetrics, collectionError: 
     `siteflow_build_job_oldest_running_heartbeat_age_seconds ${metricNumber(metrics.oldestRunningBuildHeartbeatAgeSeconds)}`,
     prometheusTypeLine("siteflow_runtime_metrics_collection_error"),
     `siteflow_runtime_metrics_collection_error ${collectionError ? 1 : 0}`,
+    prometheusTypeLine("siteflow_storage_artifact_free_bytes"),
+    `siteflow_storage_artifact_free_bytes ${metricBytes(metrics.storageArtifactFreeBytes)}`,
+    prometheusTypeLine("siteflow_storage_evidence_free_bytes"),
+    `siteflow_storage_evidence_free_bytes ${metricBytes(metrics.storageEvidenceFreeBytes)}`,
+    prometheusTypeLine("siteflow_storage_temp_free_bytes"),
+    `siteflow_storage_temp_free_bytes ${metricBytes(metrics.storageTempFreeBytes)}`,
+    prometheusTypeLine("siteflow_storage_missing_paths"),
+    `siteflow_storage_missing_paths ${metricNumber(metrics.storageMissingPaths)}`,
+    prometheusTypeLine("siteflow_storage_metrics_collection_error"),
+    `siteflow_storage_metrics_collection_error ${collectionError ? 1 : metricFlag(metrics.storageMetricsCollectionError)}`,
     prometheusTypeLine("siteflow_backup_automation_last_success_age_seconds"),
     `siteflow_backup_automation_last_success_age_seconds ${metricAgeSeconds(metrics.backupAutomationLastSuccessAgeSeconds)}`,
     prometheusTypeLine("siteflow_backup_restore_drill_last_success_age_seconds"),
@@ -1122,14 +1144,20 @@ function releaseEvidenceMetadataFromBundle(
   const commitRef = evidenceString(check.selectedEvidence.releaseCommitRef);
   const repository = evidenceString(check.selectedEvidence.repository);
   const branch = evidenceString(check.selectedEvidence.branch);
+  const payloadDigest = evidenceString(check.payloadDigest);
 
   if (!commitRef || !repository || !branch) {
     throw new SyntaxError("Production release evidence bundle must include repository, branch, and commitRef.");
   }
 
+  if (!payloadDigest) {
+    throw new SyntaxError("Production release evidence bundle check must include payloadDigest.");
+  }
+
   return {
     evidencePath,
     checkedAt: check.checkedAt,
+    payloadDigest,
     status: "passed" as const,
     commitRef,
     repository,
@@ -1155,9 +1183,24 @@ function requireProductionReleaseEvidence(
   }
 
   const { bundle, evidencePath } = releaseEvidencePayload(body.releaseEvidence);
+
+  if (!options.releaseEvidenceAttestationSigningKey) {
+    throw new SyntaxError("Production release evidence bundle verification requires SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY.");
+  }
+
+  if (!releaseEvidenceBundleAttestationSignatureVerified(
+    bundle,
+    options.releaseEvidenceAttestationSigningKey,
+    options.releaseEvidenceRequiredAttestationKeyId
+  )) {
+    throw new SyntaxError("Production release evidence bundle must include compose-generated attestation metadata with a valid signature.");
+  }
+
   const check = (options.releaseEvidenceEvaluator ?? evaluateReleaseEvidenceBundle)(bundle, {
     evidencePath,
-    targetEnvironment: "production"
+    targetEnvironment: "production",
+    attestationSigningKey: options.releaseEvidenceAttestationSigningKey,
+    requiredAttestationKeyId: options.releaseEvidenceRequiredAttestationKeyId
   });
 
   if (check.status !== "passed") {

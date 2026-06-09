@@ -167,6 +167,13 @@ export function createIngressOperatorEvidenceTemplate(options: IngressOperatorEv
       enforcementPoint: null,
       evidenceLocation: null
     }),
+    metricsAccessControl: todoSection(checkedAt, "If metrics are intentionally unauthenticated for private scraping, prove /metrics is not publicly accessible without the trusted private scrape path.", {
+      privateScrapeException: null,
+      scrapePath: "/metrics",
+      protection: null,
+      publicAccessBlocked: null,
+      evidenceLocation: null
+    }),
     operator: todoSection(checkedAt, "Record the operator and ticket that own the target ingress proof.", {
       name: operatorName,
       ticketId,

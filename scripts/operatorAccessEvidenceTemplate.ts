@@ -119,6 +119,15 @@ export function createOperatorAccessEvidenceTemplate(options: OperatorAccessEvid
       repository: requiredValue(options.repo, "--repo"),
       branch: requiredValue(options.branch, "--branch")
     },
+    target: {
+      environment: requiredValue(options.targetEnvironment, "--target-environment"),
+      publicBaseUrl,
+      release: {
+        commitRef: requiredValue(options.commitRef, "--commit-ref"),
+        repository: requiredValue(options.repo, "--repo"),
+        branch: requiredValue(options.branch, "--branch")
+      }
+    },
     instructions: [
       "Replace every todo/null field with observations from the target or target-equivalent operator access run.",
       "Set dryRun=false and status=passed only after every section reflects real non-dry-run evidence.",

@@ -97,6 +97,69 @@ function releaseEvidenceSelectedEvidenceFailure(check: Record<string, unknown>) 
   return undefined;
 }
 
+function releaseEvidenceBundleIdentity(bundle: Record<string, unknown>) {
+  const release = isRecord(bundle.release) ? bundle.release : undefined;
+
+  return {
+    commitRef: stringValue(release?.commitRef) ?? stringValue(release?.commitSha) ?? stringValue(bundle.commitRef) ?? stringValue(bundle.commitSha),
+    repository: stringValue(release?.repository) ?? stringValue(bundle.repository),
+    branch: stringValue(release?.branch) ?? stringValue(bundle.branch),
+    targetEnvironment: releaseEvidenceTargetEnvironment(bundle),
+    channel: stringValue(release?.channel) ?? stringValue(bundle.channel) ?? stringValue(bundle.releaseChannel),
+    deploymentId:
+      stringValue(release?.deploymentId) ??
+      stringValue(release?.targetDeploymentId) ??
+      stringValue(bundle.deploymentId) ??
+      stringValue(bundle.targetDeploymentId)
+  };
+}
+
+function releaseEvidenceSelectedIdentity(selectedEvidence: Record<string, unknown>) {
+  return {
+    commitRef: stringValue(selectedEvidence.releaseCommitRef) ?? stringValue(selectedEvidence.commitRef) ?? stringValue(selectedEvidence.commitSha),
+    repository: stringValue(selectedEvidence.repository),
+    branch: stringValue(selectedEvidence.branch),
+    targetEnvironment: stringValue(selectedEvidence.targetEnvironment) ?? stringValue(selectedEvidence.environment),
+    channel: stringValue(selectedEvidence.channel) ?? stringValue(selectedEvidence.releaseChannel),
+    deploymentId:
+      stringValue(selectedEvidence.deploymentId) ??
+      stringValue(selectedEvidence.targetDeploymentId) ??
+      stringValue(selectedEvidence.releaseDeploymentId)
+  };
+}
+
+function releaseEvidenceIdentityFailure(bundle: Record<string, unknown>, check: Record<string, unknown> | undefined) {
+  const selectedEvidence = isRecord(check?.selectedEvidence) ? check.selectedEvidence : undefined;
+
+  if (!selectedEvidence) {
+    return undefined;
+  }
+
+  const bundleIdentity = releaseEvidenceBundleIdentity(bundle);
+  const selectedIdentity = releaseEvidenceSelectedIdentity(selectedEvidence);
+
+  if (!bundleIdentity.commitRef || !bundleIdentity.repository || !bundleIdentity.branch) {
+    return "Release evidence bundle must include release commit, repository, and branch.";
+  }
+
+  const mismatches = [
+    bundleIdentity.commitRef !== selectedIdentity.commitRef ? "release commit" : undefined,
+    bundleIdentity.repository !== selectedIdentity.repository ? "repository" : undefined,
+    bundleIdentity.branch !== selectedIdentity.branch ? "branch" : undefined,
+    selectedIdentity.targetEnvironment && bundleIdentity.targetEnvironment !== selectedIdentity.targetEnvironment ? "target environment" : undefined,
+    bundleIdentity.channel && selectedIdentity.channel && bundleIdentity.channel !== selectedIdentity.channel ? "channel" : undefined,
+    bundleIdentity.deploymentId && selectedIdentity.deploymentId && bundleIdentity.deploymentId !== selectedIdentity.deploymentId
+      ? "deployment"
+      : undefined
+  ].filter((field): field is string => Boolean(field));
+
+  if (mismatches.length > 0) {
+    return `Release evidence checker selected evidence must match bundle ${mismatches.join(", ")}.`;
+  }
+
+  return undefined;
+}
+
 function releaseEvidenceCheckFailure(check: Record<string, unknown> | undefined) {
   if (!check) {
     return "Release evidence requires a passing release:evidence checker result.";
@@ -165,6 +228,12 @@ export function parseReleaseEvidence(value: string): ParsedReleaseEvidence {
 
     if (checkFailure) {
       return { status: "invalid", message: checkFailure };
+    }
+
+    const identityFailure = releaseEvidenceIdentityFailure(bundle, check);
+
+    if (identityFailure) {
+      return { status: "invalid", message: identityFailure };
     }
 
     return {

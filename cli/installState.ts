@@ -60,6 +60,7 @@ export interface InstallState {
   secrets: {
     apiTokenRef: string;
     metricsTokenRef: string;
+    releaseEvidenceSigningKeyRef?: string;
     postgresPasswordRef: string;
     appSecretRef: string;
     workerTokenRef: string;
@@ -152,6 +153,7 @@ export function createInitialInstallState(input: CreateInstallStateInput): Insta
     secrets: {
       apiTokenRef: `${paths.configDir}/secrets/api-token.secret`,
       metricsTokenRef: `${paths.configDir}/secrets/metrics-token.secret`,
+      releaseEvidenceSigningKeyRef: `${paths.configDir}/secrets/release-evidence-signing-key.secret`,
       postgresPasswordRef: `${paths.configDir}/secrets/postgres-password.secret`,
       appSecretRef: `${paths.configDir}/secrets/app-secret.secret`,
       workerTokenRef: `${paths.configDir}/secrets/worker-token.secret`,

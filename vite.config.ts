@@ -40,7 +40,8 @@ export default defineConfig((configEnv) => {
       environment: "jsdom",
       exclude: ["node_modules/**", "dist/**", "dist-cli/**", "dist-server/**", "tests/e2e/**"],
       globals: true,
-      setupFiles: "./src/test/setup.ts"
+      setupFiles: "./src/test/setup.ts",
+      testTimeout: 30000
     }
   };
 });

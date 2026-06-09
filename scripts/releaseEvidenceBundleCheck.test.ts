@@ -2,11 +2,15 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
+  releaseEvidenceBundleAttestationKeyId,
+  bundleWithReleaseEvidenceAttestation,
   evaluateReleaseEvidenceBundle,
+  releaseEvidenceBundlePayloadDigest,
   runReleaseEvidenceBundleCheckCli
 } from "./releaseEvidenceBundleCheck";
 import { requiredOffHostBackupEvidenceCheckNames } from "./backupEvidenceCheck";
 import { requiredReleaseArtifactCheckNames } from "./releaseArtifactContracts";
+import { requiredObservabilityEvidenceCheckNames } from "./observabilityEvidenceCheck";
 import { requiredSourceProviderEvidenceCheckNames } from "./sourceProviderEvidenceCheck";
 import { requiredTargetRuntimeEvidenceCheckNames } from "./releaseTargetRuntimeEvidenceCheck";
 
@@ -15,6 +19,8 @@ const commitRef = "abc123def456";
 const repository = "acme/siteflow";
 const branch = "main";
 const requiredStatusCheck = "Install, test, and build";
+const attestationSigningKey = "release-evidence-test-signing-key-with-enough-entropy";
+const attestationSigningKeyId = releaseEvidenceBundleAttestationKeyId(attestationSigningKey);
 const pinnedBuildImage = "registry.local/siteflow/build-node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const backupKmsKeyRef = "arn:aws:kms:us-east-1:111122223333:key/siteflow-prod-backups";
 const postgresRehearsalScopes = [
@@ -93,6 +99,13 @@ function validReleaseGateEvidence() {
   return {
     status: "pass",
     checkedAt: "2026-06-07T10:09:00.000Z",
+    checks: [
+      passingCheck("local.gitStatus"),
+      passingCheck("local.requiredEnv"),
+      passingCheck("external.githubBranchProtection"),
+      passingCheck("external.githubProtectedBranchCommit"),
+      passingCheck("external.githubCommitStatus")
+    ],
     promotionEvidence: {
       gateStatus: "pass",
       checkedAt: "2026-06-07T10:09:00.000Z",
@@ -165,7 +178,11 @@ function validReleaseGateEvidence() {
         gitTimeoutStatus: "pass",
         gitTimeoutMs: 300000,
         buildNetworkStatus: "pass",
-        buildNetwork: "none"
+        buildNetwork: "none",
+        workerUserStatus: "pass",
+        workerUser: "1000:1000",
+        dockerSocketGidStatus: "pass",
+        dockerSocketGid: 998
       },
       dirtyWorktree: {
         status: "pass",
@@ -349,6 +366,10 @@ function validArtifactEvidence() {
   };
 }
 
+function standaloneLocalReleaseArtifactManifest() {
+  return { ...validArtifactEvidence().manifest };
+}
+
 function sameProcessFunctionArtifactEvidence() {
   const evidence = validArtifactEvidence() as ReturnType<typeof validArtifactEvidence> & Record<string, unknown>;
   const artifactManifest = evidence.artifactManifest as Record<string, unknown>;
@@ -413,13 +434,49 @@ function validReleaseImageEvidence() {
         requested: true,
         present: true,
         predicateType: "https://slsa.dev/provenance/v1",
-        manifestDigest: `sha256:${"e".repeat(64)}`
+        manifestDigest: `sha256:${"e".repeat(64)}`,
+        statementDigest: `sha256:${"c".repeat(64)}`,
+        subjectDigest: `sha256:${"f".repeat(64)}`,
+        subjects: [
+          {
+            name: "ghcr.io/siteflow/siteflow",
+            digest: {
+              sha256: `${"f".repeat(64)}`
+            }
+          }
+        ],
+        source: {
+          repository,
+          commitRef,
+          refName: "v0.1.0"
+        },
+        builder: {
+          id: "https://github.com/docker/buildx/actions/runs/123456789/attempts/1"
+        },
+        materials: [
+          {
+            uri: "git+https://github.com/acme/siteflow.git#refs/tags/v0.1.0",
+            digest: {
+              gitCommit: commitRef
+            }
+          }
+        ]
       },
       sbom: {
         requested: true,
         present: true,
         predicateType: "https://spdx.dev/Document",
-        manifestDigest: `sha256:${"d".repeat(64)}`
+        manifestDigest: `sha256:${"d".repeat(64)}`,
+        statementDigest: `sha256:${"b".repeat(64)}`,
+        subjectDigest: `sha256:${"f".repeat(64)}`,
+        subjects: [
+          {
+            name: "ghcr.io/siteflow/siteflow",
+            digest: {
+              sha256: `${"f".repeat(64)}`
+            }
+          }
+        ]
       }
     },
     checkedAt: "2026-06-07T10:19:45.000Z"
@@ -441,7 +498,36 @@ function validSourceProviderEvidence() {
       branch,
       provider: "github",
       webhookDeliveryId: "delivery-123",
-      deployKeyMode: "not_required"
+      deployKeyMode: "not_required",
+      checkout: {
+        status: "passed",
+        timestamp: "2026-06-07T10:16:00.000Z",
+        commitRef,
+        headSha: commitRef,
+        exactCommitVerified: true
+      },
+      signedWebhook: {
+        status: "passed",
+        timestamp: "2026-06-07T10:17:00.000Z",
+        deliveryId: "delivery-123",
+        event: "push",
+        signatureVerified: true
+      },
+      deployKey: {
+        status: "not_required",
+        timestamp: "2026-06-07T10:18:00.000Z"
+      },
+      hostKey: {
+        status: "not_required",
+        timestamp: "2026-06-07T10:18:30.000Z"
+      },
+      releaseProvenance: {
+        status: "passed",
+        timestamp: "2026-06-07T10:19:00.000Z",
+        commitRef,
+        repository,
+        branch
+      }
     },
     checks: [
       passingCheck("evidence_shape"),
@@ -468,9 +554,28 @@ function validTargetRuntimeEvidence() {
       commitRef,
       repository,
       branch,
+      targetIdentity: {
+        status: "passed",
+        timestamp: "2026-06-07T10:20:50.000Z",
+        hostname: "siteflow-prod-01",
+        dockerContext: "siteflow-prod",
+        composeProject: "siteflow-prod"
+      },
       composeConfig: {
         status: "passed",
         timestamp: "2026-06-07T10:21:00.000Z"
+      },
+      workerRuntimePosture: {
+        status: "passed",
+        timestamp: "2026-06-07T10:21:00.000Z",
+        dockerSocketMounted: true,
+        groupAddConfigured: true,
+        buildRunnerDocker: true,
+        buildNetworkNone: true,
+        dockerCliPreflightPresent: true,
+        dockerInfoPreflightPresent: true,
+        gitSshKeyPathEnvPresent: true,
+        gitKnownHostsPathEnvPresent: true
       },
       startup: {
         status: "passed",
@@ -519,6 +624,12 @@ function validBackupEvidence() {
     name: "siteflow-backup-evidence-check",
     status: "passed",
     checkedAt: "2026-06-07T10:30:00.000Z",
+    release: {
+      commitRef,
+      repository,
+      branch,
+      targetEnvironment: "production"
+    },
     thresholds: {
       maxBackupAgeHours: 24,
       maxRestoreDrillAgeHours: 168,
@@ -688,76 +799,7 @@ function validObservabilityEvidence() {
         timestamp: "2026-06-07T10:49:00.000Z"
       }
     },
-    checks: [
-      passingCheck("release_identity"),
-      passingCheck("target_environment"),
-      passingCheck("readiness_present"),
-      passingCheck("readiness_status"),
-      passingCheck("readiness_age"),
-      passingCheck("readiness_status_codes"),
-      passingCheck("readiness_traffic_removed"),
-      passingCheck("metrics_present"),
-      passingCheck("metrics_status"),
-      passingCheck("metrics_age"),
-      passingCheck("metrics_access_control"),
-      passingCheck("metrics_expected_names"),
-      passingCheck("backup_automation_run_present"),
-      passingCheck("backup_automation_run_identity"),
-      passingCheck("backup_automation_run_status"),
-      passingCheck("backup_automation_run_age"),
-      passingCheck("backup_automation_run_steps"),
-      passingCheck("backup_automation_checker_output"),
-      passingCheck("backup_automation_history_present"),
-      passingCheck("backup_automation_history_identity"),
-      passingCheck("backup_automation_history_latest_run"),
-      passingCheck("backup_automation_history_latest_status"),
-      passingCheck("backup_restore_drill_cadence_count"),
-      passingCheck("backup_restore_drill_cadence_gap"),
-      passingCheck("backup_history_checker_output"),
-      passingCheck("backup_scheduler_ownership_present"),
-      passingCheck("backup_scheduler_ownership_status"),
-      passingCheck("backup_scheduler_ownership_age"),
-      passingCheck("backup_scheduler_ownership_schema"),
-      passingCheck("backup_scheduler_ownership_source"),
-      passingCheck("backup_scheduler_ownership_target_environment"),
-      passingCheck("backup_scheduler_ownership_enabled"),
-      passingCheck("backup_scheduler_ownership_schedule"),
-      passingCheck("backup_scheduler_ownership_command"),
-      passingCheck("backup_scheduler_ownership_run_links"),
-      passingCheck("backup_scheduler_ownership_owner"),
-      passingCheck("observability_apply_proof_present"),
-      passingCheck("observability_apply_proof_status"),
-      passingCheck("observability_apply_proof_age"),
-      passingCheck("observability_apply_proof_schema"),
-      passingCheck("observability_apply_proof_source"),
-      passingCheck("observability_apply_proof_plan_schema"),
-      passingCheck("observability_apply_proof_assets"),
-      passingCheck("observability_target_stack_proof_present"),
-      passingCheck("observability_target_stack_proof_status"),
-      passingCheck("observability_target_stack_proof_age"),
-      passingCheck("observability_target_stack_proof_schema"),
-      passingCheck("observability_target_stack_proof_source"),
-      passingCheck("observability_target_stack_proof_release_identity"),
-      passingCheck("observability_target_stack_proof_target_environment"),
-      passingCheck("observability_target_stack_prometheus_rules"),
-      passingCheck("observability_target_stack_grafana_dashboard"),
-      passingCheck("observability_target_stack_alertmanager_receiver"),
-      passingCheck("alert_present"),
-      passingCheck("alert_status"),
-      passingCheck("alert_age"),
-      passingCheck("alert_delivered"),
-      passingCheck("dashboard_present"),
-      passingCheck("dashboard_status"),
-      passingCheck("dashboard_age"),
-      passingCheck("dashboard_reference"),
-      passingCheck("dashboard_owner"),
-      passingCheck("log_pipeline_present"),
-      passingCheck("log_pipeline_status"),
-      passingCheck("log_pipeline_age"),
-      passingCheck("log_retention"),
-      passingCheck("log_redaction_spot_check"),
-      passingCheck("no_sensitive_evidence_values")
-    ],
+    checks: requiredObservabilityEvidenceCheckNames.map(passingCheck),
     exitCode: 0
   };
 }
@@ -825,6 +867,7 @@ function validOperatorAccessEvidence() {
       passingCheck("status_final"),
       passingCheck("evidence_age"),
       passingCheck("release_identity"),
+      passingCheck("target_facts"),
       passingCheck("environment"),
       passingCheck("public_base_url"),
       passingCheck("session_create_present"),
@@ -897,6 +940,7 @@ function validNonSessionCredentialEvidence() {
       credentialCount: 1,
       breakGlass: {
         status: "passed",
+        timestamp: "2026-06-07T10:59:00.000Z",
         ticket: "INC-123"
       }
     },
@@ -910,6 +954,7 @@ function validNonSessionCredentialEvidence() {
       passingCheck("status_final"),
       passingCheck("evidence_age"),
       passingCheck("release_identity"),
+      passingCheck("target_facts"),
       passingCheck("environment"),
       passingCheck("operator"),
       passingCheck("ticket"),
@@ -951,7 +996,27 @@ function validUpgradeRollbackEvidence() {
       toVersion: "0.1.1",
       rollbackVersion: "0.1.0",
       upgradeOperationId: "op_upgrade_1",
-      rollbackOperationId: "op_rollback_1"
+      rollbackOperationId: "op_rollback_1",
+      backupEvidence: {
+        status: "passed",
+        timestamp: "2026-06-07T10:30:00.000Z"
+      },
+      routeUpgrade: {
+        status: "passed",
+        timestamp: "2026-06-07T10:40:00.000Z"
+      },
+      routeRollback: {
+        status: "passed",
+        timestamp: "2026-06-07T10:50:00.000Z"
+      },
+      readiness: {
+        status: "passed",
+        timestamp: "2026-06-07T10:55:00.000Z"
+      },
+      observability: {
+        status: "passed",
+        timestamp: "2026-06-07T11:00:00.000Z"
+      }
     },
     checks: [
       passingCheck("evidence_shape"),
@@ -968,6 +1033,7 @@ function validUpgradeRollbackEvidence() {
       passingCheck("version_pair"),
       passingCheck("rollback_version"),
       passingCheck("release_identity"),
+      passingCheck("target_facts"),
       passingCheck("api_image_digests"),
       passingCheck("worker_image_digests"),
       passingCheck("service_rollback_digest"),
@@ -1037,6 +1103,7 @@ function validIngressEvidence() {
       passingCheck("status_final"),
       passingCheck("evidence_age"),
       passingCheck("release_identity"),
+      passingCheck("target_facts"),
       passingCheck("environment"),
       passingCheck("no_sensitive_evidence_values"),
       passingCheck("public_base_url"),
@@ -1067,7 +1134,7 @@ function validIngressEvidence() {
 }
 
 function validEvidence(overrides: Record<string, unknown> = {}) {
-  return {
+  const bundle = {
     schemaVersion: "siteflow.releaseEvidence.v1",
     name: "siteflow-release-evidence-bundle",
     checkedAt: "2026-06-07T11:30:00.000Z",
@@ -1077,6 +1144,7 @@ function validEvidence(overrides: Record<string, unknown> = {}) {
       repository,
       branch,
       requiredStatusCheck,
+      targetEnvironment: "production",
       operatorName: "release-operator",
       releaseTicket: "REL-2026-0607",
       dockerSocketProfileAccepted: true
@@ -1161,21 +1229,45 @@ function validEvidence(overrides: Record<string, unknown> = {}) {
     },
     ...overrides
   };
+
+  return bundleWithReleaseEvidenceAttestation(bundle, "2026-06-07T11:30:00.000Z", {
+    attestationSigningKey
+  });
+}
+
+function reattestEvidence(evidence: Record<string, unknown>) {
+  evidence.attestation = bundleWithReleaseEvidenceAttestation(evidence, "2026-06-07T11:30:00.000Z", {
+    attestationSigningKey
+  }).attestation;
+
+  return evidence;
 }
 
 describe("releaseEvidenceBundleCheck", () => {
   it("passes when all release evidence is complete and consistent", () => {
-    const result = evaluateReleaseEvidenceBundle(validEvidence(), {
+    const evidence = validEvidence();
+    const result = evaluateReleaseEvidenceBundle(evidence, {
       evidencePath: "release-evidence.json",
       now,
       commitRef,
       repo: repository,
-      branch
+      branch,
+      attestationSigningKey
     });
 
     expect(result.status).toBe("passed");
     expect(result.exitCode).toBe(0);
+    expect(result.payloadDigest).toBe(releaseEvidenceBundlePayloadDigest(evidence));
     expect(result.checks.every((check) => check.status === "pass")).toBe(true);
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "bundle_attestation_signature",
+      status: "pass"
+    }));
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "release_metadata",
+      status: "pass"
+    }));
+    expect((validEvidence().attestation as Record<string, unknown>).signatureKeyId).toBe(attestationSigningKeyId);
     expect(result.selectedEvidence).toMatchObject({
       releaseCommitRef: commitRef,
       repository,
@@ -1194,6 +1286,298 @@ describe("releaseEvidenceBundleCheck", () => {
       ingressEvidenceStatus: "passed",
       upgradeRollbackDrillStatus: "passed"
     });
+  });
+
+  it("blocks production bundles without compose-generated attestation metadata by default", () => {
+    const evidence = validEvidence();
+    delete (evidence as Record<string, unknown>).attestation;
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch,
+      targetEnvironment: "production"
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "bundle_attestation_required",
+      status: "fail"
+    }));
+  });
+
+  it("blocks signed production bundles when the signing key is not configured", () => {
+    const result = evaluateReleaseEvidenceBundle(validEvidence(), {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch,
+      targetEnvironment: "production"
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "bundle_attestation_signature",
+      status: "fail"
+    }));
+  });
+
+  it("blocks signed production bundles when the signing key does not match", () => {
+    const result = evaluateReleaseEvidenceBundle(validEvidence(), {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch,
+      targetEnvironment: "production",
+      attestationSigningKey: "different-release-evidence-test-signing-key"
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "bundle_attestation_signature",
+      status: "fail"
+    }));
+  });
+
+  it("blocks signed production bundles when the required signing key id does not match", () => {
+    const result = evaluateReleaseEvidenceBundle(validEvidence(), {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch,
+      targetEnvironment: "production",
+      attestationSigningKey,
+      requiredAttestationKeyId: "sha256:0000000000000000"
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "bundle_attestation_signature",
+      status: "fail"
+    }));
+  });
+
+  it("blocks production bundles with legacy unsigned attestation metadata", () => {
+    const evidence = validEvidence();
+    (evidence as Record<string, unknown>).attestation =
+      bundleWithReleaseEvidenceAttestation(evidence, "2026-06-07T11:30:00.000Z").attestation;
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch,
+      targetEnvironment: "production",
+      attestationSigningKey
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "bundle_attestation_signature",
+      status: "fail"
+    }));
+  });
+
+  it("allows a missing production bundle attestation only with an explicit option", () => {
+    const evidence = validEvidence();
+    delete (evidence as Record<string, unknown>).attestation;
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch,
+      targetEnvironment: "production",
+      allowMissingAttestation: true
+    });
+
+    expect(result.status).toBe("passed");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "bundle_attestation_required",
+      status: "pass"
+    }));
+  });
+
+  it("does not require missing attestation for non-production bundle checks", () => {
+    const evidence = validEvidence({
+      targetEnvironment: "staging",
+      release: {
+        commitRef,
+        repository,
+        branch,
+        requiredStatusCheck,
+        operatorName: "release-operator",
+        releaseTicket: "REL-2026-0607",
+        dockerSocketProfileAccepted: true,
+        targetEnvironment: "staging"
+      }
+    });
+    delete (evidence as Record<string, unknown>).attestation;
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch,
+      targetEnvironment: "staging"
+    });
+
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "bundle_attestation_required",
+      status: "pass"
+    }));
+  });
+
+  it("blocks bundles that move canonical release metadata to the root object", () => {
+    const evidence = validEvidence();
+    const release = evidence.release as Record<string, unknown>;
+
+    Object.assign(evidence, {
+      commitRef: release.commitRef,
+      repository: release.repository,
+      branch: release.branch,
+      requiredStatusCheck: release.requiredStatusCheck,
+      operatorName: release.operatorName,
+      releaseTicket: release.releaseTicket,
+      dockerSocketProfileAccepted: release.dockerSocketProfileAccepted
+    });
+    delete (evidence as Record<string, unknown>).release;
+    reattestEvidence(evidence);
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch,
+      targetEnvironment: "production",
+      attestationSigningKey
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "release_metadata",
+      status: "fail"
+    }));
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "operator",
+      status: "fail"
+    }));
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "ticket",
+      status: "fail"
+    }));
+  });
+
+  it("blocks bundles whose release required status check falls back to promotion evidence", () => {
+    const evidence = validEvidence();
+    delete (evidence.release as Record<string, unknown>).requiredStatusCheck;
+    reattestEvidence(evidence);
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch,
+      targetEnvironment: "production",
+      attestationSigningKey
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "release_metadata",
+      status: "fail"
+    }));
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "release_required_status_check",
+      status: "fail"
+    }));
+  });
+
+  it("blocks bundles whose operator and ticket only exist at the root fallback", () => {
+    const evidence = validEvidence();
+    const release = evidence.release as Record<string, unknown>;
+
+    (evidence as Record<string, unknown>).operatorName = release.operatorName;
+    (evidence as Record<string, unknown>).releaseTicket = release.releaseTicket;
+    delete release.operatorName;
+    delete release.releaseTicket;
+    reattestEvidence(evidence);
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch,
+      targetEnvironment: "production",
+      attestationSigningKey
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "operator",
+      status: "fail"
+    }));
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "ticket",
+      status: "fail"
+    }));
+  });
+
+  it("blocks bundles whose Docker socket acceptance only exists at the root fallback", () => {
+    const evidence = validEvidence();
+    const release = evidence.release as Record<string, unknown>;
+
+    (evidence as Record<string, unknown>).dockerSocketProfileAccepted = release.dockerSocketProfileAccepted;
+    delete release.dockerSocketProfileAccepted;
+    reattestEvidence(evidence);
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch,
+      targetEnvironment: "production",
+      attestationSigningKey
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "docker_socket_profile_acceptance",
+      status: "fail"
+    }));
+  });
+
+  it("blocks bundles whose attestation digest no longer matches the payload", () => {
+    const evidence = validEvidence();
+
+    ((evidence.release as Record<string, unknown>).operatorName) = "different-operator";
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch,
+      targetEnvironment: "production"
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "bundle_attestation_digest",
+      status: "fail"
+    }));
   });
 
   it("blocks missing target runtime evidence", () => {
@@ -1221,6 +1605,35 @@ describe("releaseEvidenceBundleCheck", () => {
     const selectedEvidence = targetRuntime.selectedEvidence as Record<string, unknown>;
 
     selectedEvidence.composeConfig = { status: "passed" };
+
+    const result = evaluateReleaseEvidenceBundle(
+      validEvidence({
+        targetRuntimeEvidence: {
+          ...validEvidence().targetRuntimeEvidence,
+          evidence: targetRuntime
+        }
+      }),
+      {
+        evidencePath: "release-evidence.json",
+        now,
+        commitRef,
+        repo: repository,
+        branch
+      }
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "target_runtime_selected_evidence",
+      status: "fail"
+    }));
+  });
+
+  it("blocks target runtime evidence without selected worker runtime posture summary", () => {
+    const targetRuntime = validTargetRuntimeEvidence();
+    const selectedEvidence = targetRuntime.selectedEvidence as Record<string, unknown>;
+
+    delete selectedEvidence.workerRuntimePosture;
 
     const result = evaluateReleaseEvidenceBundle(
       validEvidence({
@@ -1273,6 +1686,183 @@ describe("releaseEvidenceBundleCheck", () => {
     expect(result.status).toBe("blocked");
     expect(result.checks).toContainEqual(expect.objectContaining({
       name: "target_runtime_selected_evidence",
+      status: "fail"
+    }));
+  });
+
+  it("blocks source provider evidence with shallow selected checkout summaries", () => {
+    const sourceProvider = validSourceProviderEvidence();
+    const selectedEvidence = sourceProvider.selectedEvidence as Record<string, unknown>;
+
+    selectedEvidence.checkout = { status: "passed" };
+
+    const result = evaluateReleaseEvidenceBundle(
+      validEvidence({
+        sourceProviderEvidence: {
+          ...validEvidence().sourceProviderEvidence,
+          evidence: sourceProvider
+        }
+      }),
+      {
+        evidencePath: "release-evidence.json",
+        now,
+        commitRef,
+        repo: repository,
+        branch
+      }
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "source_provider_selected_evidence",
+      status: "fail"
+    }));
+  });
+
+  it("blocks backup evidence with shallow selected offload summaries", () => {
+    const backup = validBackupEvidence();
+    const selectedEvidence = backup.selectedEvidence as Record<string, unknown>;
+
+    selectedEvidence.backupOffload = { status: "offloaded" };
+
+    const result = evaluateReleaseEvidenceBundle(
+      validEvidence({
+        backupEvidence: {
+          ...validEvidence().backupEvidence,
+          evidence: backup
+        }
+      }),
+      {
+        evidencePath: "release-evidence.json",
+        now,
+        commitRef,
+        repo: repository,
+        branch
+      }
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "backup_selected_evidence",
+      status: "fail"
+    }));
+  });
+
+  it("blocks upgrade rollback evidence with shallow selected route summaries", () => {
+    const upgradeRollback = validUpgradeRollbackEvidence();
+    const selectedEvidence = upgradeRollback.selectedEvidence as Record<string, unknown>;
+
+    selectedEvidence.routeRollback = { status: "passed" };
+
+    const result = evaluateReleaseEvidenceBundle(
+      validEvidence({
+        upgradeRollbackEvidence: {
+          ...validEvidence().upgradeRollbackEvidence,
+          evidence: upgradeRollback
+        }
+      }),
+      {
+        evidencePath: "release-evidence.json",
+        now,
+        commitRef,
+        repo: repository,
+        branch
+      }
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "upgrade_rollback_selected_evidence",
+      status: "fail"
+    }));
+  });
+
+  it("blocks operator access evidence with shallow selected section summaries", () => {
+    const operatorAccess = validOperatorAccessEvidence();
+    const selectedEvidence = operatorAccess.selectedEvidence as Record<string, unknown>;
+
+    selectedEvidence.sessionCreate = { status: "passed" };
+
+    const result = evaluateReleaseEvidenceBundle(
+      validEvidence({
+        operatorAccessEvidence: {
+          ...validEvidence().operatorAccessEvidence,
+          evidence: operatorAccess
+        }
+      }),
+      {
+        evidencePath: "release-evidence.json",
+        now,
+        commitRef,
+        repo: repository,
+        branch
+      }
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "operator_access_selected_evidence",
+      status: "fail"
+    }));
+  });
+
+  it("blocks non-session credential evidence with shallow break-glass summary", () => {
+    const nonSessionCredential = validNonSessionCredentialEvidence();
+    const selectedEvidence = nonSessionCredential.selectedEvidence as Record<string, unknown>;
+
+    selectedEvidence.breakGlass = { status: "passed" };
+
+    const result = evaluateReleaseEvidenceBundle(
+      validEvidence({
+        nonSessionCredentialEvidence: {
+          ...validEvidence().nonSessionCredentialEvidence,
+          evidence: nonSessionCredential
+        }
+      }),
+      {
+        evidencePath: "release-evidence.json",
+        now,
+        commitRef,
+        repo: repository,
+        branch
+      }
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "non_session_credential_selected_evidence",
+      status: "fail"
+    }));
+  });
+
+  it("blocks ingress evidence with failed selected section summaries", () => {
+    const ingress = validIngressEvidence();
+    const selectedEvidence = ingress.selectedEvidence as Record<string, unknown>;
+
+    selectedEvidence.forwardedHeaders = {
+      status: "failed",
+      timestamp: "2026-06-07T10:56:00.000Z"
+    };
+
+    const result = evaluateReleaseEvidenceBundle(
+      validEvidence({
+        ingressEvidence: {
+          ...validEvidence().ingressEvidence,
+          evidence: ingress
+        }
+      }),
+      {
+        evidencePath: "release-evidence.json",
+        now,
+        commitRef,
+        repo: repository,
+        branch
+      }
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "ingress_selected_evidence",
       status: "fail"
     }));
   });
@@ -1354,6 +1944,62 @@ describe("releaseEvidenceBundleCheck", () => {
     );
   });
 
+  it("blocks release gate evidence that omits worker socket posture", () => {
+    const evidence = validEvidence();
+    const releaseGate = evidence.releaseGate.evidence as ReturnType<typeof validReleaseGateEvidence>;
+    const runtimeEnv = releaseGate.promotionEvidence.runtimeEnv as Record<string, unknown>;
+
+    delete runtimeEnv.workerUserStatus;
+    delete runtimeEnv.workerUser;
+    delete runtimeEnv.dockerSocketGidStatus;
+    delete runtimeEnv.dockerSocketGid;
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "runtime_resource_controls",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
+  it("blocks release gate evidence that runs the worker as root", () => {
+    const evidence = validEvidence();
+    const releaseGate = evidence.releaseGate.evidence as ReturnType<typeof validReleaseGateEvidence>;
+    const runtimeEnv = releaseGate.promotionEvidence.runtimeEnv as Record<string, unknown>;
+
+    runtimeEnv.workerUserStatus = "fail";
+    runtimeEnv.workerUser = "0:0";
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "runtime_resource_controls",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
   it("blocks release gate evidence when browser token fallback is enabled", () => {
     const evidence = validEvidence();
     const releaseGate = evidence.releaseGate.evidence as ReturnType<typeof validReleaseGateEvidence>;
@@ -1406,6 +2052,73 @@ describe("releaseEvidenceBundleCheck", () => {
       ])
     );
     expect(serialized).not.toContain("abcdefghijklmnop");
+  });
+
+  it("blocks forged final bundles that attach template or dry-run evidence despite passing check rows", () => {
+    const evidence = validEvidence();
+    const sourceProvider = evidence.sourceProviderEvidence.evidence as Record<string, unknown>;
+    const operatorAccess = evidence.operatorAccessEvidence.evidence as Record<string, unknown>;
+
+    sourceProvider.template = true;
+    operatorAccess.dryRun = true;
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "bundle_attachments_final_evidence",
+          status: "fail",
+          message: expect.stringContaining("source provider: template")
+        })
+      ])
+    );
+    expect(result.checks.find((check) => check.name === "bundle_attachments_final_evidence")?.message)
+      .toContain("operator access: dryRun");
+  });
+
+  it("blocks standalone local artifact manifests used as release artifact evidence", () => {
+    const evidence = validEvidence();
+    evidence.artifactEvidence.evidence = standaloneLocalReleaseArtifactManifest();
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "artifact_passed",
+          status: "fail"
+        }),
+        expect.objectContaining({
+          name: "artifact_name",
+          status: "fail",
+          message: expect.stringContaining("siteflow-release-artifact-check")
+        }),
+        expect.objectContaining({
+          name: "artifact_selected_evidence",
+          status: "fail"
+        }),
+        expect.objectContaining({
+          name: "artifact_function_runtime_isolation",
+          status: "fail",
+          message: expect.stringContaining("deployment artifact manifest")
+        })
+      ])
+    );
   });
 
   it("blocks release artifact manifests that declare same-process function runtime isolation", () => {
@@ -1714,6 +2427,107 @@ describe("releaseEvidenceBundleCheck", () => {
     }));
   });
 
+  it("blocks manifest-only release image attestation evidence without inspected statement details", () => {
+    const evidence = validEvidence();
+    const releaseImage = ((evidence.releaseImageEvidence as Record<string, unknown>).evidence ?? {}) as Record<string, unknown>;
+    const attestations = releaseImage.attestations as Record<string, unknown>;
+    const provenance = attestations.provenance as Record<string, unknown>;
+    const sbom = attestations.sbom as Record<string, unknown>;
+
+    delete provenance.statementDigest;
+    delete provenance.subjectDigest;
+    delete provenance.subjects;
+    delete provenance.source;
+    delete provenance.builder;
+    delete provenance.materials;
+    delete sbom.statementDigest;
+    delete sbom.subjectDigest;
+    delete sbom.subjects;
+    attestations.failedChecks = [
+      "provenance_statement_unavailable",
+      "sbom_statement_unavailable"
+    ];
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "release_image_attestation_no_failed_checks",
+      status: "fail"
+    }));
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "release_image_provenance_statement",
+      status: "fail"
+    }));
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "release_image_sbom_statement",
+      status: "fail"
+    }));
+  });
+
+  it("blocks release image provenance with conflicting source identity", () => {
+    const evidence = validEvidence();
+    const releaseImage = ((evidence.releaseImageEvidence as Record<string, unknown>).evidence ?? {}) as Record<string, unknown>;
+    const provenance = ((releaseImage.attestations as Record<string, unknown>).provenance ?? {}) as Record<string, unknown>;
+    const source = provenance.source as Record<string, unknown>;
+
+    source.commitRef = "different-commit";
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "release_image_provenance_source_identity",
+      status: "fail"
+    }));
+  });
+
+  it("blocks release image SBOM statements bound to a different subject digest", () => {
+    const evidence = validEvidence();
+    const releaseImage = ((evidence.releaseImageEvidence as Record<string, unknown>).evidence ?? {}) as Record<string, unknown>;
+    const sbom = ((releaseImage.attestations as Record<string, unknown>).sbom ?? {}) as Record<string, unknown>;
+
+    sbom.subjectDigest = `sha256:${"a".repeat(64)}`;
+    sbom.subjects = [
+      {
+        name: "ghcr.io/siteflow/siteflow",
+        digest: {
+          sha256: `${"a".repeat(64)}`
+        }
+      }
+    ];
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      commitRef,
+      repo: repository,
+      branch
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "release_image_attestation_subject",
+      status: "fail"
+    }));
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "release_image_sbom_statement",
+      status: "fail"
+    }));
+  });
+
   it("blocks stale release image attestation inspection evidence", () => {
     const evidence = validEvidence();
     const releaseImage = ((evidence.releaseImageEvidence as Record<string, unknown>).evidence ?? {}) as Record<string, unknown>;
@@ -1936,6 +2750,31 @@ describe("releaseEvidenceBundleCheck", () => {
     );
   });
 
+  it("blocks promotion evidence when release gate check rows are manual_required", () => {
+    const evidence = validEvidence();
+    const releaseGateEvidence = (evidence.releaseGate as Record<string, unknown>).evidence as Record<string, unknown>;
+
+    releaseGateEvidence.checks = [
+      passingCheck("local.gitStatus"),
+      { name: "external.githubBranchProtection", status: "manual_required", message: "requires manual verification" }
+    ];
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "release_gate_checks_passed",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
   it("blocks promotion evidence that lists dirty worktree entries", () => {
     const evidence = validEvidence();
     const releaseGateEvidence = (evidence.releaseGate as Record<string, unknown>).evidence as Record<string, unknown>;
@@ -2084,16 +2923,182 @@ describe("releaseEvidenceBundleCheck", () => {
     );
   });
 
+  it("accepts an explicit private-scrape metrics exception when observability and ingress evidence are bound", () => {
+    const evidence = validEvidence();
+    const releaseGateEvidence = (evidence.releaseGate as Record<string, unknown>).evidence as Record<string, unknown>;
+    const promotionEvidence = releaseGateEvidence.promotionEvidence as Record<string, unknown>;
+    const runtimeEnv = promotionEvidence.runtimeEnv as Record<string, unknown>;
+    const observability = ((evidence.observabilityEvidence as Record<string, unknown>).evidence as Record<string, unknown>);
+    const observabilitySelected = observability.selectedEvidence as Record<string, unknown>;
+    const ingress = ((evidence.ingressEvidence as Record<string, unknown>).evidence as Record<string, unknown>);
+    const ingressSelected = ingress.selectedEvidence as Record<string, unknown>;
+
+    runtimeEnv.metricsTokenConfigured = false;
+    runtimeEnv.unauthenticatedMetricsAllowed = true;
+    runtimeEnv.metricsTokenStrengthStatus = "skipped";
+    observabilitySelected.metricsScrape = {
+      status: "scraped",
+      timestamp: "2026-06-07T10:46:00.000Z",
+      authenticated: false,
+      privateScrapeException: true,
+      observedStatusCode: 200
+    };
+    ingressSelected.metricsAccessControl = {
+      status: "passed",
+      timestamp: "2026-06-07T10:59:00.000Z",
+      privateScrapeException: true,
+      scrapePath: "/metrics",
+      protection: "reverse_proxy_allowlist",
+      publicAccessBlocked: true
+    };
+    (ingress.checks as Record<string, unknown>[]).push(
+      passingCheck("metrics_access_control_optional"),
+      passingCheck("metrics_access_control_age"),
+      passingCheck("metrics_access_control_private_scrape")
+    );
+    reattestEvidence(evidence);
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      attestationSigningKey
+    });
+
+    expect(result.status).toBe("passed");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "metrics_private_scrape_exception_bound",
+      status: "pass"
+    }));
+  });
+
+  it("blocks private-scrape metrics exceptions without matching ingress access-control proof", () => {
+    const evidence = validEvidence();
+    const releaseGateEvidence = (evidence.releaseGate as Record<string, unknown>).evidence as Record<string, unknown>;
+    const promotionEvidence = releaseGateEvidence.promotionEvidence as Record<string, unknown>;
+    const runtimeEnv = promotionEvidence.runtimeEnv as Record<string, unknown>;
+    const observability = ((evidence.observabilityEvidence as Record<string, unknown>).evidence as Record<string, unknown>);
+    const observabilitySelected = observability.selectedEvidence as Record<string, unknown>;
+
+    runtimeEnv.metricsTokenConfigured = false;
+    runtimeEnv.unauthenticatedMetricsAllowed = true;
+    runtimeEnv.metricsTokenStrengthStatus = "skipped";
+    observabilitySelected.metricsScrape = {
+      status: "scraped",
+      timestamp: "2026-06-07T10:46:00.000Z",
+      authenticated: false,
+      privateScrapeException: true,
+      observedStatusCode: 200
+    };
+    reattestEvidence(evidence);
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      attestationSigningKey
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "metrics_private_scrape_exception_bound",
+      status: "fail"
+    }));
+  });
+
+  it("blocks private-scrape metrics exceptions when ingress proof lacks checker validation rows", () => {
+    const evidence = validEvidence();
+    const releaseGateEvidence = (evidence.releaseGate as Record<string, unknown>).evidence as Record<string, unknown>;
+    const promotionEvidence = releaseGateEvidence.promotionEvidence as Record<string, unknown>;
+    const runtimeEnv = promotionEvidence.runtimeEnv as Record<string, unknown>;
+    const observability = ((evidence.observabilityEvidence as Record<string, unknown>).evidence as Record<string, unknown>);
+    const observabilitySelected = observability.selectedEvidence as Record<string, unknown>;
+    const ingress = ((evidence.ingressEvidence as Record<string, unknown>).evidence as Record<string, unknown>);
+    const ingressSelected = ingress.selectedEvidence as Record<string, unknown>;
+
+    runtimeEnv.metricsTokenConfigured = false;
+    runtimeEnv.unauthenticatedMetricsAllowed = true;
+    runtimeEnv.metricsTokenStrengthStatus = "skipped";
+    observabilitySelected.metricsScrape = {
+      status: "scraped",
+      timestamp: "2026-06-07T10:46:00.000Z",
+      authenticated: false,
+      privateScrapeException: true,
+      observedStatusCode: 200
+    };
+    ingressSelected.metricsAccessControl = {
+      status: "passed",
+      timestamp: "2026-06-07T10:59:00.000Z",
+      privateScrapeException: true,
+      scrapePath: "/metrics",
+      protection: "reverse_proxy_allowlist",
+      publicAccessBlocked: true
+    };
+    reattestEvidence(evidence);
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      attestationSigningKey
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "metrics_private_scrape_exception_bound",
+      status: "fail"
+    }));
+  });
+
+  it("blocks private-scrape metrics exceptions without observability privateScrapeException evidence", () => {
+    const evidence = validEvidence();
+    const releaseGateEvidence = (evidence.releaseGate as Record<string, unknown>).evidence as Record<string, unknown>;
+    const promotionEvidence = releaseGateEvidence.promotionEvidence as Record<string, unknown>;
+    const runtimeEnv = promotionEvidence.runtimeEnv as Record<string, unknown>;
+    const ingress = ((evidence.ingressEvidence as Record<string, unknown>).evidence as Record<string, unknown>);
+    const ingressSelected = ingress.selectedEvidence as Record<string, unknown>;
+
+    runtimeEnv.metricsTokenConfigured = false;
+    runtimeEnv.unauthenticatedMetricsAllowed = true;
+    runtimeEnv.metricsTokenStrengthStatus = "skipped";
+    ingressSelected.metricsAccessControl = {
+      status: "passed",
+      timestamp: "2026-06-07T10:59:00.000Z",
+      privateScrapeException: true,
+      scrapePath: "/metrics",
+      protection: "reverse_proxy_allowlist",
+      publicAccessBlocked: true
+    };
+    (ingress.checks as Record<string, unknown>[]).push(
+      passingCheck("metrics_access_control_optional"),
+      passingCheck("metrics_access_control_age"),
+      passingCheck("metrics_access_control_private_scrape")
+    );
+    reattestEvidence(evidence);
+
+    const result = evaluateReleaseEvidenceBundle(evidence, {
+      evidencePath: "release-evidence.json",
+      now,
+      attestationSigningKey
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: "metrics_private_scrape_exception_bound",
+      status: "fail"
+    }));
+  });
+
   it("accepts release gate evidence with native secret file app secret source", () => {
     const evidence = validEvidence();
     const releaseGateEvidence = (evidence.releaseGate as Record<string, unknown>).evidence as Record<string, unknown>;
     const promotionEvidence = releaseGateEvidence.promotionEvidence as Record<string, unknown>;
     const runtimeEnv = promotionEvidence.runtimeEnv as Record<string, unknown>;
     runtimeEnv.appSecretSource = "SITEFLOW_APP_SECRET_FILE";
+    (evidence as Record<string, unknown>).attestation =
+      bundleWithReleaseEvidenceAttestation(evidence, "2026-06-07T11:30:00.000Z", { attestationSigningKey }).attestation;
 
     const result = evaluateReleaseEvidenceBundle(evidence, {
       evidencePath: "release-evidence.json",
-      now
+      now,
+      attestationSigningKey
     });
 
     expect(result.status).toBe("passed");
@@ -2563,6 +3568,67 @@ describe("releaseEvidenceBundleCheck", () => {
     );
   });
 
+  it("blocks backup evidence output from the wrong checker", () => {
+    const result = evaluateReleaseEvidenceBundle(
+      validEvidence({
+        backupEvidence: {
+          ...validEvidence().backupEvidence,
+          evidence: {
+            ...validBackupEvidence(),
+            name: "siteflow-backup-automation-run"
+          }
+        }
+      }),
+      {
+        evidencePath: "release-evidence.json",
+        now
+      }
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "backup_name",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
+  it("blocks backup evidence bound to another target environment", () => {
+    const result = evaluateReleaseEvidenceBundle(
+      validEvidence({
+        backupEvidence: {
+          ...validEvidence().backupEvidence,
+          evidence: {
+            ...validBackupEvidence(),
+            release: {
+              commitRef,
+              repository,
+              branch,
+              targetEnvironment: "staging"
+            }
+          }
+        }
+      }),
+      {
+        evidencePath: "release-evidence.json",
+        now
+      }
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "backup_target_environment",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
   it("blocks backup evidence checker output that lacks offload and prune proof", () => {
     const backupEvidence = validBackupEvidence();
     const result = evaluateReleaseEvidenceBundle(
@@ -2661,6 +3727,34 @@ describe("releaseEvidenceBundleCheck", () => {
     );
   });
 
+  it("blocks observability evidence output from the wrong checker", () => {
+    const result = evaluateReleaseEvidenceBundle(
+      validEvidence({
+        observabilityEvidence: {
+          ...validEvidence().observabilityEvidence,
+          evidence: {
+            ...validObservabilityEvidence(),
+            name: "siteflow-observability-plan"
+          }
+        }
+      }),
+      {
+        evidencePath: "release-evidence.json",
+        now
+      }
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "observability_name",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
   it("blocks stale observability evidence", () => {
     const result = evaluateReleaseEvidenceBundle(
       validEvidence({
@@ -2751,6 +3845,38 @@ describe("releaseEvidenceBundleCheck", () => {
       expect.arrayContaining([
         expect.objectContaining({
           name: expectedCheck,
+          status: "fail"
+        })
+      ])
+    );
+  });
+
+  it("blocks observability evidence missing exported non-dry-run required checks", () => {
+    const observability = validObservabilityEvidence();
+    const observabilityAttachment = validEvidence().observabilityEvidence as Record<string, unknown>;
+    observability.checks = observability.checks.filter((check) =>
+      check.name !== "observability_apply_proof_non_dry_run"
+    );
+
+    const result = evaluateReleaseEvidenceBundle(
+      validEvidence({
+        observabilityEvidence: {
+          ...observabilityAttachment,
+          evidence: observability
+        }
+      }),
+      {
+        evidencePath: "release-evidence.json",
+        now,
+        attestationSigningKey
+      }
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "observability_required_checks",
           status: "fail"
         })
       ])
@@ -3398,17 +4524,124 @@ describe("releaseEvidenceBundleCheck", () => {
     expect(stdout).toContain("upgrade/rollback drill");
   });
 
-  it("emits JSON from the CLI", async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-evidence-"));
+  it("CLI blocks a production bundle that is missing attestation metadata", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-evidence-missing-attestation-"));
     const evidencePath = path.join(root, "release-evidence.json");
     let stdout = "";
     let stderr = "";
 
     try {
-      await writeFile(evidencePath, `${JSON.stringify(validEvidence())}\n`, "utf8");
+      const evidence = validEvidence();
+      delete (evidence as Record<string, unknown>).attestation;
+      await writeFile(evidencePath, `${JSON.stringify(evidence)}\n`, "utf8");
 
       const exitCode = await runReleaseEvidenceBundleCheckCli(
-        ["--evidence", evidencePath, "--commit-ref", commitRef, "--repo", repository, "--branch", branch, "--json"],
+        ["--evidence", evidencePath, "--target-environment", "production", "--json"],
+        {
+          stdout: { write: (chunk: string) => ((stdout += chunk), true) },
+          stderr: { write: (chunk: string) => ((stderr += chunk), true) }
+        },
+        {
+          now,
+          attestationSigningKey
+        }
+      );
+      const parsed = JSON.parse(stdout);
+
+      expect(exitCode).toBe(1);
+      expect(stderr).toBe("");
+      expect(parsed).toMatchObject({
+        status: "blocked",
+        checks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "bundle_attestation_required",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("CLI uses env attestation key id pinning by default", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-evidence-env-key-id-"));
+    const evidencePath = path.join(root, "release-evidence.json");
+    const previousSigningKey = process.env.SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY;
+    const previousRequiredKeyId = process.env.SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID;
+    const previousLegacyKeyId = process.env.SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_ID;
+    let stdout = "";
+    let stderr = "";
+
+    try {
+      await writeFile(evidencePath, `${JSON.stringify(validEvidence())}\n`, "utf8");
+      process.env.SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY = attestationSigningKey;
+      process.env.SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID = "sha256:0000000000000000";
+      delete process.env.SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_ID;
+
+      const exitCode = await runReleaseEvidenceBundleCheckCli(
+        ["--evidence", evidencePath, "--target-environment", "production", "--json"],
+        {
+          stdout: { write: (chunk: string) => ((stdout += chunk), true) },
+          stderr: { write: (chunk: string) => ((stderr += chunk), true) }
+        },
+        {
+          now
+        }
+      );
+      const parsed = JSON.parse(stdout);
+
+      expect(exitCode).toBe(1);
+      expect(stderr).toBe("");
+      expect(parsed).toMatchObject({
+        status: "blocked",
+        checks: expect.arrayContaining([
+          expect.objectContaining({
+            name: "bundle_attestation_signature",
+            status: "fail"
+          })
+        ])
+      });
+    } finally {
+      if (previousSigningKey === undefined) {
+        delete process.env.SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY;
+      } else {
+        process.env.SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY = previousSigningKey;
+      }
+      if (previousRequiredKeyId === undefined) {
+        delete process.env.SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID;
+      } else {
+        process.env.SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID = previousRequiredKeyId;
+      }
+      if (previousLegacyKeyId === undefined) {
+        delete process.env.SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_ID;
+      } else {
+        process.env.SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_ID = previousLegacyKeyId;
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("emits JSON from the CLI", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-evidence-"));
+    const evidencePath = path.join(root, "release-evidence.json");
+    const keyPath = path.join(root, "release-evidence-signing-key");
+    let stdout = "";
+    let stderr = "";
+
+    try {
+      await writeFile(evidencePath, `${JSON.stringify(validEvidence())}\n`, "utf8");
+      await writeFile(keyPath, `${attestationSigningKey}\n`, "utf8");
+
+      const exitCode = await runReleaseEvidenceBundleCheckCli(
+        [
+          "--evidence", evidencePath,
+          "--commit-ref", commitRef,
+          "--repo", repository,
+          "--branch", branch,
+          "--attestation-key-file", keyPath,
+          "--json"
+        ],
         {
           stdout: { write: (chunk: string) => ((stdout += chunk), true) },
           stderr: { write: (chunk: string) => ((stderr += chunk), true) }

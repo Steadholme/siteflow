@@ -24,6 +24,12 @@ function validBackupEvidence() {
     name: "siteflow-backup-evidence-check",
     status: "passed",
     checkedAt: "2026-06-07T09:55:00.000Z",
+    release: {
+      commitRef,
+      repository,
+      branch,
+      targetEnvironment: "staging"
+    },
     thresholds: {
       maxBackupAgeHours: 24,
       maxRestoreDrillAgeHours: 168,
@@ -33,18 +39,25 @@ function validBackupEvidence() {
       backupVerify: {
         status: "verified",
         backupPath: "/backups/siteflow-20260607",
+        offHostLocation: "s3://siteflow-prod-backups/siteflow-20260607",
+        provider: "s3",
         timestamp: "2026-06-07T09:45:00.000Z"
       },
       restoreDrill: {
         status: "restore_drilled",
         restoreDrill: true,
+        backupPath: "/tmp/siteflow-fetched-backups/siteflow-20260607",
         timestamp: "2026-06-07T09:50:00.000Z"
       },
       backupOffload: {
         status: "offloaded",
+        timestamp: "2026-06-07T09:51:00.000Z",
         backupPath: "/backups/siteflow-20260607",
         offHostLocation: "s3://siteflow-prod-backups/siteflow-20260607",
         provider: "s3",
+        treeSha256: "b".repeat(64),
+        objectCount: 4,
+        totalBytes: 512,
         encrypted: true,
         kmsKeyRef: backupKmsKeyRef,
         providerKmsProof: true,
@@ -58,6 +71,9 @@ function validBackupEvidence() {
         backupPath: "/tmp/siteflow-fetched-backups/siteflow-20260607",
         offHostLocation: "s3://siteflow-prod-backups/siteflow-20260607",
         provider: "s3",
+        treeSha256: "b".repeat(64),
+        objectCount: 4,
+        totalBytes: 512,
         timestamp: "2026-06-07T09:52:00.000Z"
       },
       backupProviderSecurityAudit: {
@@ -112,6 +128,7 @@ function validBackupEvidence() {
       },
       backupPrune: {
         status: "pruned",
+        timestamp: "2026-06-07T09:54:30.000Z",
         dryRun: false,
         retentionDays: 30,
         minimumBackups: 8
@@ -152,6 +169,19 @@ function validEvidence(overrides: Record<string, unknown> = {}) {
       rollbackVersion: "0.1.0",
       operatorName: "release-operator",
       releaseTicket: "REL-2026-0607"
+    },
+    target: {
+      environment: "staging",
+      release: {
+        commitRef,
+        repository,
+        branch
+      },
+      versions: {
+        fromVersion: "0.1.0",
+        toVersion: "0.1.1",
+        rollbackVersion: "0.1.0"
+      }
     },
     services: {
       api: {
@@ -403,6 +433,40 @@ describe("upgradeRollbackDrillEvidenceCheck", () => {
     );
   });
 
+  it("blocks evidence with missing or mismatched target facts", () => {
+    const result = evaluateUpgradeRollbackDrillEvidence(
+      validEvidence({
+        target: {
+          environment: "staging",
+          release: {
+            commitRef: "different",
+            repository,
+            branch
+          },
+          versions: {
+            fromVersion: "0.1.0",
+            toVersion: "0.1.1",
+            rollbackVersion: "0.1.0"
+          }
+        }
+      }),
+      {
+        evidencePath: "upgrade-rollback.json",
+        now
+      }
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "target_facts",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
   it("blocks unordered drill phase timestamps", () => {
     const result = evaluateUpgradeRollbackDrillEvidence(validEvidence({
       operations: {
@@ -486,6 +550,52 @@ describe("upgradeRollbackDrillEvidenceCheck", () => {
     });
 
     const result = evaluateUpgradeRollbackDrillEvidence(evidence, {
+      evidencePath: "upgrade-rollback.json",
+      now
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "route_rollback_restores_previous_artifact",
+          status: "fail"
+        }),
+        expect.objectContaining({
+          name: "http_rollback_verification",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
+  it("blocks rollback route artifact checksums that are not full sha256 values", () => {
+    const shortArtifact = `sha256:${"a".repeat(16)}`;
+    const result = evaluateUpgradeRollbackDrillEvidence(validEvidence({
+      route: {
+        before: {
+          deploymentId: "dep_previous",
+          artifactChecksum: shortArtifact
+        },
+        after: {
+          deploymentId: "dep_candidate",
+          artifactChecksum: afterArtifact
+        },
+        rollback: {
+          deploymentId: "dep_previous",
+          artifactChecksum: shortArtifact
+        }
+      },
+      httpVerification: {
+        rollback: {
+          status: "passed",
+          checkedAt: "2026-06-07T10:55:00.000Z",
+          statusCode: 200,
+          deploymentId: "dep_previous",
+          artifactChecksum: shortArtifact
+        }
+      }
+    }), {
       evidencePath: "upgrade-rollback.json",
       now
     });
@@ -589,6 +699,29 @@ describe("upgradeRollbackDrillEvidenceCheck", () => {
     );
   });
 
+  it("blocks stale embedded backup checker output", () => {
+    const result = evaluateUpgradeRollbackDrillEvidence(validEvidence({
+      backupEvidence: {
+        ...validBackupEvidence(),
+        checkedAt: "2026-05-01T09:55:00.000Z"
+      }
+    }), {
+      evidencePath: "upgrade-rollback.json",
+      now,
+      maxAgeHours: 24
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "backup_evidence_passed",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
   it("blocks passed backup evidence when embedded backup checks failed", () => {
     const result = evaluateUpgradeRollbackDrillEvidence(validEvidence({
       backupEvidence: {
@@ -602,6 +735,63 @@ describe("upgradeRollbackDrillEvidenceCheck", () => {
         ]
       }
     }), {
+      evidencePath: "upgrade-rollback.json",
+      now
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "backup_evidence_passed",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
+  it("blocks backup evidence when restore drill used a different fetched backup path", () => {
+    const backupEvidence = validBackupEvidence();
+    backupEvidence.selectedEvidence.restoreDrill.backupPath = "/tmp/siteflow-fetched-backups/other-backup";
+    const result = evaluateUpgradeRollbackDrillEvidence(validEvidence({ backupEvidence }), {
+      evidencePath: "upgrade-rollback.json",
+      now
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "backup_evidence_passed",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
+  it("blocks backup evidence when fetched backup integrity differs from offloaded backup", () => {
+    const backupEvidence = validBackupEvidence();
+    backupEvidence.selectedEvidence.backupFetch.treeSha256 = "c".repeat(64);
+    const result = evaluateUpgradeRollbackDrillEvidence(validEvidence({ backupEvidence }), {
+      evidencePath: "upgrade-rollback.json",
+      now
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "backup_evidence_passed",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
+  it("blocks backup evidence bound to a different release target", () => {
+    const backupEvidence = validBackupEvidence();
+    backupEvidence.release.targetEnvironment = "production";
+    const result = evaluateUpgradeRollbackDrillEvidence(validEvidence({ backupEvidence }), {
       evidencePath: "upgrade-rollback.json",
       now
     });

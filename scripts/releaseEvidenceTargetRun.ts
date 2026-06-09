@@ -6,10 +6,22 @@ import { pathToFileURL } from "node:url";
 import { sensitiveOutputReasons } from "./evidenceSecretScan.js";
 import { createReleaseEvidenceGapReport, type ReleaseEvidenceGapReportResult } from "./releaseEvidenceGapReport.js";
 import { validateReleaseEvidenceRehearsalPackContract } from "./releaseEvidenceRehearsalPackContract.js";
+import {
+  parseTargetEnvFile,
+  targetEnvFilePreflightIssues,
+  targetEnvFileUnreadableIssues
+} from "./releaseTargetEnvFilePreflight.js";
 
 type RunStatus = "planned" | "running" | "completed" | "blocked" | "failed";
 type StepStatus = "completed" | "blocked" | "failed" | "skipped" | "planned";
 type StepKind = "evidence" | "final_compose" | "final_check";
+type EvidenceProductionSource =
+  "target_runner_command" |
+  "control_plane_query" |
+  "external_artifact_download" |
+  "bundle_finalization";
+
+const sha256DigestPattern = /^sha256:[a-f0-9]{64}$/i;
 
 interface PackCommand {
   executable?: unknown;
@@ -68,6 +80,7 @@ export interface ReleaseEvidenceTargetRunOptions {
   maxEvidenceAgeHours?: number;
   env?: NodeJS.ProcessEnv;
   cwd?: string;
+  targetEnvironment?: string | null;
   now?: () => Date;
   commandRunner?: ReleaseEvidenceCommandRunner;
 }
@@ -77,6 +90,11 @@ export interface ReleaseEvidenceTargetRunStep {
   title: string;
   kind: StepKind;
   status: StepStatus;
+  evidenceProduction?: {
+    source: EvidenceProductionSource;
+    consumesPreparedInputs: string[];
+    note: string;
+  };
   outputPath?: string;
   commandDisplay: string;
   replacementKeys: string[];
@@ -100,6 +118,7 @@ export interface ReleaseEvidenceTargetRunStep {
   stdoutCapturedTo?: string;
   stdoutDiscardedReason?: string;
   stdoutBytes?: number;
+  stdoutSensitiveReasons?: string[];
   stderrBytes?: number;
   stderrPreview?: string;
   stderrSensitiveReasons?: string[];
@@ -134,6 +153,34 @@ export interface ReleaseEvidenceTargetRunResult {
   gapReports: ReleaseEvidenceTargetRunGapSnapshot[];
   blockedProductionClaims: string[];
   commandsExecuted: number;
+  evidenceProductionSummary: {
+    targetRunnerCommandSteps: {
+      total: number;
+      completed: number;
+      stepIds: string[];
+    };
+    controlPlaneQuerySteps: {
+      total: number;
+      completed: number;
+      stepIds: string[];
+    };
+    externalArtifactDownloadSteps: {
+      total: number;
+      completed: number;
+      stepIds: string[];
+    };
+    preparedInputConsumerSteps: Array<{
+      id: string;
+      status: StepStatus;
+      inputs: string[];
+    }>;
+    finalizationSteps: {
+      total: number;
+      completed: number;
+      stepIds: string[];
+    };
+    productionReadyOnlyWhen: string;
+  };
   productionEvidenceGenerated: boolean;
   failOnGaps?: boolean;
   initialGapReportStatus?: ReleaseEvidenceGapReportResult["status"];
@@ -204,6 +251,15 @@ function nestedObject(root: Record<string, unknown>, key: string) {
   return isObject(root[key]) ? root[key] : undefined;
 }
 
+async function fileExists(filePath: string) {
+  try {
+    await access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function readJsonObject(filePath: string) {
   const parsed = JSON.parse(await readFile(filePath, "utf8")) as unknown;
 
@@ -212,6 +268,16 @@ async function readJsonObject(filePath: string) {
   }
 
   return parsed;
+}
+
+function commandFlagValue(args: string[], flag: string) {
+  const index = args.indexOf(flag);
+
+  return index === -1 ? undefined : args[index + 1];
+}
+
+function releaseImageEvidenceDigest(evidence: Record<string, unknown>) {
+  return stringValue(nestedObject(evidence, "image")?.digest);
 }
 
 function packSteps(pack: Record<string, unknown>) {
@@ -385,9 +451,19 @@ async function envRequirements(command: PackCommand, env: NodeJS.ProcessEnv, cwd
   const requirements = commandEnvSpecs(command).map((spec) => {
     const { name, expected } = envNameAndExpected(spec);
     const configured = name ? env[name] : undefined;
+    const fileName = name ? `${name}_FILE` : undefined;
+    const fileConfigured = fileName ? env[fileName] : undefined;
     const placeholder = Boolean(expected && expected.includes("<") && expected.includes(">"));
 
     if (!expected) {
+      if (!configured && fileConfigured && fileName) {
+        return {
+          name: fileName,
+          kind: "present" as const,
+          status: "satisfied" as const
+        };
+      }
+
       return {
         name,
         kind: "present" as const,
@@ -410,7 +486,57 @@ async function envRequirements(command: PackCommand, env: NodeJS.ProcessEnv, cwd
     };
   }).filter((entry) => entry.name);
 
-  return Promise.all(requirements.map((requirement) => fileSecretRequirement(requirement, env, cwd)));
+  return uniqueEnvRequirements(await Promise.all(requirements.map((requirement) => fileSecretRequirement(requirement, env, cwd))));
+}
+
+async function targetEnvFileRequirements(
+  args: string[],
+  cwd: string | undefined,
+  targetEnvironment: string | null | undefined
+): Promise<ReleaseEvidenceTargetRunStep["envRequirements"]> {
+  const rawEnvFile = commandFlagValue(args, "--env-file");
+
+  if (!rawEnvFile || rawEnvFile.startsWith("--")) {
+    return [];
+  }
+
+  const envFilePath = path.isAbsolute(rawEnvFile)
+    ? rawEnvFile
+    : path.resolve(cwd ?? process.cwd(), rawEnvFile);
+
+  let values: Map<string, string>;
+
+  try {
+    values = parseTargetEnvFile(await readFile(envFilePath, "utf8"));
+  } catch {
+    return targetEnvFileUnreadableIssues(targetEnvironment).map((entry) => ({
+      name: entry.name,
+      kind: "present" as const,
+      status: entry.status,
+      message: entry.message
+    }));
+  }
+
+  return targetEnvFilePreflightIssues(values, targetEnvironment).map((entry) => ({
+    name: entry.name,
+    kind: "present" as const,
+    status: entry.status,
+    message: entry.message
+  }));
+}
+
+function uniqueEnvRequirements(requirements: ReleaseEvidenceTargetRunStep["envRequirements"]) {
+  const byName = new Map<string, ReleaseEvidenceTargetRunStep["envRequirements"][number]>();
+
+  for (const requirement of requirements) {
+    const existing = byName.get(requirement.name);
+
+    if (!existing || existing.status !== "satisfied" && requirement.status === "satisfied") {
+      byName.set(requirement.name, requirement);
+    }
+  }
+
+  return [...byName.values()];
 }
 
 async function fileSecretRequirement(
@@ -666,6 +792,126 @@ function blockedProductionClaims(pack: Record<string, unknown>) {
   return stringArray(pack.blockedProductionClaims);
 }
 
+function evidenceProductionForItem(item: RunItem): NonNullable<ReleaseEvidenceTargetRunStep["evidenceProduction"]> {
+  if (item.kind === "final_compose" || item.kind === "final_check") {
+    return {
+      source: "bundle_finalization",
+      consumesPreparedInputs: [],
+      note: "Final bundle command validates and signs the already collected release evidence; it does not collect new target evidence."
+    };
+  }
+
+  switch (item.id) {
+    case "release_gate":
+      return {
+        source: "control_plane_query",
+        consumesPreparedInputs: [],
+        note: "Queries repository protection and commit-status control-plane state for the exact release commit."
+      };
+    case "release_image_evidence":
+      return {
+        source: "external_artifact_download",
+        consumesPreparedInputs: [],
+        note: "Downloads the release-image evidence artifact from the GitHub workflow; the workflow run must already be complete for the release commit."
+      };
+    case "release_artifact_evidence":
+      return {
+        source: "target_runner_command",
+        consumesPreparedInputs: [
+          "private candidate deployment detail exported from the target SiteFlow API; must be real target data, not a template or dry run"
+        ],
+        note: "Runs artifact checks, consumes the private candidate deployment detail, and writes only the sanitized deployment artifact manifest into release evidence."
+      };
+    case "backup_evidence":
+      return {
+        source: "target_runner_command",
+        consumesPreparedInputs: [
+          "fresh backup verify output",
+          "fresh restore drill output",
+          "off-host backup proof",
+          "off-host fetch proof",
+          "provider security audit",
+          "backup prune proof",
+          "backup policy"
+        ],
+        note: "Composes and checks backup evidence from fresh backup, restore, offload, fetch, prune, provider, and policy records."
+      };
+    case "observability_evidence":
+      return {
+        source: "target_runner_command",
+        consumesPreparedInputs: [
+          "backup automation run",
+          "backup automation history",
+          "backup scheduler ownership",
+          "operator observability evidence completed from observability:operator-evidence:template with real target observations; must not remain template or dry-run",
+          "target stack proof from Prometheus, Grafana, and Alertmanager APIs when configured"
+        ],
+        note: "Collects target readiness, metrics, alert, dashboard, and log evidence while consuming operator and backup automation proof files."
+      };
+    case "ingress_evidence":
+      return {
+        source: "target_runner_command",
+        consumesPreparedInputs: [
+          "operator ingress evidence completed from ingress:operator-evidence:template with real target proxy and topology observations; must not remain template or dry-run",
+          "target topology values",
+          "direct API URL"
+        ],
+        note: "Probes ingress behavior and rate limiting, then combines those probes with operator-provided proxy and topology evidence."
+      };
+    case "upgrade_rollback_evidence":
+      return {
+        source: "target_runner_command",
+        consumesPreparedInputs: [
+          "raw upgrade/rollback drill transcript from a completed non-dry-run target drill"
+        ],
+        note: "Checks a completed non-dry-run upgrade and rollback drill transcript; it does not orchestrate the drill."
+      };
+    default:
+      return {
+        source: "target_runner_command",
+        consumesPreparedInputs: [],
+        note: "Runs the rehearsal-pack command on the confirmed target evidence runner."
+      };
+  }
+}
+
+function withEvidenceProduction(
+  item: RunItem,
+  stepResult: ReleaseEvidenceTargetRunStep
+): ReleaseEvidenceTargetRunStep {
+  return {
+    ...stepResult,
+    evidenceProduction: evidenceProductionForItem(item)
+  };
+}
+
+function summarizeEvidenceProduction(steps: ReleaseEvidenceTargetRunStep[]) {
+  const bySource = (source: EvidenceProductionSource) => {
+    const matching = steps.filter((step) => step.evidenceProduction?.source === source);
+
+    return {
+      total: matching.length,
+      completed: matching.filter((step) => step.status === "completed").length,
+      stepIds: matching.map((step) => step.id)
+    };
+  };
+
+  return {
+    targetRunnerCommandSteps: bySource("target_runner_command"),
+    controlPlaneQuerySteps: bySource("control_plane_query"),
+    externalArtifactDownloadSteps: bySource("external_artifact_download"),
+    preparedInputConsumerSteps: steps
+      .filter((step) => (step.evidenceProduction?.consumesPreparedInputs.length ?? 0) > 0)
+      .map((step) => ({
+        id: step.id,
+        status: step.status,
+        inputs: step.evidenceProduction?.consumesPreparedInputs ?? []
+      })),
+    finalizationSteps: bySource("bundle_finalization"),
+    productionReadyOnlyWhen: "productionEvidenceGenerated is true only after all commands complete and the final release:evidence:gaps snapshot passes; prepared inputs must be real target evidence, not templates, dry runs, placeholders, or local rehearsal substitutes."
+  };
+}
+
 function currentResult(
   options: ReleaseEvidenceTargetRunOptions,
   startedAt: string,
@@ -700,6 +946,7 @@ function currentResult(
     gapReports,
     blockedProductionClaims: blockedProductionClaims(pack),
     commandsExecuted,
+    evidenceProductionSummary: summarizeEvidenceProduction(steps),
     productionEvidenceGenerated: !options.planOnly && status === "completed",
     ...(options.failOnGaps ? { failOnGaps: true } : {}),
     ...(initialGapReportStatus ? { initialGapReportStatus } : {}),
@@ -772,6 +1019,7 @@ function skippedStep(item: RunItem, reason: string): ReleaseEvidenceTargetRunSte
     title: item.title,
     kind: item.kind,
     status: "skipped",
+    evidenceProduction: evidenceProductionForItem(item),
     outputPath: item.outputPath,
     commandDisplay: commandDisplay(item.command),
     replacementKeys: [],
@@ -793,7 +1041,10 @@ async function commandPlanStep(
   const resolvedReplacements = options.resolvedReplacements ?? options.replacements ?? {};
   const args = applyReplacements(originalArgs, resolvedReplacements);
   const placeholders = remainingPlaceholders(args);
-  const requirements = await envRequirements(command, env, options.cwd);
+  const requirements = uniqueEnvRequirements([
+    ...(await envRequirements(command, env, options.cwd)),
+    ...(await targetEnvFileRequirements(args, options.cwd, options.targetEnvironment))
+  ]);
   const blockedRequirements = envBlocked(requirements);
   const replacementKeys = Object.keys(resolvedReplacements).filter((key) =>
     originalArgs.some((arg) => arg.includes(`<${key}>`))
@@ -896,7 +1147,10 @@ async function executeItem(
   const resolvedReplacements = options.resolvedReplacements ?? options.replacements ?? {};
   const args = applyReplacements(originalArgs, resolvedReplacements);
   const placeholders = remainingPlaceholders(args);
-  const requirements = await envRequirements(command, env, options.cwd);
+  const requirements = uniqueEnvRequirements([
+    ...(await envRequirements(command, env, options.cwd)),
+    ...(await targetEnvFileRequirements(args, options.cwd, options.targetEnvironment))
+  ]);
   const blockedRequirements = envBlocked(requirements);
   const replacementKeys = Object.keys(resolvedReplacements).filter((key) =>
     originalArgs.some((arg) => arg.includes(`<${key}>`))
@@ -991,15 +1245,18 @@ async function executeItem(
     cwd: options.cwd
   });
   const captureStdoutTo = stringValue(command.captureStdoutTo);
-  const sensitiveReasons = captureStdoutTo ? sensitiveOutputReasons(result.stdout) : [];
-  const stderrSensitiveReasons = result.exitCode === 0 ? [] : sensitiveOutputReasons(result.stderr);
+  const stdoutSensitiveReasons = sensitiveOutputReasons(result.stdout);
+  const stderrSensitiveReasons = sensitiveOutputReasons(result.stderr);
   const stderrPreview = result.exitCode === 0 || stderrSensitiveReasons.length > 0 ? undefined : outputPreview(result.stderr);
 
-  if (captureStdoutTo && sensitiveReasons.length === 0 && result.exitCode === 0) {
+  if (captureStdoutTo && stdoutSensitiveReasons.length === 0 && stderrSensitiveReasons.length === 0 && result.exitCode === 0) {
     await writeJsonCompatibleText(captureStdoutTo, result.stdout);
   }
 
-  if (sensitiveReasons.length > 0) {
+  if (stdoutSensitiveReasons.length > 0 || stderrSensitiveReasons.length > 0) {
+    const sensitiveStream = stdoutSensitiveReasons.length > 0 ? "stdout" : "stderr";
+    const sensitiveReasons = stdoutSensitiveReasons.length > 0 ? stdoutSensitiveReasons : stderrSensitiveReasons;
+
     return {
       id: item.id,
       title: item.title,
@@ -1014,12 +1271,12 @@ async function executeItem(
       ...(executableRequirement ? { executableRequirement } : {}),
       startedAt,
       completedAt: (options.now?.() ?? new Date()).toISOString(),
-      exitCode: 1,
+      exitCode: result.exitCode === 0 ? 1 : result.exitCode,
       stdoutBytes: Buffer.byteLength(result.stdout, "utf8"),
+      ...(stdoutSensitiveReasons.length > 0 ? { stdoutSensitiveReasons } : {}),
       stderrBytes: Buffer.byteLength(result.stderr, "utf8"),
-      ...(stderrPreview ? { stderrPreview } : {}),
       ...(stderrSensitiveReasons.length > 0 ? { stderrSensitiveReasons } : {}),
-      message: `Command stdout matched sensitive output patterns before evidence capture: ${sensitiveReasons.join(", ")}.`
+      message: `Command ${sensitiveStream} matched sensitive output patterns before evidence capture: ${sensitiveReasons.join(", ")}.`
     };
   }
 
@@ -1041,11 +1298,60 @@ async function executeItem(
     ...(captureStdoutTo && result.exitCode === 0 ? { stdoutCapturedTo: captureStdoutTo } : {}),
     ...(captureStdoutTo && result.exitCode !== 0 ? { stdoutDiscardedReason: "Command exited non-zero; stdout was not written to the evidence output path." } : {}),
     stdoutBytes: Buffer.byteLength(result.stdout, "utf8"),
+    ...(stdoutSensitiveReasons.length > 0 ? { stdoutSensitiveReasons } : {}),
     stderrBytes: Buffer.byteLength(result.stderr, "utf8"),
     ...(stderrPreview ? { stderrPreview } : {}),
     ...(stderrSensitiveReasons.length > 0 ? { stderrSensitiveReasons } : {}),
     message: result.exitCode === 0 ? "Command completed." : `Command exited with code ${result.exitCode}.`
   };
+}
+
+async function validateReleaseImageDigestBinding(
+  item: RunItem,
+  step: ReleaseEvidenceTargetRunStep,
+  options: ReleaseEvidenceTargetRunOptions
+): Promise<ReleaseEvidenceTargetRunStep> {
+  if (item.id !== "release_image_evidence" || step.status !== "completed" || !item.outputPath) {
+    return step;
+  }
+
+  if (!await fileExists(item.outputPath)) {
+    return step;
+  }
+
+  const expectedDigest = stringValue((options.resolvedReplacements ?? options.replacements ?? {})["release-image-digest"]);
+
+  if (!expectedDigest) {
+    return step;
+  }
+
+  let evidence: Record<string, unknown>;
+
+  try {
+    evidence = await readJsonObject(item.outputPath);
+  } catch {
+    return {
+      ...step,
+      status: "failed",
+      exitCode: 1,
+      message: "Downloaded release image evidence artifact could not be parsed as JSON after the GitHub artifact download step."
+    };
+  }
+
+  const artifactDigest = releaseImageEvidenceDigest(evidence);
+
+  if (!sha256DigestPattern.test(expectedDigest) ||
+    !sha256DigestPattern.test(artifactDigest ?? "") ||
+    artifactDigest !== expectedDigest) {
+    return {
+      ...step,
+      status: "failed",
+      exitCode: 1,
+      message: "Downloaded release image evidence digest must be a sha256 digest matching the release-image-digest replacement."
+    };
+  }
+
+  return step;
 }
 
 async function writeJsonCompatibleText(filePath: string, value: string) {
@@ -1080,6 +1386,7 @@ export async function runReleaseEvidenceTargetRun(
     planOnly: rawOptions.planOnly ?? false,
     failOnGaps: rawOptions.failOnGaps ?? false,
     env: baseEnv,
+    targetEnvironment: release.targetEnvironment,
     maxEvidenceAgeHours: positiveNumber(rawOptions.maxEvidenceAgeHours, 168, "maxEvidenceAgeHours")
   };
   const startedAt = (options.now?.() ?? new Date()).toISOString();
@@ -1112,7 +1419,7 @@ export async function runReleaseEvidenceTargetRun(
 
   if (options.planOnly) {
     for (const item of items) {
-      steps.push(await commandPlanStep(item, options, baseEnv));
+      steps.push(withEvidenceProduction(item, await commandPlanStep(item, options, baseEnv)));
     }
 
     const planBlocked = steps.some((step) => step.status === "blocked");
@@ -1146,7 +1453,11 @@ export async function runReleaseEvidenceTargetRun(
       continue;
     }
 
-    const step = await executeItem(item, options, baseEnv);
+    const step = await validateReleaseImageDigestBinding(
+      item,
+      withEvidenceProduction(item, await executeItem(item, options, baseEnv)),
+      options
+    );
 
     steps.push(step);
 

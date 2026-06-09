@@ -19,6 +19,10 @@ export const requiredReleaseEvidenceStepIds = [
 const requiredEvidenceFileKeys = ["releaseEvidence", "releaseEvidenceCheck"];
 const requiredFinalCommandKeys = ["compose", "check"];
 const releaseIdentityFlags = ["--commit-ref", "--repo", "--branch"];
+const sourceProviders = new Set(["github", "gitlab", "gitea", "generic"]);
+const releaseEvidenceSigningKeyEnv = "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY";
+const releaseEvidenceRequiredSigningKeyIdEnv = "SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID";
+const defaultObservabilityTargetStackTokenEnv = "SITEFLOW_OBSERVABILITY_STACK_TOKEN";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
@@ -60,6 +64,10 @@ function nestedRecord(value: unknown, key: string) {
 
 function commandArgs(command: unknown) {
   return isRecord(command) ? stringArray(command.args) ?? [] : [];
+}
+
+function commandEnv(command: unknown) {
+  return isRecord(command) ? stringArray(command.env) ?? [] : [];
 }
 
 function flagValue(args: string[], flag: string) {
@@ -170,6 +178,22 @@ function requireNoCapture(problems: string[], label: string, command: unknown) {
   }
 }
 
+function requireCommandEnv(problems: string[], label: string, command: unknown, expected: string) {
+  const env = commandEnv(command);
+
+  if (!env.includes(expected)) {
+    problems.push(`${label} command env must include ${expected}`);
+  }
+}
+
+function requireCommandEnvAbsent(problems: string[], label: string, command: unknown, unexpected: string) {
+  const env = commandEnv(command);
+
+  if (env.includes(unexpected)) {
+    problems.push(`${label} command env must not include ${unexpected}`);
+  }
+}
+
 function requireStepOutput(
   problems: string[],
   label: string,
@@ -197,6 +221,14 @@ function requireDisplayTokens(problems: string[], label: string, command: unknow
     if (!display.includes(token)) {
       problems.push(`${label} command display must include ${token}`);
     }
+  }
+}
+
+function requireStringListIncludes(problems: string[], label: string, value: unknown, token: string) {
+  const entries = stringArray(value);
+
+  if (!entries?.some((entry) => entry.includes(token))) {
+    problems.push(`${label} must mention ${token}`);
   }
 }
 
@@ -256,7 +288,11 @@ function validateStepSemantics(
       requireScript(problems, id, command, "release:artifacts:evidence");
       requireFlagValue(problems, id, args, "--manifest", stringValue(files?.releaseArtifactManifest));
       if (stringValue(release?.targetEnvironment) === "production") {
-        requireFlagValue(problems, id, args, "--deployment-artifact-manifest", stringValue(files?.deploymentArtifactManifest));
+        requireFlagValue(problems, id, args, "--deployment-detail", "<candidate-deployment-detail-path>");
+        requireFlagValue(problems, id, args, "--write-deployment-artifact-manifest", stringValue(files?.deploymentArtifactManifest));
+        if (args.includes("--deployment-artifact-manifest")) {
+          problems.push(`${id} command must consume the private candidate deployment detail instead of requiring a pre-exported deployment artifact manifest`);
+        }
       }
       requireReleaseIdentity(problems, id, args, release);
       requireFlagValue(problems, id, args, "--target-environment", stringValue(release?.targetEnvironment));
@@ -278,21 +314,58 @@ function validateStepSemantics(
       break;
     case "source_provider_evidence":
       requireStepOutput(problems, id, step, stringValue(files?.sourceProvider));
-      requireScript(problems, id, command, "source-provider:evidence");
-      requireFlagValue(problems, id, args, "--evidence", stringValue(files?.sourceProviderRaw));
-      requireReleaseIdentity(problems, id, args, release);
-      requireFlagValue(problems, id, args, "--target-environment", stringValue(release?.targetEnvironment));
-      requireToken(problems, id, args, "--json");
-      requireCapture(problems, id, command, outputPath);
+      if (stringValue(release?.sourceProvider) === "github") {
+        requireScript(problems, id, command, "source-provider:evidence:collect");
+        requireFlagValue(problems, id, args, "--provider", "github");
+        requireReleaseIdentity(problems, id, args, release);
+        requireFlagValue(problems, id, args, "--target-environment", stringValue(release?.targetEnvironment));
+        requireFlagValue(problems, id, args, "--operator-name", stringValue(release?.operatorName));
+        requireFlagValue(problems, id, args, "--release-ticket", stringValue(release?.releaseTicket));
+        requireFlagValue(problems, id, args, "--webhook-delivery-id", "<webhook-delivery-id>");
+        requireToken(problems, id, args, "--webhook-signature-verified");
+        requireToken(problems, id, args, "--webhook-secret-configured");
+        requireFlagValue(problems, id, args, "--deploy-key-path", "<deploy-key-path>");
+        requireToken(problems, id, args, "--deploy-key-mounted");
+        requireToken(problems, id, args, "--host-key-pinned");
+        requireFlagValue(problems, id, args, "--known-hosts-path", "<known-hosts-path>");
+        requireFlagValue(problems, id, args, "--output", stringValue(files?.sourceProviderRaw));
+        requireFlagValue(problems, id, args, "--check-output", stringValue(files?.sourceProvider));
+        requireToken(problems, id, args, "--json");
+        requireCommandEnv(problems, id, command, "GITHUB_TOKEN");
+        requireNoCapture(problems, id, command);
+        requireDisplayTokens(problems, id, command, [
+          "<webhook-delivery-id>",
+          "<deploy-key-path>",
+          "<known-hosts-path>",
+          stringValue(files?.sourceProviderRaw),
+          stringValue(files?.sourceProvider)
+        ].filter((value): value is string => Boolean(value)));
+      } else {
+        requireScript(problems, id, command, "source-provider:evidence");
+        requireFlagValue(problems, id, args, "--evidence", stringValue(files?.sourceProviderRaw));
+        requireReleaseIdentity(problems, id, args, release);
+        requireFlagValue(problems, id, args, "--target-environment", stringValue(release?.targetEnvironment));
+        requireToken(problems, id, args, "--json");
+        requireCapture(problems, id, command, stringValue(files?.sourceProvider));
+        requireCommandEnvAbsent(problems, id, command, "GITHUB_TOKEN");
+        requireStringListIncludes(problems, `${id} prerequisites`, step.prerequisites, `--provider ${stringValue(release?.sourceProvider)}`);
+      }
       break;
     case "target_runtime_evidence":
       requireStepOutput(problems, id, step, stringValue(files?.targetRuntime));
-      requireScript(problems, id, command, "release:target-runtime:evidence");
-      requireFlagValue(problems, id, args, "--evidence", stringValue(files?.targetRuntimeRaw));
+      requireScript(problems, id, command, "release:target-runtime:evidence:collect");
       requireReleaseIdentity(problems, id, args, release);
       requireFlagValue(problems, id, args, "--target-environment", stringValue(release?.targetEnvironment));
+      requireFlagValue(problems, id, args, "--env-file", stringValue(release?.targetEnvFile));
+      requireFlagValue(problems, id, args, "--public-base-url", stringValue(release?.publicBaseUrl));
+      requireFlagValue(problems, id, args, "--expected-digest", "<release-image-digest>");
+      requireFlagValue(problems, id, args, "--operator-name", stringValue(release?.operatorName));
+      requireFlagValue(problems, id, args, "--release-ticket", stringValue(release?.releaseTicket));
+      requireFlagValue(problems, id, args, "--output", stringValue(files?.targetRuntimeRaw));
+      requireFlagValue(problems, id, args, "--check-output", stringValue(files?.targetRuntime));
       requireToken(problems, id, args, "--json");
-      requireCapture(problems, id, command, outputPath);
+      requireNoCapture(problems, id, command);
+      requireStringListIncludes(problems, `${id} prerequisites`, step.prerequisites, "SITEFLOW_DOCKER_SOCKET_GID");
       break;
     case "backup_evidence":
       requireStepOutput(problems, id, step, stringValue(files?.backup));
@@ -320,6 +393,22 @@ function validateStepSemantics(
       requireFlagValue(problems, id, args, "--backup-automation-history", stringValue(files?.backupAutomationHistory));
       requireFlagValue(problems, id, args, "--backup-scheduler-ownership", stringValue(files?.backupSchedulerOwnership));
       requireFlagValue(problems, id, args, "--operator-evidence", stringValue(files?.operatorObservability));
+      requireReleaseIdentity(problems, id, args, release);
+      requireFlagValue(problems, id, args, "--target-environment", stringValue(release?.targetEnvironment));
+      if (stringValue(release?.observabilityTargetStackApiUrl)) {
+        const targetStackTokenEnv = stringValue(release?.observabilityTargetStackTokenEnv) ?? defaultObservabilityTargetStackTokenEnv;
+
+        requireFlagValue(problems, id, args, "--target-stack-api-url", stringValue(release?.observabilityTargetStackApiUrl));
+        if (stringValue(release?.observabilityTargetStackTokenEnv)) {
+          requireFlagValue(problems, id, args, "--target-stack-token-env", stringValue(release?.observabilityTargetStackTokenEnv));
+        }
+        requireFlagValue(problems, id, args, "--operator-name", stringValue(release?.operatorName));
+        requireFlagValue(problems, id, args, "--release-ticket", stringValue(release?.releaseTicket));
+        requireCommandEnv(problems, id, command, targetStackTokenEnv);
+        requireCommandEnv(problems, id, command, `${targetStackTokenEnv}_FILE`);
+      } else if (stringValue(release?.targetEnvironment) === "production") {
+        problems.push(`${id} command must include --target-stack-api-url for production release evidence packs`);
+      }
       requireFlagValue(problems, id, args, "--output", stringValue(files?.observabilityRaw));
       requireFlagValue(problems, id, args, "--check-output", stringValue(files?.observability));
       requireNoCapture(problems, id, command);
@@ -327,21 +416,63 @@ function validateStepSemantics(
       break;
     case "operator_access_evidence":
       requireStepOutput(problems, id, step, stringValue(files?.operatorAccess));
-      requireScript(problems, id, command, "operator-access:evidence");
-      requireFlagValue(problems, id, args, "--evidence", stringValue(files?.operatorAccessRaw));
+      requireScript(problems, id, command, "operator-access:evidence:collect");
+      requireFlagValue(problems, id, args, "--base-url", stringValue(release?.publicBaseUrl));
       requireReleaseIdentity(problems, id, args, release);
       requireFlagValue(problems, id, args, "--target-environment", stringValue(release?.targetEnvironment));
-      requireToken(problems, id, args, "--json");
-      requireCapture(problems, id, command, outputPath);
+      requireFlagValue(problems, id, args, "--operator-name", stringValue(release?.operatorName));
+      requireFlagValue(problems, id, args, "--release-ticket", stringValue(release?.releaseTicket));
+      requireFlagValue(problems, id, args, "--admin-token-env", "SITEFLOW_API_TOKEN");
+      requireFlagValue(problems, id, args, "--low-scope-token-env", "SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN");
+      requireFlagValue(problems, id, args, "--project-id", "<operator-access-project-id>");
+      requireFlagValue(problems, id, args, "--denied-project-id", "<operator-access-denied-project-id>");
+      requireToken(problems, id, args, "--execute-project-cutoff");
+      requireToken(problems, id, args, "--execute-global-cutoff");
+      requireToken(problems, id, args, "--i-understand-this-revokes-active-operator-sessions");
+      requireToken(problems, id, args, "--browser-token-fallback-disabled");
+      requireToken(problems, id, args, "--local-storage-fallback-disabled");
+      requireFlagValue(problems, id, args, "--output", stringValue(files?.operatorAccessRaw));
+      requireFlagValue(problems, id, args, "--check-output", stringValue(files?.operatorAccess));
+      requireCommandEnv(problems, id, command, "SITEFLOW_API_TOKEN");
+      requireCommandEnv(problems, id, command, "SITEFLOW_API_TOKEN_FILE");
+      requireCommandEnv(problems, id, command, "SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN");
+      requireCommandEnv(problems, id, command, "SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN_FILE");
+      requireNoCapture(problems, id, command);
+      requireDisplayTokens(problems, id, command, [stringValue(files?.operatorAccessRaw), stringValue(files?.operatorAccess)].filter((value): value is string => Boolean(value)));
       break;
     case "non_session_credential_evidence":
       requireStepOutput(problems, id, step, stringValue(files?.nonSessionCredential));
-      requireScript(problems, id, command, "non-session-credential:evidence");
-      requireFlagValue(problems, id, args, "--evidence", stringValue(files?.nonSessionCredentialRaw));
+      requireScript(problems, id, command, "non-session-credential:evidence:collect");
+      requireFlagValue(problems, id, args, "--base-url", stringValue(release?.publicBaseUrl));
       requireReleaseIdentity(problems, id, args, release);
       requireFlagValue(problems, id, args, "--target-environment", stringValue(release?.targetEnvironment));
-      requireToken(problems, id, args, "--json");
-      requireCapture(problems, id, command, outputPath);
+      requireFlagValue(problems, id, args, "--operator-name", stringValue(release?.operatorName));
+      requireFlagValue(problems, id, args, "--release-ticket", stringValue(release?.releaseTicket));
+      requireFlagValue(problems, id, args, "--old-metrics-token-env", "SITEFLOW_OLD_METRICS_TOKEN");
+      requireFlagValue(problems, id, args, "--new-metrics-token-env", "SITEFLOW_METRICS_TOKEN");
+      requireFlagValue(problems, id, args, "--old-api-token-env", "SITEFLOW_OLD_API_TOKEN");
+      requireFlagValue(problems, id, args, "--new-api-token-env", "SITEFLOW_API_TOKEN");
+      requireFlagValue(problems, id, args, "--old-redacted-identifier", "<old-metrics-token-redacted-id>");
+      requireFlagValue(problems, id, args, "--new-redacted-identifier", "<new-metrics-token-redacted-id>");
+      requireFlagValue(problems, id, args, "--old-api-redacted-identifier", "<old-root-api-token-redacted-id>");
+      requireFlagValue(problems, id, args, "--new-api-redacted-identifier", "<new-root-api-token-redacted-id>");
+      requireFlagValue(problems, id, args, "--break-glass-source", "<break-glass-source>");
+      requireFlagValue(problems, id, args, "--break-glass-approver-count", "<break-glass-approver-count>");
+      requireToken(problems, id, args, "--break-glass-reviewed");
+      requireToken(problems, id, args, "--break-glass-time-bounded");
+      requireToken(problems, id, args, "--break-glass-revocation-planned");
+      requireFlagValue(problems, id, args, "--output", stringValue(files?.nonSessionCredentialRaw));
+      requireFlagValue(problems, id, args, "--check-output", stringValue(files?.nonSessionCredential));
+      requireCommandEnv(problems, id, command, "SITEFLOW_OLD_METRICS_TOKEN");
+      requireCommandEnv(problems, id, command, "SITEFLOW_OLD_METRICS_TOKEN_FILE");
+      requireCommandEnv(problems, id, command, "SITEFLOW_METRICS_TOKEN");
+      requireCommandEnv(problems, id, command, "SITEFLOW_METRICS_TOKEN_FILE");
+      requireCommandEnv(problems, id, command, "SITEFLOW_OLD_API_TOKEN");
+      requireCommandEnv(problems, id, command, "SITEFLOW_OLD_API_TOKEN_FILE");
+      requireCommandEnv(problems, id, command, "SITEFLOW_API_TOKEN");
+      requireCommandEnv(problems, id, command, "SITEFLOW_API_TOKEN_FILE");
+      requireNoCapture(problems, id, command);
+      requireDisplayTokens(problems, id, command, [stringValue(files?.nonSessionCredentialRaw), stringValue(files?.nonSessionCredential)].filter((value): value is string => Boolean(value)));
       break;
     case "ingress_evidence":
       requireStepOutput(problems, id, step, stringValue(files?.ingress));
@@ -417,7 +548,10 @@ function validateFinalCommandSemantics(
     requireFlagValue(problems, "finalCommands.compose", composeArgs, "--target-environment", stringValue(release?.targetEnvironment));
     requireFlagValue(problems, "finalCommands.compose", composeArgs, "--operator-name", stringValue(release?.operatorName));
     requireFlagValue(problems, "finalCommands.compose", composeArgs, "--release-ticket", stringValue(release?.releaseTicket));
+    requireFlagValue(problems, "finalCommands.compose", composeArgs, "--attestation-key-env", releaseEvidenceSigningKeyEnv);
+    requireFlagValue(problems, "finalCommands.compose", composeArgs, "--attestation-key-id-env", releaseEvidenceRequiredSigningKeyIdEnv);
     requireFlagValue(problems, "finalCommands.compose", composeArgs, "--output", stringValue(files?.releaseEvidence));
+    requireCommandEnv(problems, "finalCommands.compose", compose, releaseEvidenceSigningKeyEnv);
     requireNoCapture(problems, "finalCommands.compose", compose);
   }
 
@@ -426,7 +560,10 @@ function validateFinalCommandSemantics(
     requireFlagValue(problems, "finalCommands.check", checkArgs, "--evidence", stringValue(files?.releaseEvidence));
     requireReleaseIdentity(problems, "finalCommands.check", checkArgs, release);
     requireFlagValue(problems, "finalCommands.check", checkArgs, "--target-environment", stringValue(release?.targetEnvironment));
+    requireFlagValue(problems, "finalCommands.check", checkArgs, "--attestation-key-env", releaseEvidenceSigningKeyEnv);
+    requireFlagValue(problems, "finalCommands.check", checkArgs, "--attestation-key-id-env", releaseEvidenceRequiredSigningKeyIdEnv);
     requireToken(problems, "finalCommands.check", checkArgs, "--json");
+    requireCommandEnv(problems, "finalCommands.check", check, releaseEvidenceSigningKeyEnv);
     requireCapture(problems, "finalCommands.check", check, stringValue(files?.releaseEvidenceCheck));
   }
 }
@@ -489,6 +626,7 @@ export function validateReleaseEvidenceRehearsalPackContract(pack: Record<string
       "commitRef",
       "repository",
       "branch",
+      "sourceProvider",
       "targetEnvironment",
       "requiredStatusCheck",
       "operatorName",
@@ -498,7 +636,19 @@ export function validateReleaseEvidenceRehearsalPackContract(pack: Record<string
     ]) {
       requireEnvValue(problems, "release evidence pack", release, key);
     }
+
+    const sourceProvider = stringValue(release.sourceProvider);
+
+    if (!sourceProvider || !sourceProviders.has(sourceProvider)) {
+      problems.push("release.sourceProvider must be one of github, gitlab, gitea, or generic");
+    }
+
+    if (stringValue(release.targetEnvironment) === "production" && !stringValue(release.observabilityTargetStackApiUrl)) {
+      problems.push("release.observabilityTargetStackApiUrl is required for production release evidence packs");
+    }
   }
+
+  requireStringListIncludes(problems, "requiredManualInputs", pack.requiredManualInputs, "SITEFLOW_DOCKER_SOCKET_GID");
 
   const finalCommands = isRecord(pack.finalCommands) ? pack.finalCommands : undefined;
 

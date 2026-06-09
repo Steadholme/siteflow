@@ -52,6 +52,14 @@ function validEvidence(overrides: Record<string, unknown> = {}) {
       repository: "acme/siteflow",
       branch: "main"
     },
+    target: {
+      environment: "production",
+      release: {
+        commitRef: "abc123",
+        repository: "acme/siteflow",
+        branch: "main"
+      }
+    },
     operatorName: "Platform Operator",
     ticketId: "CHG-123",
     credentials: [validCredential()],
@@ -100,6 +108,7 @@ describe("nonSessionCredentialEvidenceCheck", () => {
       credentialCount: 1,
       breakGlass: {
         status: "passed",
+        timestamp: "2026-06-08T11:45:00.000Z",
         ticket: "INC-123"
       }
     });
@@ -209,6 +218,32 @@ describe("nonSessionCredentialEvidenceCheck", () => {
     expect(result.checks).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: "environment", status: "fail" })
+      ])
+    );
+  });
+
+  it("blocks evidence with missing or mismatched target facts", () => {
+    const result = evaluateNonSessionCredentialEvidence(
+      validEvidence({
+        target: {
+          environment: "staging",
+          release: {
+            commitRef: "abc123",
+            repository: "acme/siteflow",
+            branch: "main"
+          }
+        }
+      }),
+      {
+        evidencePath: "credential-evidence.json",
+        now
+      }
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "target_facts", status: "fail" })
       ])
     );
   });

@@ -97,7 +97,32 @@ Provider payloads are normalized into SiteFlow source events. Repository clone U
 
 ## Source provider evidence
 
-Before a production promotion, archive source provider evidence for the exact release commit and target environment. Start from the blocking dry-run template when the operator needs the required JSON skeleton:
+Before a production promotion, archive source provider evidence for the exact release commit and target environment. For GitHub-backed releases, use the collector so the raw evidence and checker output are written together:
+
+```powershell
+npm run --silent source-provider:evidence:collect -- `
+  --provider github `
+  --commit-ref <sha> `
+  --repo <owner/repo> `
+  --branch main `
+  --target-environment production `
+  --operator-name <operator> `
+  --release-ticket <ticket> `
+  --webhook-delivery-id <delivery-id> `
+  --webhook-signature-verified `
+  --webhook-secret-configured `
+  --deploy-key-path <deploy-key-path> `
+  --deploy-key-mounted `
+  --host-key-pinned `
+  --known-hosts-path <known-hosts-path> `
+  --output evidence/source-provider-evidence-raw.json `
+  --check-output evidence/source-provider-evidence.json `
+  --json
+```
+
+The collector reads GitHub repository, branch, and deploy-key metadata, then runs the same source-provider checker against the raw evidence it wrote. It does not archive token values, authorization headers, webhook secrets, signature headers, private keys, or raw host keys. Missing target-side signed webhook verification, missing exact commit binding, missing private-repo deploy-key proof, or missing SSH host-key proof writes `status: "blocked"` raw evidence and blocked checker output rather than a passing artifact.
+
+Start from the blocking dry-run template when the operator needs the required JSON skeleton or a non-GitHub provider is enabled:
 
 ```powershell
 npm run --silent source-provider:evidence:template -- `
@@ -125,7 +150,7 @@ npm run --silent source-provider:evidence -- `
 
 The raw evidence must be non-dry-run target or target-equivalent evidence. It must include the provider name (`github`, `gitlab`, `gitea`, or `generic`), release commit/repository/branch, target environment, safe clone remote URL without embedded credentials, exact checkout proof, a signed webhook delivery id/event with signature verification, webhook secret hygiene without raw secret or signature archival, deploy-key evidence for private repositories, pinned host-key evidence for SSH remotes when applicable, release provenance recording, operator, and ticket metadata.
 
-`source-provenance:evidence` is an alias for the same checker. Passing source provider evidence is required by the release rehearsal pack, final bundle composer, final `release:evidence` checker, and gap reporter. The checker does not call GitHub/GitLab/Gitea, fetch repositories, rotate deploy keys, or inspect provider settings by itself; it validates the evidence the operator collected.
+`source-provenance:evidence` is an alias for the same checker. Passing source provider evidence is required by the release rehearsal pack, final bundle composer, final `release:evidence` checker, and gap reporter. The checker itself does not call GitHub/GitLab/Gitea, fetch repositories, rotate deploy keys, or inspect provider settings; it validates the collector or operator evidence.
 
 ## Trusted Proxy Boundary
 
@@ -204,6 +229,11 @@ Minimum operator actions:
 - `siteflow_build_job_oldest_queued_age_seconds`
 - `siteflow_build_job_oldest_running_heartbeat_age_seconds`
 - `siteflow_runtime_metrics_collection_error`
+- `siteflow_storage_artifact_free_bytes`
+- `siteflow_storage_evidence_free_bytes`
+- `siteflow_storage_temp_free_bytes`
+- `siteflow_storage_missing_paths`
+- `siteflow_storage_metrics_collection_error`
 - `siteflow_backup_automation_last_success_age_seconds`
 - `siteflow_backup_restore_drill_last_success_age_seconds`
 - `siteflow_backup_offload_last_success_age_seconds`
@@ -215,6 +245,8 @@ Minimum operator actions:
 The endpoint does not include path labels, query strings, request bodies, authorization headers, bearer tokens, deploy hook tokens, or internal error messages. Set `SITEFLOW_METRICS_TOKEN` in production and configure the scraper to send `Authorization: Bearer <metrics-token>`. Production startup rejects missing `SITEFLOW_METRICS_TOKEN` unless `SITEFLOW_ALLOW_UNAUTHENTICATED_METRICS=1` is explicitly set as a documented exception. Keep the endpoint on a private network, localhost sidecar, or reverse-proxy allowlist even when the bearer token is configured.
 
 Set `SITEFLOW_BACKUP_AUTOMATION_RUN_RECORD` to the stable JSON file written by `backup:automation --run-record <file>` so `/metrics` can derive backup automation gauges. Relative evidence file paths inside the run record are resolved from the run record directory, not from the API process working directory. Age gauges emit `-1` when no successful run or step is known. `siteflow_backup_metrics_collection_error` is `1` when the run record is missing, unreadable, or malformed during a scrape; it does not expose parser errors or file contents.
+
+Storage gauges report free bytes for `SITEFLOW_ARTIFACT_ROOT`, `SITEFLOW_EVIDENCE_ROOT`, and the runtime temp directory. Missing or unreadable storage paths emit `-1`, increment `siteflow_storage_missing_paths`, and set `siteflow_storage_metrics_collection_error` to `1`. These gauges prove local filesystem headroom for the API process only; target operators still need provider or host evidence for disk quotas, retention, and capacity planning.
 
 Example Prometheus scrape shape:
 
@@ -304,6 +336,46 @@ groups:
         annotations:
           summary: SiteFlow runtime metrics collection failed
 
+      - alert: SiteFlowStorageMetricsCollectionFailed
+        expr: siteflow_storage_metrics_collection_error == 1
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: SiteFlow storage metrics collection failed
+
+      - alert: SiteFlowStoragePathMissing
+        expr: siteflow_storage_missing_paths > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: SiteFlow storage path is missing or unreadable
+
+      - alert: SiteFlowArtifactStorageLow
+        expr: siteflow_storage_artifact_free_bytes >= 0 and siteflow_storage_artifact_free_bytes < 1073741824
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: SiteFlow artifact storage has less than 1 GiB free
+
+      - alert: SiteFlowEvidenceStorageLow
+        expr: siteflow_storage_evidence_free_bytes >= 0 and siteflow_storage_evidence_free_bytes < 1073741824
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: SiteFlow evidence storage has less than 1 GiB free
+
+      - alert: SiteFlowTempStorageLow
+        expr: siteflow_storage_temp_free_bytes >= 0 and siteflow_storage_temp_free_bytes < 268435456
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: SiteFlow temp storage has less than 256 MiB free
+
       - alert: SiteFlowBackupMetricsCollectionFailed
         expr: siteflow_backup_metrics_collection_error == 1
         for: 5m
@@ -349,8 +421,9 @@ Current metrics limitations:
 
 - Metrics are process-local and reset on process restart.
 - Basic build queue gauges and queue-age gauges are present, but there is no multi-instance aggregation built into SiteFlow.
+- Artifact, evidence, and temp free-byte gauges are local filesystem checks from the API process; they are not provider quota audits, capacity forecasts, or retention proof.
 - Backup automation, restore-drill, offload, and prune gauges are derived from the latest `backup:automation` run record; SiteFlow does not discover remote object storage, KMS posture, or recurring scheduler state from the infrastructure provider.
-- There are no disk or Postgres replication metrics yet.
+- There are no provider-level disk quota, filesystem growth trend, or Postgres replication metrics yet.
 - `SITEFLOW_METRICS_TOKEN` protects the scrape endpoint, but it is not a substitute for network-level restrictions and alert routing.
 - Logs must still be shipped separately from NDJSON stdout.
 
@@ -361,6 +434,15 @@ Before accepting customer traffic, collect target-environment evidence for readi
 Use the collector to scrape the target `/readyz` and `/metrics` endpoints, merge operator-supplied evidence, and optionally write the checker output used by release bundles:
 
 ```powershell
+npm run --silent observability:operator-evidence:template -- `
+  --commit-ref <sha> `
+  --repo <owner/repo> `
+  --branch main `
+  --target-environment production `
+  --operator-name <operator> `
+  --release-ticket <ticket> `
+  --output evidence/operator-observability.json
+
 npm run --silent observability:evidence:collect -- `
   --base-url https://siteflow.example.com `
   --metrics-token-env SITEFLOW_METRICS_TOKEN `
@@ -378,7 +460,7 @@ npm run --silent observability:evidence:collect -- `
   --check-output evidence/observability-evidence.json
 ```
 
-The optional `--backup-automation-run <file>` input includes a summarized backup automation run record in the observability evidence. The checker requires that record to come from `siteflow-backup-automation-run`, be completed with `exitCode: 0`, include completed backup, verify, restore-drill, offload, prune, and evidence steps, and point to passed backup checker output. The optional `--backup-automation-history <file>` input proves recurring restore-drill cadence: the history must use `siteflow.backupAutomationRunHistory.v1`, its latest run must match the selected run record, and it must contain at least 2 successful restore drills without a gap over the recorded cadence window. The optional `--backup-scheduler-ownership <file>` input proves the target scheduler is enabled, owned, monitored, and points at the same backup automation run record and run history. For production, that backup checker output must satisfy the object-storage/KMS/provider-retention/fetch/provider-security-audit off-host contract; the built-in `backup:automation --offload-target file://...` path cannot satisfy this by itself. The optional `--target-stack-api-url <url>` input fetches `observabilityTargetStackProof` from a target observability stack proof endpoint, authenticated with the bearer token named by `--target-stack-token-env` or `SITEFLOW_OBSERVABILITY_STACK_TOKEN`; the token is sent in the request and is not serialized into evidence. For release evidence, pass `--commit-ref`, `--repo`, `--branch`, and `--target-environment`; the checker records and validates those fields so old or cross-environment observability output cannot satisfy a release bundle. The operator evidence file or flags must still provide facts the collector cannot prove by scraping or by the proof endpoint: `/readyz` failure status, proof that failed readiness removes traffic, observability apply proof, alert delivery, dashboard ownership, log retention, and redaction spot-checks. For small one-off runs, scrape/readiness/dashboard/log fields can be supplied with flags such as `--readiness-failure-status-code 503`, `--traffic-removed-on-failure`, `--alert-delivered`, `--alert-channel <name>`, `--dashboard-uid <uid>`, `--dashboard-owner <owner>`, `--log-retention-days <days>`, and `--log-redaction-spot-check-passed`; apply proof should come from the target monitoring stack or operator evidence file.
+The operator template writes `status: "blocked"`, `dryRun: true`, and `template: true`; replace its todo/null sections with real target observations before using it as `--operator-evidence`. The optional `--backup-automation-run <file>` input includes a summarized backup automation run record in the observability evidence. The checker requires that record to come from `siteflow-backup-automation-run`, be completed with `exitCode: 0`, include completed backup, verify, restore-drill, offload, prune, and evidence steps, and point to passed backup checker output. The optional `--backup-automation-history <file>` input proves recurring restore-drill cadence: the history must use `siteflow.backupAutomationRunHistory.v1`, its latest run must match the selected run record, and it must contain at least 2 successful restore drills without a gap over the recorded cadence window. The optional `--backup-scheduler-ownership <file>` input proves the target scheduler is enabled, owned, monitored, and points at the same backup automation run record and run history. For production, that backup checker output must satisfy the object-storage/KMS/provider-retention/fetch/provider-security-audit off-host contract; the built-in `backup:automation --offload-target file://...` path cannot satisfy this by itself. The optional `--target-stack-api-url <url>` input fetches `observabilityTargetStackProof` from a target observability stack proof endpoint, authenticated with the bearer token named by `--target-stack-token-env` or `SITEFLOW_OBSERVABILITY_STACK_TOKEN`; the token is sent in the request and is not serialized into evidence. For release evidence, pass `--commit-ref`, `--repo`, `--branch`, and `--target-environment`; the checker records and validates those fields so old or cross-environment observability output cannot satisfy a release bundle. The operator evidence file or flags must still provide facts the collector cannot prove by scraping or by the proof endpoint: `/readyz` failure status, proof that failed readiness removes traffic, observability apply proof, alert delivery, dashboard ownership, log retention, and redaction spot-checks. For small one-off runs, scrape/readiness/dashboard/log fields can be supplied with flags such as `--readiness-failure-status-code 503`, `--traffic-removed-on-failure`, `--alert-delivered`, `--alert-channel <name>`, `--dashboard-uid <uid>`, `--dashboard-owner <owner>`, `--log-retention-days <days>`, and `--log-redaction-spot-check-passed`; apply proof should come from the target monitoring stack or operator evidence file.
 
 If evidence is already assembled by another system, run the evidence checker directly:
 
@@ -618,7 +700,7 @@ Evidence file shape:
 }
 ```
 
-The metrics evidence must prove the scrape returned SiteFlow's expected HTTP, runtime queue, and backup automation metric names, not only that a scrape endpoint responded. Release-bound observability evidence must include matching commit, repository, branch, and target environment metadata. Backup scheduler ownership evidence must use `siteflow.backupSchedulerOwnership.v1`, be fresh, have status `applied` or `passed`, match the target environment, identify the enabled cron/systemd/orchestrator job, include schedule and timezone, point at `backup:automation`, link the selected run record and run history paths, and include owner plus alert/escalation target metadata. The observability apply proof must use `siteflow.observabilityApplyProof.v1`, have status `applied` or `passed`, be fresh, include `evidenceSource`, `operator`, and `ticket`, reference `siteflow.observabilityProvisioning.v1`, and include applied `prometheus_scrape`, `prometheus_rules`, `alertmanager_route`, and `grafana_dashboard` asset hashes matching `observabilityProvisioning.renderedAssets`. The observability target-stack proof must use `siteflow.observabilityTargetStackProof.v1`, come from `target_stack_api`, include operator and ticket metadata, match the release identity and target environment, prove Prometheus loaded matching SiteFlow alert rules, prove the Grafana dashboard exposes required SiteFlow metrics, and prove Alertmanager delivered a receiver test alert. Dashboard evidence must have a passing status, a fresh timestamp, a URL or UID, and an owner/team.
+The metrics evidence must prove the scrape returned SiteFlow's expected HTTP, runtime queue, storage, and backup automation metric names, not only that a scrape endpoint responded. Release-bound observability evidence must include matching commit, repository, branch, and target environment metadata. Backup scheduler ownership evidence must use `siteflow.backupSchedulerOwnership.v1`, be fresh, have status `applied` or `passed`, match the target environment, identify the enabled cron/systemd/orchestrator job, include schedule and timezone, point at `backup:automation`, link the selected run record and run history paths, and include owner plus alert/escalation target metadata. The observability apply proof must use `siteflow.observabilityApplyProof.v1`, have status `applied` or `passed`, be fresh, include `evidenceSource`, `operator`, and `ticket`, reference `siteflow.observabilityProvisioning.v1`, and include applied `prometheus_scrape`, `prometheus_rules`, `alertmanager_route`, and `grafana_dashboard` asset hashes matching `observabilityProvisioning.renderedAssets`. The observability target-stack proof must use `siteflow.observabilityTargetStackProof.v1`, come from `target_stack_api`, include operator and ticket metadata, match the release identity and target environment, prove Prometheus loaded matching SiteFlow alert rules, prove the Grafana dashboard exposes required SiteFlow metrics, and prove Alertmanager delivered a receiver test alert. Dashboard evidence must have a passing status, a fresh timestamp, a URL or UID, and an owner/team.
 
 The provisioning plan only renders candidate observability artifacts, the collector only scrapes `/readyz` and `/metrics`, optionally fetches target-stack proof from an external proof endpoint, and merges operator evidence; the checker audits evidence only. They do not configure Prometheus, Alertmanager, dashboards, log shipping, retention, or network allowlists. Target operators must still apply the artifacts through the real observability stack and collect apply proof, alert-delivery, dashboard, log-pipeline, and readiness traffic-removal evidence.
 
@@ -1109,11 +1191,12 @@ Required promotion evidence:
 - `siteflow release-gate --promotion` JSON output.
 - JSON `status` plus `promotionEvidence.gateStatus`.
 - JSON `promotionEvidence.commitRef`, `repository`, `branch`, and `requiredStatusCheck`.
-- JSON `promotionEvidence.branchProtection.status` and required status checks.
+- JSON `promotionEvidence.branchProtection.status`, required status checks, required pull request reviews, force-push prohibition, required linear history, and signed-commit evidence when the GitHub API exposes it. Branch protection or matching active rulesets may satisfy these checks; `manual_required` remains blocking for production promotion.
 - JSON `promotionEvidence.commitStatus.status` plus the successful check-run evidence.
 - JSON `promotionEvidence.manualRequired` and `manualRequiredCheckIds`.
 - JSON `promotionEvidence.runtimeEnv.status`, `metricsTokenConfigured`, and `unauthenticatedMetricsAllowed`; production promotion must not pass without `SITEFLOW_METRICS_TOKEN` unless `SITEFLOW_ALLOW_UNAUTHENTICATED_METRICS=1` is explicitly recorded as a private-scrape exception.
 - JSON `promotionEvidence.runtimeEnv.apiTokenStrengthStatus`, `metricsTokenStrengthStatus`, `appSecretStrengthStatus`, and `appSecretSource`; production bearer tokens and app sealing secrets must meet the shared minimum strength policy.
+- JSON `promotionEvidence.runtimeEnv.workerUserStatus=pass`, `workerUser` with a non-root uid, `dockerSocketGidStatus=pass`, and `dockerSocketGid`; the release evidence bundle and gap report reject older release-gate JSON that cannot prove the worker socket posture.
 - `local.releaseSourceTree` must pass. The release commit must not track `node_modules/`, `dist/`, `dist-cli/`, `dist-server/`, `dist-worker/`, `coverage/`, `playwright-report/`, `test-results/`, `.workflow/`, `.env*`, or local release artifact manifests; these paths are regenerated or secret/scratch state and make `npm ci` / `npm run build` dirty the checkout.
 - JSON `promotionEvidence.dirtyWorktree.dirty=false` with no listed worktree entries. `--promotion` does not accept `--allow-dirty`; that flag is only for static sanity checks.
 - GitHub branch protection evidence for `main`.
@@ -1199,6 +1282,30 @@ Minimum drill evidence must show:
 - Real HTTP verification of the rolled-back route.
 - `/readyz` evidence before, after, and after rollback, plus proof traffic was removed during the upgrade window.
 - Metrics, logs, and alert delivery evidence for the rollback drill, correlated to the rollback operation and timestamped after rollback completion.
+
+Archive an auditable drill transcript beside the raw evidence. The transcript
+must record the exact commands run, the target host identity and Docker Compose
+project, the before/after/rollback deployment ids, artifact paths and
+checksums, API and worker image digests, the migration version query command and
+results, the HTTP probe URL used for route verification, the metrics, logs, and
+alert queries used for observability proof, the backup evidence path and file
+hash, and the operator plus release/change ticket. Redact secrets, tokens,
+connection strings, raw environment dumps, and unredacted logs; preserve command
+names, argument names, timestamps, exit codes, and evidence file paths.
+
+Run the drill and release-evidence follow-up in this audited order:
+
+1. `pre-backup`: collect or verify the off-host backup evidence and record its path/hash.
+2. `before state`: record target host, Compose project, current deployment id, artifact checksum, image digests, migration version query result, and `/readyz` probe URL/result.
+3. `upgrade`: run the upgrade command and record the command, timestamp, exit code, operation id, and new deployment id.
+4. `after verify`: verify route, artifact checksum, image digests, migration version, readiness, and HTTP probe URL/result for the upgraded deployment.
+5. `rollback`: run the rollback command and record the command, timestamp, exit code, operation id, and rollback deployment id.
+6. `rollback verify`: verify the restored route, rollback deployment id, artifact checksum, image digests, migration compatibility, readiness, and HTTP probe URL/result.
+7. `observability scrape`: run and archive the metrics, logs, and alert queries correlated to the rollback operation and timestamps.
+8. `checker`: run `npm run --silent upgrade-rollback:evidence -- --evidence <upgrade-rollback-evidence-raw.json> --commit-ref <sha> --repo <owner/repo> --branch main --target-environment production --json`.
+9. `gap report`: run `npm run --silent release:evidence:gaps -- --pack <release-evidence-rehearsal-pack.json> --json` with the same `--set` or `--set-env` replacements used for `release:evidence:target-run`, then archive the output. A bare gap command is expected to report unresolved target-run placeholders.
+10. `compose`: run `npm run --silent release:evidence:compose -- ... --upgrade-rollback-evidence <upgrade-rollback-evidence.json> --output <release-evidence.json>`.
+11. `final release:evidence`: run `npm run --silent release:evidence -- --evidence <release-evidence.json> --commit-ref <sha> --repo <owner/repo> --branch main --target-environment production --json`.
 
 Start from the non-passing raw evidence template when preparing the drill record:
 
@@ -1287,7 +1394,41 @@ The collector does not configure the ingress, prove ownership of an arbitrary pr
 
 ## Operator access evidence
 
-Before composing release evidence, collect target or target-equivalent operator access evidence for the same release commit:
+Before composing release evidence, collect target or target-equivalent operator access evidence for the same release commit. Prefer the collector so the raw evidence and checker output are written together:
+
+```powershell
+npm run --silent operator-access:evidence:collect -- `
+  --base-url https://siteflow.example.com `
+  --commit-ref <sha> `
+  --repo <owner/repo> `
+  --branch main `
+  --target-environment production `
+  --operator-name "<operator>" `
+  --release-ticket "<ticket>" `
+  --project-id <allowed-project-id> `
+  --denied-project-id <denied-project-id> `
+  --admin-token-env SITEFLOW_API_TOKEN `
+  --low-scope-token-env SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN `
+  --execute-project-cutoff `
+  --execute-global-cutoff `
+  --i-understand-this-revokes-active-operator-sessions `
+  --browser-token-fallback-disabled `
+  --local-storage-fallback-disabled `
+  --output <operator-access-evidence-raw.json> `
+  --check-output <operator-access-evidence.json> `
+  --json
+```
+
+This collector is not a read-only probe. It creates admin and project-scoped
+operator sessions, exercises session rotation and cutoff paths, creates and
+disables a temporary routing rule to prove server-derived actor attribution,
+and treats cleanup failure as blocking evidence. The global cutoff flag revokes
+active operator sessions and must be used only during a coordinated evidence
+window.
+
+If the target cannot be probed directly, start from the template and replace
+every placeholder with observations from the target or target-equivalent
+operator access run before checking it:
 
 ```powershell
 npm run --silent operator-access:evidence:template -- `
@@ -1299,11 +1440,7 @@ npm run --silent operator-access:evidence:template -- `
   --operator-name "<operator>" `
   --release-ticket "<ticket>" `
   --output <operator-access-evidence-raw.json>
-```
 
-The template is only a non-passing starting point: it writes `status: "blocked"`, `dryRun: true`, and `template: true` with `todo` / `null` fields. Replace every placeholder with observations from the target or target-equivalent operator access run before checking it:
-
-```powershell
 npm run --silent operator-access:evidence -- --evidence <operator-access-evidence-raw.json> --commit-ref <sha> --repo <owner/repo> --branch main --target-environment production --json > <operator-access-evidence.json>
 ```
 
@@ -1322,7 +1459,9 @@ The raw evidence must use `schemaVersion: "siteflow.operatorAccessEvidence.v1"` 
 - Evidence archives no raw Bearer tokens, raw session secrets, or authorization headers, and does not claim full login, IdP, MFA, credentialed CORS, or non-session credential rotation are complete.
 - Operator and release/change/incident ticket metadata are present.
 
-This checker audits operator-collected evidence only. It does not create sessions, collect the rotation proof by itself, rotate non-session credentials, probe CORS, or implement a login/IdP workflow.
+The checker audits operator-collected evidence only. It does not create
+sessions, collect the rotation proof by itself, rotate non-session credentials,
+probe CORS, or implement a login/IdP workflow.
 
 ## Non-session credential evidence
 
@@ -1340,6 +1479,42 @@ npm run --silent non-session-credential:evidence:template -- `
 ```
 
 The template is only a non-passing starting point: it writes `status: "blocked"`, `dryRun: true`, and `template: true` with `todo` / `null` fields for supported credential types and break-glass controls. Replace every placeholder with target or target-equivalent observations before checking it:
+
+For metrics and root API token cutover evidence, run the collector on the target evidence host after rotating the tokens and reloading the service or scraper:
+
+```powershell
+npm run --silent non-session-credential:evidence:collect -- `
+  --base-url <target-url> `
+  --old-metrics-token-env SITEFLOW_OLD_METRICS_TOKEN `
+  --new-metrics-token-env SITEFLOW_METRICS_TOKEN `
+  --old-api-token-env SITEFLOW_OLD_API_TOKEN `
+  --new-api-token-env SITEFLOW_API_TOKEN `
+  --old-redacted-identifier <old-metrics-token-redacted-id> `
+  --new-redacted-identifier <new-metrics-token-redacted-id> `
+  --old-api-redacted-identifier <old-root-api-token-redacted-id> `
+  --new-api-redacted-identifier <new-root-api-token-redacted-id> `
+  --commit-ref <sha> `
+  --repo <owner/repo> `
+  --branch main `
+  --target-environment production `
+  --operator-name "<operator>" `
+  --release-ticket "<ticket>" `
+  --break-glass-source vault `
+  --break-glass-approver-count 2 `
+  --break-glass-reviewed `
+  --break-glass-time-bounded `
+  --break-glass-revocation-planned `
+  --output <non-session-credential-evidence-raw.json> `
+  --check-output <non-session-credential-evidence.json>
+```
+
+The collector probes `/metrics` with the old and new metrics bearer tokens and
+`/api/auth/verify` with the old and new root API bearer tokens. It requires old
+tokens to return HTTP `401` or `403`, new tokens to return HTTP `200`, and
+writes both raw evidence and checker output. It records only status codes,
+redacted identifiers, env variable names, and no-raw-archive flags; it does not
+archive raw tokens, Authorization headers, response bodies, or secret file
+contents.
 
 ```powershell
 npm run --silent non-session-credential:evidence -- --evidence <non-session-credential-evidence-raw.json> --commit-ref <sha> --repo <owner/repo> --branch main --target-environment production --json > <non-session-credential-evidence.json>
@@ -1369,6 +1544,7 @@ npm run --silent release:evidence:rehearsal-pack -- `
   --commit-ref <sha> `
   --repo <owner/repo> `
   --branch main `
+  --source-provider github `
   --target-env-file evidence/target.env `
   --public-base-url https://siteflow.example.com `
   --operator-name "<operator>" `
@@ -1378,17 +1554,25 @@ npm run --silent release:evidence:rehearsal-pack -- `
   --json
 ```
 
-The pack writes `release-evidence-rehearsal-pack.json` and `release-evidence-rehearsal-pack.md`. It binds the expected evidence file paths and commands to one release identity and target environment: release gate, Docker build rehearsal, Postgres rehearsal, source provider evidence, backup evidence, observability evidence, operator access evidence, non-session credential evidence, ingress evidence, upgrade/rollback evidence, final bundle compose, and final release evidence check. The source provider, operator access, non-session credential, ingress operator, and upgrade/rollback steps also print matching template commands for their pack raw/operator evidence paths; those templates are intentionally blocked/dry-run manual evidence skeletons and must be completed with real observations before checker outputs can satisfy the release bundle.
+The pack writes `release-evidence-rehearsal-pack.json` and `release-evidence-rehearsal-pack.md`. It binds the expected evidence file paths and commands to one release identity, target environment, and source provider. `--source-provider` defaults to `github`; the GitHub path uses `source-provider:evidence:collect` and requires `GITHUB_TOKEN`. For `gitlab`, `gitea`, or `generic`, the source-provider step is a manual `source-provider:evidence:template` plus checker path, and does not require `GITHUB_TOKEN`. The operator access and non-session credential steps run collectors and write both raw evidence and checker output paths when the target inputs are available. Matching template commands remain as fallback commands for source-provider, observability operator, operator access, non-session credential, ingress operator, and upgrade/rollback evidence; those templates are intentionally blocked/dry-run manual evidence skeletons and must be completed with real observations before checker outputs can satisfy the release bundle.
 
 Pass `--docker-socket-profile-accepted` only after the release owner has recorded acceptance of the trusted single-host Docker socket worker profile. Without that flag, the generated final compose command does not include Docker socket acceptance and a Docker-runner production bundle must still be manually accepted before it can pass.
 
-The generated JSON pack is a contract. `release:evidence:target-run` and `release:evidence:gaps` reject incomplete, truncated, or hand-edited packs that omit required evidence steps, required command semantics, final commands, or release evidence output paths. The contract checks the expected `npm` executable, script names, release identity flags, target-environment flags, required environment variable names, and `captureStdoutTo` / `--output` / `--check-output` bindings before any target command is executed or reported.
+The generated JSON pack is a contract. `release:evidence:target-run` and `release:evidence:gaps` reject incomplete, truncated, or hand-edited packs that omit required evidence steps, required command semantics, final commands, release evidence output paths, or the final signed-attestation key requirement. The contract checks the expected `npm` executable, script names, release identity flags, target-environment flags, required environment variable names, and `captureStdoutTo` / `--output` / `--check-output` bindings before any target command is executed or reported.
 
-This pack is a planning and operator handoff artifact only. It does not call GitHub, run Docker, run Postgres, create backups, execute the generated ingress collector, scrape metrics, create sessions, rotate credentials, or generate synthetic checker outputs. It is not production evidence until every command output exists and `npm run --silent release:evidence -- --evidence <release-evidence.json> --commit-ref <sha> --repo <owner/repo> --branch main --target-environment <environment> --json` passes.
+CI and release-readiness checks can run the offline contract gate without touching target systems:
+
+```powershell
+npm run --silent release:evidence:pack-contract -- --json
+```
+
+That command generates a representative pack, validates the contract, runs a `release:evidence:target-run --plan-only` path with fake local `npm` / `gh` executables, verifies the expected operator placeholders and env placeholders, and scans the generated result for sensitive-looking output. It is a contract regression check only; it does not create production evidence.
+
+This pack is a planning and operator handoff artifact only. It does not call GitHub, run Docker, run Postgres, create backups, execute generated collectors, scrape metrics, create sessions, rotate credentials, or generate synthetic checker outputs until an operator explicitly runs the target-run command. It is not production evidence until every command output exists and `npm run --silent release:evidence -- --evidence <release-evidence.json> --commit-ref <sha> --repo <owner/repo> --branch main --target-environment <environment> --attestation-key-env SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY --json` passes for production.
 
 ## Release preflight workflow
 
-Use the manual GitHub Actions `Release Preflight` workflow before a promotion window when GitHub has access to the release repository, a target env file can be supplied through the `SITEFLOW_RELEASE_ENV_FILE_B64` secret, and SiteFlow API access can be supplied through the `SITEFLOW_API_TOKEN` secret.
+Use the manual GitHub Actions `Release Preflight` workflow before a promotion window when GitHub has access to the release repository, a target env file can be supplied through the `SITEFLOW_RELEASE_ENV_FILE_B64` secret, SiteFlow API access can be supplied through the `SITEFLOW_API_TOKEN` secret, the retired root API token can be supplied through `SITEFLOW_OLD_API_TOKEN`, and the release evidence attestation key can be supplied through `SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY`. The workflow inputs must include non-secret redacted identifiers for old/new metrics tokens and old/new root API tokens; never put raw tokens in workflow inputs.
 
 The workflow checks out the exact `commit_ref`, validates that the `repo` input matches the checkout, requires the target build image to be digest-pinned, requires `docker_socket_profile_accepted=true` before generating a pack that accepts the trusted single-host worker profile, runs the production build, checks that `npm ci` and `npm run build` leave the checkout clean before decoding target secrets, inspects `candidate_deployment_id` through `siteflow_api_url`, runs `release:artifacts:check` against the private deployment detail, writes only the sanitized `deployment-artifact-manifest.json`, runs `siteflow release-gate --promotion --require-commit-status`, generates the release evidence rehearsal pack, runs non-plan-only `release:evidence:target-run`, writes a gap report artifact, runs Playwright E2E safeguards, removes private inputs, and uploads the remaining evidence and Playwright artifacts.
 
@@ -1405,16 +1589,52 @@ During a promotion rehearsal, use the pack to report which target evidence files
 ```powershell
 $env:SITEFLOW_DIRECT_API_URL = 'https://siteflow-api.internal:8787/readyz'
 $env:SITEFLOW_RELEASE_IMAGE_RUN_ID = '123456789'
+$env:SITEFLOW_SOURCE_PROVIDER_WEBHOOK_DELIVERY_ID = '<delivery-id>'
+$env:SITEFLOW_SOURCE_PROVIDER_DEPLOY_KEY_PATH = '<deploy-key-path>'
+$env:SITEFLOW_SOURCE_PROVIDER_KNOWN_HOSTS_PATH = '<known-hosts-path>'
+$env:SITEFLOW_RELEASE_IMAGE_DIGEST = 'sha256:<release-image-digest>'
+$env:SITEFLOW_TRUST_PROXY = 'loopback'
+$env:SITEFLOW_API_INSTANCE_COUNT = '1'
+$env:SITEFLOW_API_PROCESS_COUNT = '1'
+$env:SITEFLOW_INGRESS_COUNT = '1'
+$env:SITEFLOW_API_RATE_LIMIT_SCOPE = 'edge'
+$env:SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT = 'ingress'
+$env:SITEFLOW_OPERATOR_ACCESS_PROJECT_ID = '<allowed-project-id>'
+$env:SITEFLOW_OPERATOR_ACCESS_DENIED_PROJECT_ID = '<denied-project-id>'
+$env:SITEFLOW_OLD_METRICS_TOKEN_REDACTED_ID = '<old-metrics-token-redacted-id>'
+$env:SITEFLOW_NEW_METRICS_TOKEN_REDACTED_ID = '<new-metrics-token-redacted-id>'
+$env:SITEFLOW_OLD_ROOT_API_TOKEN_REDACTED_ID = '<old-root-api-token-redacted-id>'
+$env:SITEFLOW_NEW_ROOT_API_TOKEN_REDACTED_ID = '<new-root-api-token-redacted-id>'
+$env:SITEFLOW_BREAK_GLASS_SOURCE = '<vault-or-ticket-system>'
+$env:SITEFLOW_BREAK_GLASS_APPROVER_COUNT = '<count>'
 npm run --silent release:evidence:gaps -- `
   --pack evidence/release-<sha>/release-evidence-rehearsal-pack.json `
   --set-env direct-api-url=SITEFLOW_DIRECT_API_URL `
+  --set-env release-image-digest=SITEFLOW_RELEASE_IMAGE_DIGEST `
   --set-env release-image-run-id=SITEFLOW_RELEASE_IMAGE_RUN_ID `
+  --set-env webhook-delivery-id=SITEFLOW_SOURCE_PROVIDER_WEBHOOK_DELIVERY_ID `
+  --set-env deploy-key-path=SITEFLOW_SOURCE_PROVIDER_DEPLOY_KEY_PATH `
+  --set-env known-hosts-path=SITEFLOW_SOURCE_PROVIDER_KNOWN_HOSTS_PATH `
+  --set-env SITEFLOW_TRUST_PROXY=SITEFLOW_TRUST_PROXY `
+  --set-env api-instance-count=SITEFLOW_API_INSTANCE_COUNT `
+  --set-env api-process-count=SITEFLOW_API_PROCESS_COUNT `
+  --set-env ingress-count=SITEFLOW_INGRESS_COUNT `
+  --set-env api-rate-limit-scope=SITEFLOW_API_RATE_LIMIT_SCOPE `
+  --set-env api-rate-limit-enforcement-point=SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT `
+  --set-env operator-access-project-id=SITEFLOW_OPERATOR_ACCESS_PROJECT_ID `
+  --set-env operator-access-denied-project-id=SITEFLOW_OPERATOR_ACCESS_DENIED_PROJECT_ID `
+  --set-env old-metrics-token-redacted-id=SITEFLOW_OLD_METRICS_TOKEN_REDACTED_ID `
+  --set-env new-metrics-token-redacted-id=SITEFLOW_NEW_METRICS_TOKEN_REDACTED_ID `
+  --set-env old-root-api-token-redacted-id=SITEFLOW_OLD_ROOT_API_TOKEN_REDACTED_ID `
+  --set-env new-root-api-token-redacted-id=SITEFLOW_NEW_ROOT_API_TOKEN_REDACTED_ID `
+  --set-env break-glass-source=SITEFLOW_BREAK_GLASS_SOURCE `
+  --set-env break-glass-approver-count=SITEFLOW_BREAK_GLASS_APPROVER_COUNT `
   --json
 ```
 
 The gap reporter reads the rehearsal pack and existing evidence outputs only. It first validates that the pack contains the complete required release evidence command contract, including command semantics and output target bindings. It then reports each planned evidence file, the final composed bundle, and the final release evidence check as `passed`, `missing`, `invalid`, `blocked`, `failed`, `manual_required`, `dry_run_only`, `stale`, or `identity_mismatch`, and includes the next command from the pack for non-passing items.
 
-The report also includes `inputGaps` on each item when the next command references missing raw input files, required environment variable names, or unresolved structured command argument placeholders such as `<release-image-run-id>`, `<direct-api-url>`, and `<api-instance-count>`. Pass repeatable `--set KEY=value` options to rehearse placeholder replacement without running the command, or `--set-env KEY=ENV_NAME` to read the replacement from an environment variable. It never prints environment variable values, `--set` replacement values, or resolved `--set-env` values, and does not read target env-file contents; it only records referenced local files, variable names, placeholder keys, and `--set-env` key/env-name pairs.
+The report also includes `inputGaps` on each item when the next command references missing raw input files, required environment variable names, or unresolved structured command argument placeholders such as `<release-image-digest>`, `<release-image-run-id>`, `<direct-api-url>`, `<api-instance-count>`, `<webhook-delivery-id>`, `<deploy-key-path>`, `<known-hosts-path>`, `<operator-access-project-id>`, `<old-root-api-token-redacted-id>`, `<new-root-api-token-redacted-id>`, `<break-glass-source>`, and `<break-glass-approver-count>`. Pass repeatable `--set KEY=value` options to rehearse placeholder replacement without running the command, or `--set-env KEY=ENV_NAME` to read the replacement from an environment variable. It never prints environment variable values, `--set` replacement values, or resolved `--set-env` values, and does not read target env-file contents; it only records referenced local files, variable names, placeholder keys, and `--set-env` key/env-name pairs.
 
 For `postgres_rehearsal`, `docker_build_rehearsal`, `source_provider_evidence`, `backup_evidence`, `observability_evidence`, `operator_access_evidence`, `non_session_credential_evidence`, `ingress_evidence`, and `upgrade_rollback_evidence`, the gap reporter also runs evidence-specific diagnostics before the final bundle check. A JSON file that generically says `status: "passed"` is still reported as `blocked` when required Postgres scenario results are missing or were collected for a different `targetEnvironment`, Docker runner profile or artifact integrity fields are weak, source provider evidence lacks selected provider/webhook/release identity or required checker rows, backup evidence was not checked with `requireOffHost: true` and complete selected verify/restore/offload/prune evidence, observability evidence lacks selected readiness/metrics/backup automation/alert/dashboard/log summaries and required observability checker rows, operator access/non-session credential/ingress checker outputs lack selected release-bound evidence, target-environment binding, or non-empty passing checker rows, or upgrade/rollback evidence lacks target binding, operation order, backup, route, readiness, observability, operator, and ticket checker rows. These issues appear in `failedChecks` with names such as `postgres_target_environment`, `postgres_scenario_results`, `docker_build_rehearsal_profile`, `docker_build_rehearsal_artifact`, `source_provider_selected_evidence`, `source_provider_required_checks`, `backup_off_host_required`, `backup_offload_prune_checks`, `observability_selected_evidence`, `observability_required_checks`, `operator_access_target_environment`, `non_session_credential_target_environment`, `ingress_target_environment`, `upgrade_rollback_target_environment`, or `upgrade_rollback_required_checks` so operators can rerun the pack command instead of discovering the issue only at final bundle time.
 
@@ -1445,18 +1665,32 @@ Treat `recommendedCommands` as an operator checklist, not automation. A real Git
 After the reviewed index-only cleanup plan, generate a release commit readiness plan before staging production-gate files:
 
 ```powershell
+$releaseCommitPlan = Join-Path $env:TEMP "siteflow-release-commit-readiness-plan.json"
+$releaseCommitChecklist = Join-Path $env:TEMP "siteflow-release-commit-review-checklist.md"
+
 npm run --silent release:commit:plan -- `
-  --output release-commit-readiness-plan.json `
+  --output "$releaseCommitPlan" `
   --json
 ```
 
-The commit readiness plan is also read-only. It combines the forbidden tracked release-source summary with production-critical untracked files such as `.github/workflows/ci.yml`, `.github/workflows/release-preflight.yml`, `.github/workflows/release-image.yml`, `.gitignore`, `.dockerignore`, `Dockerfile`, `.env.example`, `tsconfig.scripts.json`, release gate/source policy files, release evidence scripts, and production runbooks. It also reports non-forbidden tracked dirty source files as `trackedDirtySource` so existing source edits are not missed when preparing the release commit. Its `suggestedStagingGroups` and `recommendedCommands` use explicit pathspecs and intentionally never recommend `git add .`. Review the plan, stage only the listed production-readiness paths that belong in the release commit, and keep generated, dependency, scratch, report, and evidence JSON paths excluded.
+For human review, emit the Markdown checklist to stdout or to a temp path outside the repository:
 
-The safe source-to-commit sequence is: run `release:source:cleanup-plan`, perform any approved index-only cleanup as a separate commit, run `release:commit:plan`, stage reviewed production-readiness files with explicit pathspecs, then rerun `release:source:check` and `siteflow release-gate`. Neither planning command changes the Git index.
+```powershell
+npm run --silent release:commit:plan -- --review-checklist
+npm run --silent release:commit:plan -- `
+  --json `
+  --review-checklist-output "$releaseCommitChecklist"
+```
 
-The release image workflow uploads `release-image-evidence.json` with the GHCR image name, version tag, commit tag, digest, repository, commit, ref, GitHub run identifiers, and registry attestation inspection metadata. The workflow fails before upload if the published digest does not expose registry SLSA provenance and SBOM attestation manifests. Archive that artifact with the release preflight outputs; a digest in a step summary is operator-readable, but the JSON artifact is the evidence input that downstream automation can compare. The release evidence rehearsal pack now includes a `release_image_evidence` step that downloads this artifact with `gh run download <release-image-run-id> --name release-image-evidence --dir <evidence-dir>`, and final `release:evidence:compose` requires `--release-image-evidence <file>`.
+The commit readiness plan is also read-only. It combines the forbidden tracked release-source summary with production-critical untracked files such as `.github/workflows/ci.yml`, `.github/workflows/release-preflight.yml`, `.github/workflows/release-image.yml`, `.gitignore`, `.dockerignore`, `Dockerfile`, `.env.example`, `tsconfig.scripts.json`, release gate/source policy files, release evidence scripts, and production runbooks. It reports ordinary non-forbidden untracked source files as `untrackedSource` with `blockingReleaseCommit: true`, and non-forbidden tracked dirty source files as `trackedDirtySource` so source edits are not missed when preparing the release commit. Its `suggestedStagingGroups` and `recommendedCommands` use explicit pathspecs and intentionally never recommend `git add .`; `stagingCoverage` must report `covered: true`, no `missingRequiredPaths`, and no `excludedSuggestedPathspecs` before an operator treats those pathspecs as the complete release-readiness review set. Generated or forbidden pathspecs such as `evidence/`, `.vite/`, `release-commit-readiness-plan*.json`, and `npm-debug.log*` are shared with the release source policy and kept aligned with `.gitignore` / `.dockerignore`; keep generated, dependency, scratch, report, and evidence JSON paths excluded. Do not write plan or checklist outputs into the repository root during dirty-checkout convergence; use stdout, `$env:TEMP`, or a release preflight evidence directory under `$RUNNER_TEMP`.
+
+The safe source-to-commit sequence is: run `release:source:cleanup-plan`, perform any approved index-only cleanup as a separate commit, run `release:commit:plan`, review the optional `--review-checklist` path groups, stage reviewed production-readiness files with explicit pathspecs, then rerun `release:source:check` and `siteflow release-gate`. Neither planning command changes the Git index.
+
+The release image workflow uploads `release-image-evidence.json` with the GHCR image name, version tag, commit tag, digest, repository, commit, ref, GitHub run identifiers, and registry attestation inspection metadata. It records provenance/SBOM predicate types, attestation manifest digests, inspected statement digests, statement subjects, provenance source identity, builder identity, and materials when the registry exposes the attestation layer. If only the registry manifest list can be inspected, the workflow writes explicit `failedChecks` for the unproven fields and then fails the gate after uploading the evidence artifact. Archive that artifact with the release preflight outputs; a digest in a step summary is operator-readable, but the JSON artifact is the evidence input that downstream automation can compare. The release evidence rehearsal pack now includes a `release_image_evidence` step that downloads this artifact with `gh run download <release-image-run-id> --name release-image-evidence --dir <evidence-dir>`, and final `release:evidence:compose` requires `--release-image-evidence <file>`.
 
 After a production promotion has been accepted and the route is expected to be applied, collect post-promotion evidence that the passing release bundle is the one stored on the live production route:
+
+Archive fresh probe JSON files from the target route. Readiness must target `/readyz` and return `200`; metrics must target `/metrics` and return `200`, `401`, or `403` depending on the private scrape/auth posture. Both files must include an ISO `checkedAt` or `timestamp` no more than 1 hour old when the checker runs.
 
 ```powershell
 npm run --silent release:evidence:post-promote -- `
@@ -1466,10 +1700,12 @@ npm run --silent release:evidence:post-promote -- `
   --deployment <deployment-id> `
   --project <project-id> `
   --expected-evidence-path evidence/release-evidence.json `
+  --readiness evidence/post-promotion-readyz-probe.json `
+  --metrics evidence/post-promotion-metrics-probe.json `
   --json
 ```
 
-This checker is read-only. It re-runs the final release evidence bundle evaluator, fetches deployment detail through the SiteFlow API, verifies the deployment is ready, verifies the route revision is applied to the inspected deployment, and compares the route's stored release evidence metadata plus artifact counts against the release bundle. It proves the promotion record is bound to the live route it inspected; it does not replace the pre-promotion `release:evidence` gate or prove global CDN convergence.
+Use `--production-exception <file>` only for a time-bounded, approved, ticketed break-glass case when one of those probes cannot be collected. This checker is read-only. It re-runs the final release evidence bundle evaluator, fetches deployment detail through the SiteFlow API, verifies the deployment is ready, verifies the route revision is applied to the inspected deployment, validates the post-promotion probes or accepted exception, and compares the route's stored release evidence metadata plus artifact counts against the release bundle. It proves the promotion record is bound to the live route it inspected; it does not replace the pre-promotion `release:evidence` gate or prove global CDN convergence.
 
 ## Release evidence target run
 
@@ -1484,17 +1720,41 @@ $env:SITEFLOW_API_PROCESS_COUNT = '1'
 $env:SITEFLOW_INGRESS_COUNT = '1'
 $env:SITEFLOW_API_RATE_LIMIT_SCOPE = 'edge'
 $env:SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT = 'ingress'
+$env:SITEFLOW_SOURCE_PROVIDER_WEBHOOK_DELIVERY_ID = '<delivery-id>'
+$env:SITEFLOW_SOURCE_PROVIDER_DEPLOY_KEY_PATH = '<deploy-key-path>'
+$env:SITEFLOW_SOURCE_PROVIDER_KNOWN_HOSTS_PATH = '<known-hosts-path>'
+$env:SITEFLOW_OPERATOR_ACCESS_PROJECT_ID = '<allowed-project-id>'
+$env:SITEFLOW_OPERATOR_ACCESS_DENIED_PROJECT_ID = '<denied-project-id>'
+$env:SITEFLOW_OLD_METRICS_TOKEN_REDACTED_ID = '<old-metrics-token-redacted-id>'
+$env:SITEFLOW_NEW_METRICS_TOKEN_REDACTED_ID = '<new-metrics-token-redacted-id>'
+$env:SITEFLOW_OLD_ROOT_API_TOKEN_REDACTED_ID = '<old-root-api-token-redacted-id>'
+$env:SITEFLOW_NEW_ROOT_API_TOKEN_REDACTED_ID = '<new-root-api-token-redacted-id>'
+$env:SITEFLOW_BREAK_GLASS_SOURCE = '<vault-or-ticket-system>'
+$env:SITEFLOW_BREAK_GLASS_APPROVER_COUNT = '<count>'
+$env:SITEFLOW_RELEASE_IMAGE_DIGEST = 'sha256:<release-image-digest>'
 npm run --silent release:evidence:target-run -- `
   --pack evidence/release-<sha>/release-evidence-rehearsal-pack.json `
   --confirm-target-environment production `
   --set-env direct-api-url=SITEFLOW_DIRECT_API_URL `
+  --set-env release-image-digest=SITEFLOW_RELEASE_IMAGE_DIGEST `
   --set-env release-image-run-id=SITEFLOW_RELEASE_IMAGE_RUN_ID `
+  --set-env webhook-delivery-id=SITEFLOW_SOURCE_PROVIDER_WEBHOOK_DELIVERY_ID `
+  --set-env deploy-key-path=SITEFLOW_SOURCE_PROVIDER_DEPLOY_KEY_PATH `
+  --set-env known-hosts-path=SITEFLOW_SOURCE_PROVIDER_KNOWN_HOSTS_PATH `
   --set-env SITEFLOW_TRUST_PROXY=SITEFLOW_TRUST_PROXY `
   --set-env api-instance-count=SITEFLOW_API_INSTANCE_COUNT `
   --set-env api-process-count=SITEFLOW_API_PROCESS_COUNT `
   --set-env ingress-count=SITEFLOW_INGRESS_COUNT `
   --set-env api-rate-limit-scope=SITEFLOW_API_RATE_LIMIT_SCOPE `
   --set-env api-rate-limit-enforcement-point=SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT `
+  --set-env operator-access-project-id=SITEFLOW_OPERATOR_ACCESS_PROJECT_ID `
+  --set-env operator-access-denied-project-id=SITEFLOW_OPERATOR_ACCESS_DENIED_PROJECT_ID `
+  --set-env old-metrics-token-redacted-id=SITEFLOW_OLD_METRICS_TOKEN_REDACTED_ID `
+  --set-env new-metrics-token-redacted-id=SITEFLOW_NEW_METRICS_TOKEN_REDACTED_ID `
+  --set-env old-root-api-token-redacted-id=SITEFLOW_OLD_ROOT_API_TOKEN_REDACTED_ID `
+  --set-env new-root-api-token-redacted-id=SITEFLOW_NEW_ROOT_API_TOKEN_REDACTED_ID `
+  --set-env break-glass-source=SITEFLOW_BREAK_GLASS_SOURCE `
+  --set-env break-glass-approver-count=SITEFLOW_BREAK_GLASS_APPROVER_COUNT `
   --json
 ```
 
@@ -1505,14 +1765,36 @@ Postgres, backup, observability, ingress, credential, or rollback commands.
 Treat it as command-contract and prerequisite rehearsal only; it is not target
 evidence and cannot satisfy the final promotion gate.
 
-Target runtime raw evidence must be completed from the actual target host before
-`release:target-runtime:evidence` can pass. At minimum, record the redacted
-Compose config command, observation source, compose project, no-build-fallback
-state, and API/worker image references pinned to the release digest; the startup
-command; service-health command and compose project; worker health, queue probe,
-and fresh heartbeat; API/worker container IDs and image IDs; restart smoke with
-worker health after restart; readiness; log sanity; and negative evidence that
-raw config, env, secrets, and unredacted logs were not archived.
+Target runtime raw evidence must be collected from the actual target host before
+`release:target-runtime:evidence` can pass. Prefer the collector so the raw
+target-runtime evidence and checker output are written together:
+
+```powershell
+npm run --silent release:target-runtime:evidence:collect -- `
+  --commit-ref <sha> `
+  --repo <owner/repo> `
+  --branch main `
+  --target-environment production `
+  --public-base-url <https-url> `
+  --env-file evidence/target.env `
+  --operator-name <operator> `
+  --release-ticket <ticket> `
+  --output evidence/target-runtime-evidence-raw.json `
+  --check-output evidence/target-runtime-evidence.json `
+  --json
+```
+
+The collector records sanitized target host identity first: `hostname`, Docker
+context name, a hash of `docker context inspect`, the Compose project, and a
+host fingerprint hash. It then runs target `docker compose`
+startup/status/restart checks, executes the worker healthcheck, probes loopback
+and public `/readyz`, records API/worker image and container binding,
+summarizes log sanity, and avoids archiving raw Docker context inspect output,
+raw Compose config, raw env, raw secrets, or unredacted logs. If an operator
+must provide equivalent manual observations, start from
+`release:target-runtime:evidence:template`, replace every placeholder with
+target-host facts, and then run `release:target-runtime:evidence` against the
+raw evidence file.
 
 Do not copy bare angle-bracket placeholders into PowerShell commands. Replace placeholder values first, and prefer `--set-env KEY=ENV_NAME` for target topology values so run scripts show stable environment variable names rather than the values themselves. If you use `--set`, quote values that contain `=`, `:`, `/`, spaces, or shell-sensitive characters.
 
@@ -1522,7 +1804,7 @@ Use `--continue-on-error` only when collecting partial evidence during rehearsal
 
 ## Release evidence bundle
 
-After collecting the real promotion, Docker build rehearsal, Postgres rehearsal, source provider, target runtime, backup, observability, operator access, non-session credential, ingress, and upgrade/rollback drill outputs, compose them into one release evidence file:
+After collecting the real promotion, Docker build rehearsal, Postgres rehearsal, source provider, target runtime, backup, observability, operator access, non-session credential, ingress, and upgrade/rollback drill outputs, compose them into one release evidence file. Set `SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY` or `SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE` first; production bundle checks and API mutation gates require a signed attestation. Set `SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID` when the production API must pin one non-secret attestation key id during rotation.
 
 ```powershell
 npm run --silent release:evidence:compose -- `
@@ -1542,6 +1824,8 @@ npm run --silent release:evidence:compose -- `
   --target-environment production `
   --operator-name "<operator>" `
   --release-ticket "<ticket>" `
+  --attestation-key-env SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY `
+  --attestation-key-id-env SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID `
   --output release-evidence.json
 ```
 
@@ -1550,8 +1834,10 @@ Use `--ticket-id` as an alias for `--release-ticket` when the release process na
 Then validate the composed bundle:
 
 ```powershell
-npm run --silent release:evidence -- --evidence <release-evidence.json> --commit-ref <sha> --repo <owner/repo> --branch main --target-environment production --json
+npm run --silent release:evidence -- --evidence <release-evidence.json> --commit-ref <sha> --repo <owner/repo> --branch main --target-environment production --attestation-key-env SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY --attestation-key-id-env SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID --json
 ```
+
+The rehearsal pack uses `--attestation-key-env SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY` and `--attestation-key-id-env SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID` in its final commands. A mounted `SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE` also satisfies the signing key requirement because compose/check fall back to the default file env and the gap/target-run checks treat `_FILE` as the non-archived secret source. For one-off manual commands, `--attestation-key-file "$SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE"` is equivalent.
 
 Mutating CLI production promotion commands must use the same passing bundle:
 

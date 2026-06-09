@@ -31,6 +31,7 @@ import {
 } from "./releaseGate.js";
 import {
   evaluateReleaseEvidenceBundle,
+  releaseEvidenceRequiredAttestationKeyIdFromEnv,
   type ReleaseEvidenceBundleResult
 } from "../scripts/releaseEvidenceBundleCheck.js";
 
@@ -53,6 +54,7 @@ export interface CliDependencies {
 export interface ReleaseEvidenceGateDependencies {
   evaluate?: typeof evaluateReleaseEvidenceBundle;
   readFile?: typeof readFile;
+  env?: NodeJS.ProcessEnv;
   now?: () => Date;
 }
 
@@ -179,6 +181,7 @@ interface ReleaseEvidenceGateResult {
 interface ReleaseEvidenceMetadata {
   evidencePath: string;
   checkedAt: string;
+  payloadDigest: string;
   status: "passed";
   commitRef: string;
   repository: string;
@@ -687,6 +690,51 @@ function productionChannel(channel: string) {
   return channel.toLowerCase() === "production";
 }
 
+function nonEmptySecret(value: string | undefined) {
+  const normalized = value?.trim();
+
+  return normalized ? normalized : undefined;
+}
+
+function trimTrailingNewlines(value: string) {
+  return value.replace(/[\r\n]+$/g, "");
+}
+
+async function releaseEvidenceAttestationSigningKey(dependencies: ReleaseEvidenceGateDependencies | undefined) {
+  const env = dependencies?.env ?? process.env;
+  const direct = nonEmptySecret(env.SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY);
+
+  if (direct) {
+    return direct;
+  }
+
+  const filePath = nonEmptySecret(env.SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE);
+
+  if (!filePath) {
+    return undefined;
+  }
+
+  let fileValue: string | Buffer;
+
+  try {
+    fileValue = await (dependencies?.readFile ?? readFile)(filePath, "utf8");
+  } catch {
+    throw new CliBlockedError("SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE points to an unreadable release evidence signing key file.");
+  }
+
+  const normalized = trimTrailingNewlines(String(fileValue));
+
+  if (!normalized.trim()) {
+    throw new CliBlockedError("SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE points to an empty release evidence signing key file.");
+  }
+
+  return normalized;
+}
+
+function releaseEvidenceRequiredAttestationKeyId(dependencies: ReleaseEvidenceGateDependencies | undefined) {
+  return releaseEvidenceRequiredAttestationKeyIdFromEnv(dependencies?.env ?? process.env);
+}
+
 async function releaseEvidenceGate(
   parsed: ParsedArgs,
   channel: string,
@@ -711,6 +759,8 @@ async function releaseEvidenceGate(
   const check = (dependencies?.evaluate ?? evaluateReleaseEvidenceBundle)(raw, {
     evidencePath,
     targetEnvironment: "production",
+    attestationSigningKey: await releaseEvidenceAttestationSigningKey(dependencies),
+    requiredAttestationKeyId: releaseEvidenceRequiredAttestationKeyId(dependencies),
     now: dependencies?.now
   });
 
@@ -739,14 +789,20 @@ function releaseEvidenceMetadata(gate: ReleaseEvidenceGateResult | undefined): R
   const commitRef = stringValue(gate.check.selectedEvidence.releaseCommitRef);
   const repository = stringValue(gate.check.selectedEvidence.repository);
   const branch = stringValue(gate.check.selectedEvidence.branch);
+  const payloadDigest = stringValue(gate.check.payloadDigest);
 
   if (!commitRef || !repository || !branch) {
     throw new CliBlockedError("Production release evidence must include repository, branch, and commitRef.");
   }
 
+  if (!payloadDigest) {
+    throw new CliBlockedError("Production release evidence check must include a payloadDigest for the checked bundle.");
+  }
+
   return {
     evidencePath: gate.evidencePath,
     checkedAt: gate.check.checkedAt,
+    payloadDigest,
     status: "passed",
     commitRef,
     repository,
@@ -1391,7 +1447,7 @@ function helpText() {
     "  siteflow login --server https://siteflow.example.com --token <token> [--base-domain w33d.xyz]",
     "  siteflow link --project project-acme-dashboard [--server https://siteflow.example.com] [--root .] [--json]",
     "  siteflow env pull [--project project-acme-dashboard] [--environment preview] [--output .env.local] [--json]",
-    "  siteflow install --topology single --domain siteflow.w33d.xyz --base-domain w33d.xyz --image ghcr.io/siteflow/siteflow@sha256:<digest> --postgres-image postgres@sha256:<digest> --build-image node:20-bookworm-slim@sha256:<digest> --yes [--json]",
+    "  siteflow install --topology single --domain siteflow.w33d.xyz --base-domain w33d.xyz --image ghcr.io/siteflow/siteflow@sha256:<digest> --postgres-image postgres@sha256:<digest> --build-image node:20-bookworm-slim@sha256:<digest> --docker-socket-gid $(stat -c '%g' /var/run/docker.sock) --yes [--json]",
     "  siteflow backup --output <dir> --database-url <postgres-url> --artifact-root <path> [--json]",
     "  siteflow backup verify --backup <dir> [--json]",
     "  siteflow backup offload --backup <dir> --target file://<offhost-dir>|s3://<bucket/prefix> [--kms-key-ref <ref> --provider-retention-mode <mode> --provider-retention-days <days> --provider-retention-contract <id> --provider-proof] [--json]",
@@ -3913,6 +3969,8 @@ export async function runSiteFlowCli(argv: string[], io: CliIo, dependencies: Cl
     const image = flagString(parsed.flags, "image") ?? env.SITEFLOW_IMAGE;
     const postgresImage = flagString(parsed.flags, "postgres-image") ?? env.SITEFLOW_POSTGRES_IMAGE;
     const buildImage = flagString(parsed.flags, "build-image") ?? env.SITEFLOW_BUILD_IMAGE;
+    const workerUser = flagString(parsed.flags, "worker-user") ?? env.SITEFLOW_WORKER_USER;
+    const dockerSocketGid = flagString(parsed.flags, "docker-socket-gid") ?? env.SITEFLOW_DOCKER_SOCKET_GID;
     const buildImageAllowlistValue = flagString(parsed.flags, "build-image-allowlist") ?? env.SITEFLOW_BUILD_IMAGE_ALLOWLIST;
     const buildImageAllowlist = buildImageAllowlistValue
       ? buildImageAllowlistValue.split(",").map((entry) => entry.trim()).filter(Boolean)
@@ -3939,6 +3997,8 @@ export async function runSiteFlowCli(argv: string[], io: CliIo, dependencies: Cl
         image,
         postgresImage,
         buildImage,
+        workerUser,
+        dockerSocketGid,
         buildImageAllowlist,
         dryRun,
         version

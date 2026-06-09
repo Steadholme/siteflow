@@ -6,6 +6,10 @@ type CheckStatus = "pass" | "fail";
 
 export interface BackupEvidenceCheckOptions {
   evidencePath: string;
+  commitRef?: string;
+  repo?: string;
+  branch?: string;
+  targetEnvironment?: string;
   maxBackupAgeHours?: number;
   maxRestoreDrillAgeHours?: number;
   requireOffHost?: boolean;
@@ -34,6 +38,9 @@ export interface BackupEvidenceSummary {
   retentionContract?: string;
   retentionDays?: number;
   minimumBackups?: number;
+  treeSha256?: string;
+  objectCount?: number;
+  totalBytes?: number;
   dryRun?: boolean;
 }
 
@@ -42,6 +49,12 @@ export interface BackupEvidenceCheckResult {
   status: EvidenceStatus;
   checkedAt: string;
   evidencePath: string;
+  release: {
+    commitRef: string | null;
+    repository: string | null;
+    branch: string | null;
+    targetEnvironment: string | null;
+  };
   thresholds: {
     maxBackupAgeHours: number;
     maxRestoreDrillAgeHours: number;
@@ -61,6 +74,10 @@ export interface BackupEvidenceCheckResult {
 
 interface ParsedArgs {
   evidencePath?: string;
+  commitRef?: string;
+  repo?: string;
+  branch?: string;
+  targetEnvironment?: string;
   json: boolean;
   help: boolean;
   maxBackupAgeHours: number;
@@ -355,6 +372,76 @@ function nestedValue(candidate: Record<string, unknown> | undefined, path: strin
   }
 
   return current;
+}
+
+function releaseMetadata(root: Record<string, unknown> | undefined) {
+  return nestedObject(root, "release") ?? root;
+}
+
+function releaseCommit(root: Record<string, unknown> | undefined) {
+  const release = releaseMetadata(root);
+
+  return stringValue(root?.commitRef) ??
+    stringValue(root?.commitSha) ??
+    stringValue(release?.commitRef) ??
+    stringValue(release?.commitSha) ??
+    stringValue(nestedValue(root, ["selectedEvidence", "commitRef"])) ??
+    stringValue(nestedValue(root, ["selectedEvidence", "releaseCommitRef"]));
+}
+
+function releaseRepository(root: Record<string, unknown> | undefined) {
+  const release = releaseMetadata(root);
+
+  return stringValue(root?.repository) ??
+    stringValue(root?.repo) ??
+    stringValue(release?.repository) ??
+    stringValue(release?.repo) ??
+    stringValue(nestedValue(root, ["selectedEvidence", "repository"]));
+}
+
+function releaseBranch(root: Record<string, unknown> | undefined) {
+  const release = releaseMetadata(root);
+
+  return stringValue(root?.branch) ??
+    stringValue(release?.branch) ??
+    stringValue(nestedValue(root, ["selectedEvidence", "branch"]));
+}
+
+function releaseTargetEnvironment(root: Record<string, unknown> | undefined) {
+  const release = releaseMetadata(root);
+
+  return stringValue(root?.targetEnvironment) ??
+    stringValue(release?.targetEnvironment) ??
+    stringValue(nestedValue(root, ["selectedEvidence", "targetEnvironment"])) ??
+    stringValue(nestedValue(root, ["selectedEvidence", "environment"]));
+}
+
+function releaseIdentity(root: Record<string, unknown> | undefined, options: BackupEvidenceCheckOptions) {
+  return {
+    commitRef: options.commitRef ?? releaseCommit(root),
+    repository: options.repo ?? releaseRepository(root),
+    branch: options.branch ?? releaseBranch(root),
+    targetEnvironment: options.targetEnvironment ?? releaseTargetEnvironment(root)
+  };
+}
+
+function releaseIdentityMatches(root: Record<string, unknown> | undefined, options: BackupEvidenceCheckOptions) {
+  const expected = releaseIdentity(root, options);
+  const rawCommitRef = releaseCommit(root);
+  const rawRepository = releaseRepository(root);
+  const rawBranch = releaseBranch(root);
+  const rawTargetEnvironment = releaseTargetEnvironment(root);
+
+  return Boolean(
+    (!options.commitRef || expected.commitRef === options.commitRef) &&
+      (!options.repo || expected.repository === options.repo) &&
+      (!options.branch || expected.branch === options.branch) &&
+      (!options.targetEnvironment || expected.targetEnvironment === options.targetEnvironment) &&
+      (!rawCommitRef || rawCommitRef === expected.commitRef) &&
+      (!rawRepository || rawRepository === expected.repository) &&
+      (!rawBranch || rawBranch === expected.branch) &&
+      (!rawTargetEnvironment || rawTargetEnvironment === expected.targetEnvironment)
+  );
 }
 
 function positiveFiniteNumber(value: unknown) {
@@ -1002,6 +1089,9 @@ function summarizeEvidence(candidate: Record<string, unknown> | undefined, times
     retentionContract: providerRetention.retentionContract,
     retentionDays: retentionDays(candidate),
     minimumBackups: minimumBackups(candidate),
+    treeSha256: offloadTreeSha256(candidate),
+    objectCount: numberValue(offloadObjectCount(candidate)),
+    totalBytes: numberValue(offloadTotalBytes(candidate)),
     dryRun: typeof candidate.dryRun === "boolean" ? candidate.dryRun : undefined
   };
 }
@@ -1050,6 +1140,8 @@ export function evaluateBackupEvidence(
     "maxRestoreDrillAgeHours"
   );
   const requireOffHost = Boolean(options.requireOffHost);
+  const root = isObject(rawEvidence) ? rawEvidence : undefined;
+  const release = releaseIdentity(root, options);
   const backupVerify = selectBackupVerifyEvidence(rawEvidence);
   const restoreDrill = selectRestoreDrillEvidence(rawEvidence);
   const backupOffload = selectBackupOffloadEvidence(rawEvidence);
@@ -1194,6 +1286,12 @@ export function evaluateBackupEvidence(
     "ticket",
     Boolean(ticketId(rawEvidence, backupVerify, restoreDrill)),
     "Backup evidence must include an incident or release ticket id."
+  );
+  addCheck(
+    checks,
+    "release_identity",
+    releaseIdentityMatches(root, options),
+    "Backup evidence release identity must match the requested commit, repository, branch, and target environment when provided."
   );
 
   if (requireOffHost) {
@@ -1467,6 +1565,12 @@ export function evaluateBackupEvidence(
     status: passed ? "passed" : "blocked",
     checkedAt: now.toISOString(),
     evidencePath: options.evidencePath,
+    release: {
+      commitRef: release.commitRef ?? null,
+      repository: release.repository ?? null,
+      branch: release.branch ?? null,
+      targetEnvironment: release.targetEnvironment ?? null
+    },
     thresholds: {
       maxBackupAgeHours,
       maxRestoreDrillAgeHours,
@@ -1522,6 +1626,14 @@ export function parseBackupEvidenceCheckArgs(args: string[]): ParsedArgs {
 
     if (arg === "--evidence") {
       parsed.evidencePath = args[++index];
+    } else if (arg === "--commit-ref") {
+      parsed.commitRef = args[++index];
+    } else if (arg === "--repo") {
+      parsed.repo = args[++index];
+    } else if (arg === "--branch") {
+      parsed.branch = args[++index];
+    } else if (arg === "--target-environment") {
+      parsed.targetEnvironment = args[++index];
     } else if (arg === "--json") {
       parsed.json = true;
     } else if (arg === "--max-backup-age-hours") {
@@ -1553,6 +1665,10 @@ export function backupEvidenceCheckUsage() {
     "",
     "Options:",
     "  --evidence <file>                  Evidence JSON containing backup verify, restore-drill, and DR policy records.",
+    "  --commit-ref <sha>                 Bind checker output to the release commit SHA.",
+    "  --repo <owner/repo>                Bind checker output to the release repository.",
+    "  --branch <branch>                  Bind checker output to the release branch.",
+    "  --target-environment <name>        Bind checker output to the release target environment.",
     `  --max-backup-age-hours <hours>     Maximum backup manifest age. Default: ${defaultMaxBackupAgeHours}.`,
     `  --max-restore-drill-age-hours <h>  Maximum restore-drill evidence age. Default: ${defaultMaxRestoreDrillAgeHours}.`,
     "  --require-off-host                Require backupOffload and non-dry-run backupPrune evidence.",
@@ -1599,6 +1715,10 @@ export async function runBackupEvidenceCheckCli(
     const result = await runBackupEvidenceCheck({
       ...baseOptions,
       evidencePath: parsed.evidencePath!,
+      commitRef: parsed.commitRef,
+      repo: parsed.repo,
+      branch: parsed.branch,
+      targetEnvironment: parsed.targetEnvironment,
       maxBackupAgeHours: parsed.maxBackupAgeHours,
       maxRestoreDrillAgeHours: parsed.maxRestoreDrillAgeHours,
       requireOffHost: parsed.requireOffHost
@@ -1617,6 +1737,12 @@ export async function runBackupEvidenceCheckCli(
       status: "blocked",
       checkedAt: (baseOptions.now?.() ?? new Date()).toISOString(),
       evidencePath: parsed.evidencePath!,
+      release: {
+        commitRef: parsed.commitRef ?? baseOptions.commitRef ?? null,
+        repository: parsed.repo ?? baseOptions.repo ?? null,
+        branch: parsed.branch ?? baseOptions.branch ?? null,
+        targetEnvironment: parsed.targetEnvironment ?? baseOptions.targetEnvironment ?? null
+      },
       thresholds: {
         maxBackupAgeHours: parsed.maxBackupAgeHours,
         maxRestoreDrillAgeHours: parsed.maxRestoreDrillAgeHours,

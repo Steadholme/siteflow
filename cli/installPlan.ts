@@ -2,12 +2,16 @@ import {
   defaultBuildMaxArtifactBytes,
   defaultBuildMaxArtifactFiles,
   defaultBuildMinFreeBytes,
+  defaultBuildStepTimeoutMs,
+  defaultGitTimeoutMs,
   defaultPrebuiltMaxFiles,
   defaultPrebuiltMaxUploadBytes,
   normalizeBuildImage,
   normalizeBuildImageAllowlist,
+  normalizeDockerSocketGid,
   normalizeDnsName,
   normalizeProductionImage,
+  normalizeWorkerUser,
   renderComposeFile,
   renderManagedNginxConfig,
   renderSiteFlowEnvFile,
@@ -54,6 +58,8 @@ export interface CreateInstallPlanInput {
   image?: string;
   postgresImage?: string;
   dryRun?: boolean;
+  workerUser?: string;
+  dockerSocketGid?: string;
   workerPollIntervalMs?: number;
   buildImage?: string;
   buildImageAllowlist?: string[];
@@ -95,6 +101,8 @@ export function createSingleHostInstallPlan(input: CreateInstallPlanInput): Inst
   const wildcardBaseDomain = normalizeOptionalDomain(input.baseDomain, "Wildcard base domain") ?? controlPlaneHost;
   const apiPort = normalizeApiPort(input.apiPort);
   const workerPollIntervalMs = normalizeWorkerPollIntervalMs(input.workerPollIntervalMs);
+  const workerUser = normalizeWorkerUser(input.workerUser);
+  const dockerSocketGid = normalizeDockerSocketGid(input.dockerSocketGid);
   const buildImage = normalizeBuildImage(input.buildImage);
   normalizeProductionImage(buildImage, "SITEFLOW_BUILD_IMAGE");
   const buildImageAllowlist = normalizeBuildImageAllowlist(input.buildImageAllowlist, buildImage);
@@ -118,13 +126,17 @@ export function createSingleHostInstallPlan(input: CreateInstallPlanInput): Inst
     SITEFLOW_API_PORT: String(apiPort),
     SITEFLOW_ARTIFACT_ROOT: installState.storage.artifactRoot ?? `${installState.paths.dataDir}/artifacts`,
     SITEFLOW_PUBLIC_SCHEME: publicScheme,
-    SITEFLOW_TRUST_PROXY: "loopback",
+    SITEFLOW_TRUST_PROXY: "",
+    SITEFLOW_WORKER_USER: workerUser,
+    SITEFLOW_DOCKER_SOCKET_GID: dockerSocketGid,
     SITEFLOW_WORKER_POLL_INTERVAL_MS: String(workerPollIntervalMs),
     SITEFLOW_BUILD_RUNNER: "docker",
     SITEFLOW_BUILD_NETWORK: "none",
     SITEFLOW_BUILD_MAX_ARTIFACT_BYTES: defaultBuildMaxArtifactBytes,
     SITEFLOW_BUILD_MAX_ARTIFACT_FILES: defaultBuildMaxArtifactFiles,
     SITEFLOW_BUILD_MIN_FREE_BYTES: defaultBuildMinFreeBytes,
+    SITEFLOW_BUILD_STEP_TIMEOUT_MS: defaultBuildStepTimeoutMs,
+    SITEFLOW_GIT_TIMEOUT_MS: defaultGitTimeoutMs,
     SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES: defaultPrebuiltMaxUploadBytes,
     SITEFLOW_PREBUILT_MAX_FILES: defaultPrebuiltMaxFiles,
     SITEFLOW_BUILD_IMAGE: buildImage,
@@ -140,6 +152,8 @@ export function createSingleHostInstallPlan(input: CreateInstallPlanInput): Inst
     image,
     baseDomain: wildcardBaseDomain,
     siteflowEnv: "production",
+    workerUser,
+    dockerSocketGid,
     workerPollIntervalMs,
     buildImage,
     buildImageAllowlist
@@ -154,6 +168,8 @@ export function createSingleHostInstallPlan(input: CreateInstallPlanInput): Inst
     postgresImage,
     baseDomain: wildcardBaseDomain,
     siteflowEnv: "production",
+    workerUser,
+    dockerSocketGid,
     workerPollIntervalMs,
     buildImage,
     buildImageAllowlist,
@@ -164,6 +180,7 @@ export function createSingleHostInstallPlan(input: CreateInstallPlanInput): Inst
     path: installState.services.unitPath,
     unitName: installState.services.unit,
     composeFile: installState.services.composeFile,
+    envFile: env.path,
     workingDirectory: installState.paths.installDir
   });
   const secrets: InstallSecretSpec[] = [
@@ -177,6 +194,12 @@ export function createSingleHostInstallPlan(input: CreateInstallPlanInput): Inst
       id: "metrics-token",
       path: installState.secrets.metricsTokenRef,
       description: "Bearer token required to scrape production /metrics.",
+      byteLength: 32
+    },
+    {
+      id: "release-evidence-signing-key",
+      path: installState.secrets.releaseEvidenceSigningKeyRef ?? `${installState.paths.configDir}/secrets/release-evidence-signing-key.secret`,
+      description: "Signing key used by production API gates to verify release evidence bundles.",
       byteLength: 32
     },
     {
@@ -268,7 +291,7 @@ export function createSingleHostInstallPlan(input: CreateInstallPlanInput): Inst
         id: "secrets",
         title: "Generate secret files",
         action: "create",
-        summary: "Generate app, session, worker, webhook, bundled Postgres, and admin bootstrap secrets without printing raw values."
+        summary: "Generate app, release evidence, worker, webhook, bundled Postgres, and admin bootstrap secrets without printing raw values."
       },
       {
         id: "render-config",

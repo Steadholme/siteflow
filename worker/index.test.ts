@@ -79,6 +79,30 @@ describe("SiteFlow worker entrypoint", () => {
     }
   });
 
+  it("rejects weak SITEFLOW_APP_SECRET_FILE values without exposing file contents", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-secret-file-"));
+
+    try {
+      const appSecretPath = path.join(tempDir, "app-secret");
+      await writeFile(appSecretPath, "weak-worker-secret\n", "utf8");
+      let message = "";
+
+      try {
+        requireWorkerProductionSecret({
+          SITEFLOW_ENV: "production",
+          SITEFLOW_APP_SECRET_FILE: appSecretPath
+        });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+
+      expect(message).toContain("SITEFLOW_APP_SECRET");
+      expect(message).not.toContain("weak-worker-secret");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("injects SITEFLOW_POSTGRES_PASSWORD_FILE into passwordless worker database URLs", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-postgres-password-"));
 

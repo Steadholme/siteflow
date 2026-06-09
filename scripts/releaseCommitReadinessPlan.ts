@@ -8,6 +8,7 @@ import {
   forbiddenTrackedReleasePathPatterns,
   forbiddenTrackedReleasePathPrefixes,
   normalizeTrackedReleasePath,
+  releaseSourceTreeForbiddenPathspecs,
   releaseSourceTreePolicyDetails,
   type ForbiddenTrackedReleasePathFinding
 } from "../cli/releaseSourceTreePolicy.js";
@@ -100,6 +101,15 @@ export interface ReleaseCommitRecommendedCommand {
   notes: string[];
 }
 
+export interface ReleaseCommitStagingCoverage {
+  covered: boolean;
+  requiredPathCount: number;
+  coveredRequiredPathCount: number;
+  suggestedPathspecCount: number;
+  missingRequiredPaths: string[];
+  excludedSuggestedPathspecs: string[];
+}
+
 export interface ReleaseCommitReadinessPlanResult {
   name: "siteflow-release-commit-readiness-plan";
   status: CommitPlanStatus;
@@ -114,6 +124,7 @@ export interface ReleaseCommitReadinessPlanResult {
   untrackedSource: ReleaseCommitReadinessPathSummary<ReleaseCommitUntrackedSourceFinding>;
   trackedDirtySource: ReleaseCommitReadinessPathSummary<ReleaseCommitTrackedDirtySourceFinding>;
   suggestedStagingGroups: ReleaseCommitSuggestedStagingGroup[];
+  stagingCoverage: ReleaseCommitStagingCoverage;
   excludedFromStaging: string[];
   recommendedCommands: ReleaseCommitRecommendedCommand[];
   warnings: string[];
@@ -125,6 +136,8 @@ export interface ReleaseCommitReadinessPlanResult {
 interface ParsedArgs {
   rootDir?: string;
   outputPath?: string;
+  reviewChecklist: boolean;
+  reviewChecklistOutputPath?: string;
   maxFindings?: number;
   json: boolean;
   failOnBlocked: boolean;
@@ -147,6 +160,12 @@ interface SourcePathClassification {
   reason: string;
 }
 
+interface ReleaseScriptCategoryRule {
+  category: string;
+  reason: string;
+  matches: (filePath: string) => boolean;
+}
+
 const defaultMaxFindings = 50;
 const criticalExactPaths = new Map<string, { category: string; reason: string }>([
   [".github/workflows/ci.yml", { category: "workflow", reason: "CI workflow must be part of the release commit." }],
@@ -167,7 +186,7 @@ const criticalRules: CriticalPathRule[] = [
   {
     category: "release_scripts",
     reason: "Release, backup, observability, source, ingress, operator, credential, artifact retention, install profile, and rollback evidence scripts must be committed.",
-    matches: (filePath) => /^scripts\/(release|backup|observability|operator|ingress|source|upgrade|nonSession|postgres|dockerBuild|artifactRetention|installProfileCheck|evidenceSecretScan|runCompiledScript|cleanBuildArtifacts|assertBrowserBuildEnv|browserProductionBoundary)/.test(filePath)
+    matches: (filePath) => /^scripts\/(release|backup|observability|operator|ingress|source|upgrade|nonSession|postgres|dockerBuild|artifactRetention|installProfileCheck|productionRuntimeProfileContract|evidenceSecretScan|runCompiledScript|cleanBuildArtifacts|assertBrowserBuildEnv|browserProductionBoundary)/.test(filePath)
   },
   {
     category: "production_docs",
@@ -177,26 +196,69 @@ const criticalRules: CriticalPathRule[] = [
       filePath === "docs/deployment/production-single-host.md"
   }
 ];
-const excludedFromStaging = [
-  "node_modules/",
-  ".workflow/",
-  "dist/",
-  "dist-cli/",
-  "dist-server/",
-  "dist-worker/",
-  "coverage/",
-  "playwright-report/",
-  "test-results/",
-  "evidence/",
-  ".vite/",
-  "release-artifact-manifest*.json",
-  "release-image-evidence*.json",
-  "release-evidence*.json",
-  "release-post-promotion-evidence*.json",
-  "release-source-cleanup-plan*.json",
-  "release-commit-readiness-plan*.json",
-  "npm-debug.log*"
+const releaseScriptCategoryRules: ReleaseScriptCategoryRule[] = [
+  {
+    category: "release_evidence_pack_scripts",
+    reason: "Release evidence pack, gap, target-run, bundle, and contract scripts must be reviewed and staged together by evidence-pack domain.",
+    matches: (filePath) => /^scripts\/releaseEvidence/.test(filePath)
+  },
+  {
+    category: "release_artifact_runtime_scripts",
+    reason: "Release artifact, target runtime, artifact retention, and install-profile scripts must be reviewed and staged together by runtime/artifact domain.",
+    matches: (filePath) => /^scripts\/(?:releaseArtifact|releaseTargetRuntime|artifactRetention|installProfileCheck|productionRuntimeProfileContract)/.test(filePath)
+  },
+  {
+    category: "release_gate_source_scripts",
+    reason: "Release commit, source-tree, dependency, and post-promotion scripts must be reviewed and staged together by release-gate domain.",
+    matches: (filePath) => /^scripts\/(?:releaseCommit|releaseSource|releaseDependency|releasePostPromotion)/.test(filePath)
+  },
+  {
+    category: "backup_evidence_scripts",
+    reason: "Backup automation and backup evidence scripts must be reviewed and staged together.",
+    matches: (filePath) => /^scripts\/backup/.test(filePath)
+  },
+  {
+    category: "observability_evidence_scripts",
+    reason: "Observability provisioning, collection, checker, and operator-template scripts must be reviewed and staged together.",
+    matches: (filePath) => /^scripts\/observability/.test(filePath)
+  },
+  {
+    category: "operator_access_evidence_scripts",
+    reason: "Operator access evidence scripts must be reviewed and staged together.",
+    matches: (filePath) => /^scripts\/operator/.test(filePath)
+  },
+  {
+    category: "credential_evidence_scripts",
+    reason: "Non-session credential evidence scripts must be reviewed and staged together.",
+    matches: (filePath) => /^scripts\/nonSession/.test(filePath)
+  },
+  {
+    category: "source_provider_evidence_scripts",
+    reason: "Source provider evidence scripts must be reviewed and staged together.",
+    matches: (filePath) => /^scripts\/source/.test(filePath)
+  },
+  {
+    category: "ingress_evidence_scripts",
+    reason: "Ingress evidence scripts must be reviewed and staged together.",
+    matches: (filePath) => /^scripts\/ingress/.test(filePath)
+  },
+  {
+    category: "upgrade_rollback_evidence_scripts",
+    reason: "Upgrade and rollback drill evidence scripts must be reviewed and staged together.",
+    matches: (filePath) => /^scripts\/upgrade/.test(filePath)
+  },
+  {
+    category: "rehearsal_runner_scripts",
+    reason: "Docker and Postgres rehearsal runner scripts must be reviewed and staged together.",
+    matches: (filePath) => /^scripts\/(?:postgres|dockerBuild)/.test(filePath)
+  },
+  {
+    category: "release_support_scripts",
+    reason: "Shared release support scripts must be reviewed and staged together.",
+    matches: (filePath) => /^scripts\/(?:evidenceSecretScan|runCompiledScript|cleanBuildArtifacts|assertBrowserBuildEnv|browserProductionBoundary|isoTimestamp)/.test(filePath)
+  }
 ];
+const excludedFromStaging = releaseSourceTreeForbiddenPathspecs();
 const untrackedSourceRules: Array<{ category: string; reason: string; matches: (filePath: string) => boolean }> = [
   {
     category: "cli",
@@ -326,6 +388,17 @@ function shellQuotePathspec(pathspec: string) {
   return `"${pathspec.replace(/(["`$\\])/g, "\\$1")}"`;
 }
 
+function formatGitPathspecCommand(argsBeforePathspecs: string[], pathspecs: string[]) {
+  return ["git", ...argsBeforePathspecs, "--", ...pathspecs.map(shellQuotePathspec)].join(" ");
+}
+
+function pushChecklistCommand(lines: string[], label: string, command: string) {
+  lines.push(`- [ ] ${label}:`);
+  lines.push("```sh");
+  lines.push(command);
+  lines.push("```");
+}
+
 function classifyForbiddenPath(filePath: string) {
   const normalized = normalizeTrackedReleasePath(filePath);
   const prefix = forbiddenTrackedReleasePathPrefixes.find((entry) => normalized.startsWith(entry.prefix));
@@ -407,6 +480,16 @@ function criticalUntrackedFinding(filePath: string): ReleaseCommitCriticalUntrac
     };
   }
 
+  const releaseScript = releaseScriptClassification(filePath);
+
+  if (releaseScript) {
+    return {
+      path: filePath,
+      category: releaseScript.category,
+      reason: releaseScript.reason
+    };
+  }
+
   for (const rule of criticalRules) {
     if (rule.matches(filePath)) {
       return {
@@ -418,6 +501,10 @@ function criticalUntrackedFinding(filePath: string): ReleaseCommitCriticalUntrac
   }
 
   return undefined;
+}
+
+function releaseScriptClassification(filePath: string): SourcePathClassification | undefined {
+  return releaseScriptCategoryRules.find((rule) => rule.matches(filePath));
 }
 
 function untrackedSourceClassification(filePath: string): SourcePathClassification | undefined {
@@ -448,6 +535,12 @@ function stagingClassification(filePath: string) {
 
   if (exact) {
     return exact;
+  }
+
+  const releaseScript = releaseScriptClassification(filePath);
+
+  if (releaseScript) {
+    return releaseScript;
   }
 
   for (const rule of criticalRules) {
@@ -520,9 +613,31 @@ function stagingPathspecsByGroup(findings: ReleaseCommitStagingFinding[]) {
   });
 }
 
-function recommendedCommands(suggestedStagingGroups: ReleaseCommitSuggestedStagingGroup[]) {
-  const commands: ReleaseCommitRecommendedCommand[] = [
-    {
+function stagingCoverage(
+  findings: ReleaseCommitStagingFinding[],
+  suggestedStagingGroups: ReleaseCommitSuggestedStagingGroup[]
+): ReleaseCommitStagingCoverage {
+  const requiredPaths = uniqueSorted(findings.map((finding) => finding.path));
+  const suggestedPathspecs = uniqueSorted(suggestedStagingGroups.flatMap((group) => group.pathspecs));
+  const suggestedPathspecSet = new Set(suggestedPathspecs);
+  const missingRequiredPaths = requiredPaths.filter((filePath) => !suggestedPathspecSet.has(filePath));
+  const excludedSuggestedPathspecs = suggestedPathspecs.filter((pathspec) => findForbiddenTrackedReleasePaths([pathspec]).length > 0);
+
+  return {
+    covered: missingRequiredPaths.length === 0 && excludedSuggestedPathspecs.length === 0,
+    requiredPathCount: requiredPaths.length,
+    coveredRequiredPathCount: requiredPaths.length - missingRequiredPaths.length,
+    suggestedPathspecCount: suggestedPathspecs.length,
+    missingRequiredPaths,
+    excludedSuggestedPathspecs
+  };
+}
+
+function recommendedCommands(suggestedStagingGroups: ReleaseCommitSuggestedStagingGroup[], hasForbiddenTrackedPaths: boolean) {
+  const commands: ReleaseCommitRecommendedCommand[] = [];
+
+  if (hasForbiddenTrackedPaths) {
+    commands.push({
       id: "review-release-source-cleanup",
       description: "Generate the index cleanup plan before staging the release commit.",
       command: "npm",
@@ -535,8 +650,8 @@ function recommendedCommands(suggestedStagingGroups: ReleaseCommitSuggestedStagi
         "Run and review this before applying any index-only cleanup command.",
         "Keep the cleanup commit separate from the release-readiness commit."
       ]
-    }
-  ];
+    });
+  }
 
   for (const group of suggestedStagingGroups) {
     commands.push({
@@ -606,8 +721,9 @@ export async function runReleaseCommitReadinessPlan(
       untrackedSource: summarizePaths([], maxFindings),
       trackedDirtySource: summarizePaths([], maxFindings),
       suggestedStagingGroups: [],
+      stagingCoverage: stagingCoverage([], []),
       excludedFromStaging,
-      recommendedCommands: recommendedCommands([]),
+      recommendedCommands: recommendedCommands([], false),
       warnings: warnings(false),
       policy,
       errors,
@@ -638,11 +754,13 @@ export async function runReleaseCommitReadinessPlan(
     .map(trackedDirtySourceFinding)
     .filter((finding): finding is ReleaseCommitTrackedDirtySourceFinding => Boolean(finding))
     .sort((left, right) => left.path.localeCompare(right.path));
-  const suggestedStagingGroups = stagingPathspecsByGroup([...criticalUntracked, ...untrackedSource, ...dirtyTrackedSource]);
+  const requiredStagingFindings = [...criticalUntracked, ...untrackedSource, ...dirtyTrackedSource];
+  const suggestedStagingGroups = stagingPathspecsByGroup(requiredStagingFindings);
+  const coverage = stagingCoverage(requiredStagingFindings, suggestedStagingGroups);
   const hasFindings = forbiddenFindings.length > 0 || criticalUntracked.length > 0 || untrackedSource.length > 0 || dirtyTrackedSource.length > 0;
   const result: ReleaseCommitReadinessPlanResult = {
     name: "siteflow-release-commit-readiness-plan",
-    status: hasFindings ? "blocked" : "pass",
+    status: hasFindings || !coverage.covered ? "blocked" : "pass",
     checkedAt,
     rootDir,
     ...(outputPath ? { outputPath } : {}),
@@ -654,8 +772,9 @@ export async function runReleaseCommitReadinessPlan(
     untrackedSource: summarizePaths(untrackedSource, maxFindings),
     trackedDirtySource: summarizePaths(dirtyTrackedSource, maxFindings),
     suggestedStagingGroups,
+    stagingCoverage: coverage,
     excludedFromStaging,
-    recommendedCommands: recommendedCommands(suggestedStagingGroups),
+    recommendedCommands: recommendedCommands(suggestedStagingGroups, forbiddenFindings.length > 0),
     warnings: warnings(hasFindings),
     policy,
     errors: [],
@@ -691,6 +810,7 @@ function parsePositiveInteger(value: string, flag: string) {
 
 export function parseReleaseCommitReadinessPlanArgs(args: string[]): ParsedArgs {
   const parsed: ParsedArgs = {
+    reviewChecklist: false,
     json: false,
     failOnBlocked: false,
     help: false
@@ -704,6 +824,11 @@ export function parseReleaseCommitReadinessPlanArgs(args: string[]): ParsedArgs 
       index += 1;
     } else if (arg === "--output") {
       parsed.outputPath = readArgValue(args, index, arg);
+      index += 1;
+    } else if (arg === "--review-checklist") {
+      parsed.reviewChecklist = true;
+    } else if (arg === "--review-checklist-output") {
+      parsed.reviewChecklistOutputPath = readArgValue(args, index, arg);
       index += 1;
     } else if (arg === "--max-findings") {
       parsed.maxFindings = parsePositiveInteger(readArgValue(args, index, arg), arg);
@@ -729,11 +854,121 @@ export function releaseCommitReadinessPlanUsage() {
     "Options:",
     "  --root <dir>            Repository root. Default: current working directory.",
     "  --output <file>         Write the commit readiness plan JSON to a file.",
+    "  --review-checklist      Emit a Markdown checklist for human pathspec review.",
+    "  --review-checklist-output <file>  Write the Markdown review checklist to a file.",
     `  --max-findings <n>      Maximum forbidden and untracked paths to include. Default: ${defaultMaxFindings}.`,
     "  --json                  Emit a single JSON result.",
     "  --fail-on-blocked       Exit 1 when the advisory plan status is blocked.",
     "  --help                  Show this help."
   ].join("\n");
+}
+
+export function formatReleaseCommitReviewChecklist(result: ReleaseCommitReadinessPlanResult) {
+  const pathDetails = new Map<string, string[]>();
+  const recordPathDetail = (filePath: string, detail: string) => {
+    pathDetails.set(filePath, [...(pathDetails.get(filePath) ?? []), detail]);
+  };
+
+  for (const finding of result.criticalUntracked.paths) {
+    recordPathDetail(finding.path, `critical untracked ${finding.category}: ${finding.reason}`);
+  }
+
+  for (const finding of result.untrackedSource.paths) {
+    recordPathDetail(finding.path, `untracked source ${finding.category}: ${finding.reason}`);
+  }
+
+  for (const finding of result.trackedDirtySource.paths) {
+    recordPathDetail(finding.path, `tracked dirty ${finding.status.trim() || "changed"} ${finding.category}: ${finding.reason}`);
+  }
+
+  const lines: string[] = [
+    "# SiteFlow Release Commit Review Checklist",
+    "",
+    `Status: ${result.status}`,
+    `Checked at: ${result.checkedAt}`,
+    `Repository root: ${result.rootDir}`,
+    `Required paths covered by suggested pathspecs: ${result.stagingCoverage.covered ? "yes" : "no"} (${result.stagingCoverage.coveredRequiredPathCount}/${result.stagingCoverage.requiredPathCount})`,
+    "",
+    "This checklist is read-only. Review every listed path before running any `git add` command, keep cleanup commits separate from release-readiness commits, and do not use `git add .`.",
+    ""
+  ];
+
+  if (result.errors.length > 0) {
+    lines.push("## Errors", "");
+    for (const error of result.errors) {
+      lines.push(`- ${error}`);
+    }
+    lines.push("");
+  }
+
+  if (result.forbiddenRoots.length > 0 || result.forbiddenPaths.total > 0) {
+    lines.push("## Source Cleanup Required", "");
+    lines.push("- [ ] Run and review `npm run --silent release:source:cleanup-plan -- --json` before staging release files.");
+    for (const root of result.forbiddenRoots) {
+      lines.push(`- [ ] Resolve forbidden tracked root \`${root.root}\` (${root.count} path(s)): ${root.reason}`);
+    }
+    for (const finding of result.forbiddenPaths.paths) {
+      lines.push(`- [ ] Remove forbidden tracked path from the Git index: \`${finding.path}\``);
+    }
+    lines.push("");
+  }
+
+  if (result.stagingCoverage.missingRequiredPaths.length > 0 || result.stagingCoverage.excludedSuggestedPathspecs.length > 0) {
+    lines.push("## Staging Coverage Gaps", "");
+    for (const filePath of result.stagingCoverage.missingRequiredPaths) {
+      lines.push(`- [ ] Add an explicit reviewed pathspec for \`${filePath}\`.`);
+    }
+    for (const filePath of result.stagingCoverage.excludedSuggestedPathspecs) {
+      lines.push(`- [ ] Remove forbidden/generated pathspec from staging suggestions: \`${filePath}\`.`);
+    }
+    lines.push("");
+  }
+
+  if (result.suggestedStagingGroups.length > 0) {
+    lines.push("## Review And Stage Groups", "");
+    result.suggestedStagingGroups.forEach((group, groupIndex) => {
+      const reviewCommand = formatGitPathspecCommand(["diff", "--stat"], group.pathspecs);
+      const fullDiffCommand = formatGitPathspecCommand(["diff"], group.pathspecs);
+
+      lines.push(`### ${groupIndex + 1}. ${group.id}`);
+      lines.push("");
+      lines.push(group.description);
+      lines.push("");
+      lines.push(`Path count: ${group.pathspecs.length}`);
+      lines.push("");
+      lines.push("- [ ] Confirm these paths belong in the same reviewed release-readiness staging group.");
+      pushChecklistCommand(lines, "Review diff stats", reviewCommand);
+      pushChecklistCommand(lines, "Review full tracked diffs", fullDiffCommand);
+      lines.push("- [ ] For untracked paths, open the file contents directly before staging; `git diff` does not show untracked file bodies.");
+      pushChecklistCommand(lines, "Stage only after review", group.command.display);
+      lines.push("");
+      lines.push("Paths:");
+      for (const pathspec of group.pathspecs) {
+        const details = pathDetails.get(pathspec);
+        lines.push(`- \`${pathspec}\`${details ? ` - ${details.join("; ")}` : ""}`);
+      }
+      lines.push("");
+    });
+  } else {
+    lines.push("## Review And Stage Groups", "", "No release-readiness staging groups are currently suggested.", "");
+  }
+
+  if (result.warnings.length > 0) {
+    lines.push("## Warnings", "");
+    for (const warning of result.warnings) {
+      lines.push(`- ${warning}`);
+    }
+    lines.push("");
+  }
+
+  lines.push("## Final Verification", "");
+  lines.push("- [ ] Re-run `npm run --silent release:source:check -- --json`.");
+  lines.push("- [ ] Inspect the staged release-readiness commit with `git diff --cached --stat` and `git diff --cached`.");
+  lines.push("- [ ] After creating the release-readiness commit on a clean checkout, re-run `npm run --silent release:commit:plan -- --fail-on-blocked --json` and confirm it passes.");
+  lines.push("- [ ] Re-run `npm run siteflow -- release-gate --promotion --env-file <target-env-file> --repo <owner/repo> --branch main --commit-ref <sha> --require-commit-status --json` with production evidence inputs.");
+  lines.push("");
+
+  return `${lines.join("\n")}\n`;
 }
 
 function writeHumanResult(result: ReleaseCommitReadinessPlanResult, io: CliIo) {
@@ -745,6 +980,10 @@ function writeHumanResult(result: ReleaseCommitReadinessPlanResult, io: CliIo) {
   output.write(`Critical untracked paths: ${result.criticalUntracked.total}\n`);
   output.write(`Untracked source paths: ${result.untrackedSource.total}\n`);
   output.write(`Tracked dirty source paths: ${result.trackedDirtySource.total}\n`);
+  output.write(
+    `Staging coverage: ${result.stagingCoverage.covered ? "covered" : "incomplete"} ` +
+      `(${result.stagingCoverage.coveredRequiredPathCount}/${result.stagingCoverage.requiredPathCount} required path(s))\n`
+  );
 
   for (const root of result.forbiddenRoots) {
     output.write(`- forbidden ${root.root}: ${root.count} path(s) - ${root.reason}\n`);
@@ -772,6 +1011,14 @@ function writeHumanResult(result: ReleaseCommitReadinessPlanResult, io: CliIo) {
 
   if (result.trackedDirtySource.truncated) {
     output.write(`Additional tracked dirty source paths omitted: ${result.trackedDirtySource.total - result.trackedDirtySource.returned}\n`);
+  }
+
+  for (const filePath of result.stagingCoverage.missingRequiredPaths) {
+    output.write(`- missing staging pathspec ${filePath}\n`);
+  }
+
+  for (const filePath of result.stagingCoverage.excludedSuggestedPathspecs) {
+    output.write(`- excluded staging pathspec ${filePath}\n`);
   }
 
   if (result.suggestedStagingGroups.length > 0) {
@@ -806,16 +1053,32 @@ export async function runReleaseCommitReadinessPlanCli(
     return 0;
   }
 
+  if (parsed.json && parsed.reviewChecklist && !parsed.reviewChecklistOutputPath) {
+    io.stderr.write("--review-checklist cannot be combined with --json unless --review-checklist-output is also provided.\n\n");
+    io.stderr.write(`${releaseCommitReadinessPlanUsage()}\n`);
+    return 2;
+  }
+
   const result = await runReleaseCommitReadinessPlan({
     ...baseOptions,
     rootDir: parsed.rootDir,
     outputPath: parsed.outputPath,
     maxFindings: parsed.maxFindings
   });
+  const reviewChecklistPath = parsed.reviewChecklistOutputPath
+    ? path.resolve(result.rootDir, parsed.reviewChecklistOutputPath)
+    : undefined;
+
+  if (reviewChecklistPath) {
+    await writeFile(reviewChecklistPath, formatReleaseCommitReviewChecklist(result), "utf8");
+  }
 
   if (parsed.json) {
     const output = result.errors.length > 0 ? io.stderr : io.stdout;
     output.write(`${JSON.stringify(result, null, 2)}\n`);
+  } else if (parsed.reviewChecklist) {
+    const output = result.errors.length > 0 ? io.stderr : io.stdout;
+    output.write(formatReleaseCommitReviewChecklist(result));
   } else {
     writeHumanResult(result, io);
   }

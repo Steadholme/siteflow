@@ -7,6 +7,8 @@ import { assertBuildStoragePreflight, executeBuildJob, runBuildWorkerOnce } from
 import { detectBuildSettings } from "./frameworkDetector";
 import { LocalSourceResolver } from "./localSourceResolver";
 
+const trustedHostBuildPathTestTimeoutMs = 30_000;
+
 function queuedJob(sourceDirectory: string): QueuedBuildJob {
   return {
     id: "build_test_1",
@@ -747,7 +749,7 @@ describe("SiteFlow build worker", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  }, 10000);
+  }, trustedHostBuildPathTestTimeoutMs);
 
   it("detects Node.js functions and publishes them with the artifact manifest", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-functions-"));

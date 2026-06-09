@@ -8,6 +8,9 @@ import {
 } from "./backupEvidenceCompose";
 
 const now = () => new Date("2026-06-07T12:00:00.000Z");
+const commitRef = "abc123def456";
+const repository = "acme/siteflow";
+const branch = "main";
 const artifactTreeSha256 = "a".repeat(64);
 const kmsKeyRef = "arn:aws:kms:us-east-1:111122223333:key/siteflow-prod-backups";
 
@@ -319,6 +322,10 @@ describe("backupEvidenceCompose", () => {
           "--provider-security-audit", files.providerSecurityAudit,
           "--backup-prune", files.backupPrune,
           "--policy", files.policy,
+          "--commit-ref", commitRef,
+          "--repo", repository,
+          "--branch", branch,
+          "--target-environment", "production",
           "--operator-name", "release-operator",
           "--ticket-id", "REL-2026-0607",
           "--output", outputPath,
@@ -365,6 +372,10 @@ describe("backupEvidenceCompose", () => {
           "--provider-security-audit", files.providerSecurityAudit,
           "--backup-prune", files.backupPrune,
           "--policy", files.policy,
+          "--commit-ref", commitRef,
+          "--repo", repository,
+          "--branch", branch,
+          "--target-environment", "production",
           "--operator-name", "release-operator",
           "--release-ticket", "REL-2026-0607",
           "--require-off-host",
@@ -385,10 +396,22 @@ describe("backupEvidenceCompose", () => {
 
       expect(exitCode).toBe(0);
       expect(raw.name).toBeUndefined();
+      expect(raw.release).toMatchObject({
+        commitRef,
+        repository,
+        branch,
+        targetEnvironment: "production"
+      });
       expect(check).toMatchObject({
         name: "siteflow-backup-evidence-check",
         status: "passed",
         exitCode: 0,
+        release: {
+          commitRef,
+          repository,
+          branch,
+          targetEnvironment: "production"
+        },
         thresholds: {
           requireOffHost: true
         },

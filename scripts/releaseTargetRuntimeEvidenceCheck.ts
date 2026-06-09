@@ -36,7 +36,9 @@ export interface ReleaseTargetRuntimeEvidenceCheckResult {
     commitRef: string | null;
     repository: string | null;
     branch: string | null;
+    targetIdentity: RuntimeEvidenceSummary | null;
     composeConfig: RuntimeEvidenceSummary | null;
+    workerRuntimePosture: RuntimeEvidenceSummary | null;
     startup: RuntimeEvidenceSummary | null;
     serviceHealth: RuntimeEvidenceSummary | null;
     readiness: RuntimeEvidenceSummary | null;
@@ -54,6 +56,26 @@ interface RuntimeEvidenceSummary {
   expectedDigest?: string;
   apiImageDigest?: string;
   workerImageDigest?: string;
+  hostname?: string;
+  dockerContext?: string;
+  composeProject?: string;
+  dockerSocketMounted?: boolean;
+  groupAddConfigured?: boolean;
+  hostDockerSocketGid?: number | null;
+  groupAddMatchesHostDockerSocketGid?: boolean;
+  privileged?: boolean;
+  capAddEmpty?: boolean;
+  dangerousSecurityOptConfigured?: boolean;
+  hostNetworkMode?: boolean;
+  buildRunnerDocker?: boolean;
+  buildNetworkNone?: boolean;
+  buildMemoryConfigured?: boolean;
+  buildCpusConfigured?: boolean;
+  buildPidsLimitConfigured?: boolean;
+  dockerCliPreflightPresent?: boolean;
+  dockerInfoPreflightPresent?: boolean;
+  gitSshKeyPathEnvPresent?: boolean;
+  gitKnownHostsPathEnvPresent?: boolean;
 }
 
 interface ParsedArgs {
@@ -91,14 +113,27 @@ export const requiredTargetRuntimeEvidenceCheckNames = [
   "environment",
   "public_base_url",
   "evidence_age",
+  "target_identity_present",
+  "target_identity_status",
+  "target_identity_source",
+  "target_identity_host",
+  "target_identity_docker_context",
+  "target_identity_compose_project",
   "compose_config_present",
   "compose_config_status",
   "compose_config_services",
   "compose_config_secrets",
+  "compose_config_healthchecks",
   "compose_config_sanitized",
   "compose_config_images",
   "compose_config_release_image_digest",
   "compose_config_no_build_fallback",
+  "compose_config_api_profile",
+  "compose_config_worker_socket_profile",
+  "compose_config_worker_socket_gid",
+  "compose_config_privilege_posture",
+  "compose_config_worker_build_resources",
+  "compose_config_worker_git_credentials",
   "compose_config_observation",
   "startup_present",
   "startup_status",
@@ -272,6 +307,21 @@ function summarizeImageBinding(candidate: Record<string, unknown> | undefined): 
   };
 }
 
+function summarizeTargetIdentity(candidate: Record<string, unknown> | undefined): RuntimeEvidenceSummary | null {
+  const summary = summarize(candidate);
+
+  if (!summary) {
+    return null;
+  }
+
+  return {
+    ...summary,
+    ...(stringValue(candidate?.hostname) ? { hostname: stringValue(candidate?.hostname) } : {}),
+    ...(stringValue(candidate?.dockerContext) ? { dockerContext: stringValue(candidate?.dockerContext) } : {}),
+    ...(stringValue(candidate?.composeProject) ? { composeProject: stringValue(candidate?.composeProject) } : {})
+  };
+}
+
 function stringArray(value: unknown) {
   return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
 }
@@ -361,8 +411,136 @@ function composeNoBuildFallback(composeConfig: Record<string, unknown> | undefin
     emptyArrayField(composeConfig?.buildFallbacks);
 }
 
+function serviceProfile(composeConfig: Record<string, unknown> | undefined, serviceName: string) {
+  const profiles = nestedObject(composeConfig, "serviceProfiles");
+
+  return nestedObject(profiles, serviceName);
+}
+
+function nonRootUserPassed(value: unknown) {
+  const user = stringValue(value);
+  const uid = user?.split(":")[0];
+
+  return Boolean(user && uid !== "0" && uid?.toLowerCase() !== "root");
+}
+
+function summarizeWorkerRuntimePosture(composeConfig: Record<string, unknown> | undefined): RuntimeEvidenceSummary | null {
+  const summary = summarize(composeConfig);
+  const worker = serviceProfile(composeConfig, "worker");
+
+  if (!summary || !worker) {
+    return null;
+  }
+
+  return {
+    ...summary,
+    dockerSocketMounted: worker.dockerSocketMounted === true,
+    groupAddConfigured: worker.groupAddConfigured === true,
+    hostDockerSocketGid: Number.isInteger(Number(worker.hostDockerSocketGid)) ? Number(worker.hostDockerSocketGid) : null,
+    groupAddMatchesHostDockerSocketGid: worker.groupAddMatchesHostDockerSocketGid === true,
+    privileged: worker.privileged === true,
+    capAddEmpty: worker.capAddEmpty === true,
+    dangerousSecurityOptConfigured: worker.dangerousSecurityOptConfigured === true,
+    hostNetworkMode: worker.hostNetworkMode === true,
+    buildRunnerDocker: worker.buildRunnerDocker === true,
+    buildNetworkNone: worker.buildNetworkNone === true,
+    buildMemoryConfigured: worker.buildMemoryConfigured === true,
+    buildCpusConfigured: worker.buildCpusConfigured === true,
+    buildPidsLimitConfigured: worker.buildPidsLimitConfigured === true,
+    dockerCliPreflightPresent: worker.dockerCliPreflightPresent === true,
+    dockerInfoPreflightPresent: worker.dockerInfoPreflightPresent === true,
+    gitSshKeyPathEnvPresent: worker.gitSshKeyPathEnvPresent === true,
+    gitKnownHostsPathEnvPresent: worker.gitKnownHostsPathEnvPresent === true
+  };
+}
+
+function servicePrivilegePosturePassed(service: Record<string, unknown> | undefined) {
+  return Boolean(
+    service &&
+      service.privileged === false &&
+      service.capAddEmpty === true &&
+      service.dangerousSecurityOptConfigured === false &&
+      service.hostNetworkMode === false
+  );
+}
+
+function apiProfilePassed(composeConfig: Record<string, unknown> | undefined) {
+  const api = serviceProfile(composeConfig, "api");
+
+  return Boolean(
+    api &&
+      stringValue(api.user) === "1000:1000" &&
+      api.readOnly === true &&
+      api.capDropAll === true &&
+      api.noNewPrivileges === true &&
+      api.dockerSocketMounted === false
+  );
+}
+
+function workerSocketProfilePassed(composeConfig: Record<string, unknown> | undefined) {
+  const worker = serviceProfile(composeConfig, "worker");
+
+  return Boolean(
+    worker &&
+      nonRootUserPassed(worker.user) &&
+      worker.groupAddConfigured === true &&
+      worker.readOnly === true &&
+      worker.capDropAll === true &&
+      worker.noNewPrivileges === true &&
+      worker.dockerSocketMounted === true &&
+      worker.buildRunnerDocker === true &&
+      worker.buildNetworkNone === true &&
+      worker.dockerCliPreflightPresent === true &&
+      worker.dockerInfoPreflightPresent === true
+  );
+}
+
+function workerSocketGidPassed(composeConfig: Record<string, unknown> | undefined) {
+  const worker = serviceProfile(composeConfig, "worker");
+  const hostDockerSocketGid = Number(worker?.hostDockerSocketGid);
+
+  return Boolean(
+    worker &&
+      Number.isInteger(hostDockerSocketGid) &&
+      hostDockerSocketGid > 0 &&
+      worker.groupAddMatchesHostDockerSocketGid === true
+  );
+}
+
+function composePrivilegePosturePassed(composeConfig: Record<string, unknown> | undefined) {
+  return servicePrivilegePosturePassed(serviceProfile(composeConfig, "api")) &&
+    servicePrivilegePosturePassed(serviceProfile(composeConfig, "worker"));
+}
+
+function workerBuildResourceLimitsPassed(composeConfig: Record<string, unknown> | undefined) {
+  const worker = serviceProfile(composeConfig, "worker");
+
+  return Boolean(
+    worker &&
+      worker.buildMemoryConfigured === true &&
+      worker.buildCpusConfigured === true &&
+      worker.buildPidsLimitConfigured === true
+  );
+}
+
+function workerGitCredentialPosturePassed(composeConfig: Record<string, unknown> | undefined) {
+  const worker = serviceProfile(composeConfig, "worker");
+
+  return Boolean(
+    worker &&
+      worker.gitSshKeyPathEnvPresent === true &&
+      worker.gitKnownHostsPathEnvPresent === true
+  );
+}
+
 function statusCodeOk(value: unknown) {
   return typeof value === "number" && value >= 200 && value < 300;
+}
+
+function readinessBodyStatusPassed(value: unknown) {
+  const normalized = statusValue(value);
+
+  return normalized === "ok" || normalized === "ready";
 }
 
 function publicBaseUrlPassed(value: unknown) {
@@ -422,6 +600,7 @@ export function evaluateReleaseTargetRuntimeEvidence(
   const maxAgeHours = positiveNumber(options.maxAgeHours, defaultMaxAgeHours, "maxAgeHours");
   const evidence = isObject(rawEvidence) ? rawEvidence : undefined;
   const composeConfig = nestedObject(evidence, "composeConfig");
+  const targetIdentity = nestedObject(evidence, "targetIdentity");
   const startup = nestedObject(evidence, "startup");
   const serviceHealth = nestedObject(evidence, "serviceHealth");
   const readiness = nestedObject(evidence, "readiness");
@@ -468,10 +647,63 @@ export function evaluateReleaseTargetRuntimeEvidence(
   addCheck(checks, "public_base_url", publicBaseUrlPassed(publicBaseUrl(evidence)), "Target runtime evidence publicBaseUrl must be an HTTPS URL without credentials, query strings, or fragments.");
   addCheck(checks, "evidence_age", freshTimestamp(evidenceTimestamp(evidence), now, maxAgeHours), `Target runtime evidence checkedAt must be no older than ${maxAgeHours} hours.`);
 
+  addCheck(checks, "target_identity_present", Boolean(targetIdentity), "Target runtime evidence must include target host identity evidence.");
+  addCheck(checks, "target_identity_status", sectionPassed(targetIdentity, now, maxAgeHours), "Target host identity evidence must have passing status and fresh timestamp.");
+  addCheck(
+    checks,
+    "target_identity_source",
+    targetIdentity?.source === "target_host_identity_probe" &&
+      Boolean(stringValue(targetIdentity?.command)),
+    "Target host identity evidence must identify the target-host probe command source."
+  );
+  addCheck(
+    checks,
+    "target_identity_host",
+    Boolean(
+      stringValue(targetIdentity?.hostname) &&
+        sha256HexPattern.test(stringValue(targetIdentity?.hostFingerprintSha256) ?? "")
+    ),
+    "Target host identity evidence must include a hostname and sanitized host fingerprint hash."
+  );
+  addCheck(
+    checks,
+    "target_identity_docker_context",
+    Boolean(
+      stringValue(targetIdentity?.dockerContext) &&
+        sha256HexPattern.test(stringValue(targetIdentity?.dockerContextInspectSha256) ?? "") &&
+        targetIdentity?.rawContextArchived === false
+    ),
+    "Target host identity evidence must include Docker context name and only a sanitized context-inspection hash."
+  );
+  addCheck(
+    checks,
+    "target_identity_compose_project",
+    Boolean(
+      stringValue(targetIdentity?.composeProject) &&
+        targetIdentity?.composeProject === composeConfig?.composeProject &&
+        targetIdentity?.composeProject === serviceHealth?.composeProject &&
+        stringValue(targetIdentity?.composeFile) &&
+        targetIdentity?.publicBaseUrl === publicBaseUrl(evidence)
+    ),
+    "Target host identity evidence must bind the Docker context to the same Compose project, Compose file, and public base URL."
+  );
+
   addCheck(checks, "compose_config_present", Boolean(composeConfig), "Target runtime evidence must include docker compose config evidence.");
   addCheck(checks, "compose_config_status", sectionPassed(composeConfig, now, maxAgeHours), "Compose config evidence must have passing status and fresh timestamp.");
   addCheck(checks, "compose_config_services", arrayIncludesAllStrings(composeConfig?.services, ["postgres", "api", "worker"]), "Compose config evidence must summarize postgres, api, and worker services.");
-  addCheck(checks, "compose_config_secrets", arrayIncludesAllStrings(composeConfig?.secrets, ["siteflow_app_secret", "siteflow_api_token", "siteflow_metrics_token", "siteflow_postgres_password"]), "Compose config evidence must summarize required Docker secrets.");
+  addCheck(
+    checks,
+    "compose_config_secrets",
+    arrayIncludesAllStrings(composeConfig?.secrets, [
+      "siteflow_app_secret",
+      "siteflow_api_token",
+      "siteflow_metrics_token",
+      "siteflow_release_evidence_signing_key",
+      "siteflow_postgres_password"
+    ]),
+    "Compose config evidence must summarize required Docker secrets."
+  );
+  addCheck(checks, "compose_config_healthchecks", arrayIncludesAllStrings(composeConfig?.healthchecks, ["postgres", "api", "worker"]), "Compose config evidence must summarize Postgres, API, and worker healthchecks.");
   addCheck(checks, "compose_config_sanitized", composeConfig?.sanitized === true && composeConfig?.rawConfigArchived === false && sha256HexPattern.test(stringValue(composeConfig?.configSha256) ?? ""), "Compose config evidence must be sanitized and include only a SHA-256 config hash, not raw config.");
   addCheck(checks, "compose_config_images", composeImagesDigestPinned(composeConfig), "Compose config evidence must prove postgres, API, and worker services use digest-pinned images.");
   const composeReleaseDigestIssues = composeReleaseImageDigestIssues(composeConfig, stringValue(imageBinding?.expectedDigest));
@@ -484,6 +716,12 @@ export function evaluateReleaseTargetRuntimeEvidence(
       : `Compose config API/worker image digest mismatch: ${composeReleaseDigestIssues.join("; ")}.`
   );
   addCheck(checks, "compose_config_no_build_fallback", composeNoBuildFallback(composeConfig), "Compose config evidence must prove the target Compose config has no build services or build fallback.");
+  addCheck(checks, "compose_config_api_profile", apiProfilePassed(composeConfig), "Compose config evidence must prove the API is non-root, read-only, drops capabilities, uses no-new-privileges, and does not mount the Docker socket.");
+  addCheck(checks, "compose_config_worker_socket_profile", workerSocketProfilePassed(composeConfig), "Compose config evidence must prove the worker socket profile has explicit user/group posture, Docker runner/network settings, startup preflight, hardening, and the trusted Docker socket mount.");
+  addCheck(checks, "compose_config_worker_socket_gid", workerSocketGidPassed(composeConfig), "Compose config evidence must prove the target host Docker socket gid matches the worker group_add posture.");
+  addCheck(checks, "compose_config_privilege_posture", composePrivilegePosturePassed(composeConfig), "Compose config evidence must prove API and worker services are not privileged, do not add capabilities, do not disable seccomp/AppArmor, and do not use host networking.");
+  addCheck(checks, "compose_config_worker_build_resources", workerBuildResourceLimitsPassed(composeConfig), "Compose config evidence must prove the worker has explicit Docker build memory, CPU, and PIDs limits.");
+  addCheck(checks, "compose_config_worker_git_credentials", workerGitCredentialPosturePassed(composeConfig), "Compose config evidence must prove the worker exposes private Git credential path environment entries without archiving their values.");
   addCheck(checks, "compose_config_observation", Boolean(stringValue(composeConfig?.command) && stringValue(composeConfig?.source) && stringValue(composeConfig?.composeProject)), "Compose config evidence must include the redacted command, observation source, and compose project used on the target host.");
 
   addCheck(checks, "startup_present", Boolean(startup), "Target runtime evidence must include startup evidence.");
@@ -498,8 +736,8 @@ export function evaluateReleaseTargetRuntimeEvidence(
 
   addCheck(checks, "readiness_present", Boolean(readiness), "Target runtime evidence must include readiness evidence.");
   addCheck(checks, "readiness_status", sectionPassed(readiness, now, maxAgeHours), "Readiness evidence must have passing status and fresh timestamp.");
-  addCheck(checks, "readiness_loopback", statusCodeOk(readiness?.loopbackStatusCode) && statusValue(readiness?.loopbackBodyStatus) === "ok", "Loopback /readyz evidence must return a 2xx status and ok body.");
-  addCheck(checks, "readiness_public", statusCodeOk(readiness?.publicStatusCode) && statusValue(readiness?.publicBodyStatus) === "ok", "Public /readyz evidence must return a 2xx status and ok body.");
+  addCheck(checks, "readiness_loopback", statusCodeOk(readiness?.loopbackStatusCode) && readinessBodyStatusPassed(readiness?.loopbackBodyStatus), "Loopback /readyz evidence must return a 2xx status and ok or ready body.");
+  addCheck(checks, "readiness_public", statusCodeOk(readiness?.publicStatusCode) && readinessBodyStatusPassed(readiness?.publicBodyStatus), "Public /readyz evidence must return a 2xx status and ok or ready body.");
 
   addCheck(checks, "image_binding_present", Boolean(imageBinding), "Target runtime evidence must include running image binding evidence.");
   addCheck(checks, "image_binding_status", sectionPassed(imageBinding, now, maxAgeHours) && imageBinding?.apiMatchesReleaseImage === true && imageBinding?.workerMatchesReleaseImage === true, "Image binding evidence must show API and worker run the release image digest.");
@@ -540,7 +778,9 @@ export function evaluateReleaseTargetRuntimeEvidence(
       commitRef: actualCommitRef ?? null,
       repository: actualRepository ?? null,
       branch: actualBranch ?? null,
+      targetIdentity: summarizeTargetIdentity(targetIdentity),
       composeConfig: summarize(composeConfig),
+      workerRuntimePosture: summarizeWorkerRuntimePosture(composeConfig),
       startup: summarize(startup),
       serviceHealth: summarize(serviceHealth),
       readiness: summarize(readiness),
@@ -609,7 +849,7 @@ export function releaseTargetRuntimeEvidenceCheckUsage() {
   return [
     "Usage: npm run --silent release:target-runtime:evidence -- --evidence <target-runtime-evidence.json> [--commit-ref <sha>] [--repo <owner/name>] [--branch <branch>] [--target-environment <env>] [--json]",
     "",
-    "Validates target-host Compose config, startup, service health, readiness, release image binding, restart smoke, and log sanity evidence."
+    "Validates target-host identity, Compose config, startup, service health, readiness, release image binding, restart smoke, and log sanity evidence."
   ].join("\n");
 }
 

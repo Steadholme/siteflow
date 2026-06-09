@@ -622,6 +622,7 @@ function finalizeEvidence(
     commitRef: options.commitRef,
     repo: options.repo,
     branch: options.branch,
+    targetEnvironment: options.environment,
     maxAgeHours: options.maxAgeHours,
     now: options.now
   });
@@ -634,6 +635,7 @@ function finalizeEvidence(
     commitRef: options.commitRef,
     repo: options.repo,
     branch: options.branch,
+    targetEnvironment: options.environment,
     maxAgeHours: options.maxAgeHours,
     now: options.now
   });
@@ -656,6 +658,11 @@ export async function collectIngressEvidence(
   const proxySourcePolicy = collectProxySourcePolicyEvidence(options, checkedAt) ??
     sectionFromOperator(operatorEvidence, "proxySourcePolicy");
   const deploymentTopology = collectDeploymentTopologyEvidence(options, operatorEvidence);
+  const metricsAccessControl = firstSectionFromOperator(operatorEvidence, [
+    "metricsAccessControl",
+    "metricsPrivateScrape",
+    "metricsPrivateScrapeException"
+  ]);
   const apiRateLimit = {
     ...apiRateLimitProbe,
     ...collectApiRateLimitTopologyEvidence(options, operatorEvidence)
@@ -672,6 +679,16 @@ export async function collectIngressEvidence(
       repository: options.repo,
       branch: options.branch
     },
+    target: {
+      environment: options.environment,
+      publicBaseUrl,
+      directApiUrl: directApiPort.target,
+      release: {
+        commitRef: options.commitRef,
+        repository: options.repo,
+        branch: options.branch
+      }
+    },
     trustProxyPolicy: options.trustProxyPolicy,
     deploymentTopology,
     directApiPort,
@@ -679,6 +696,7 @@ export async function collectIngressEvidence(
     proxySourcePolicy,
     apiRateLimit,
     unthrottledRoutes,
+    metricsAccessControl,
     operatorName: options.operatorName,
     ticketId: options.ticketId
   };

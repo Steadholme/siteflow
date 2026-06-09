@@ -22,12 +22,31 @@ describe("installProfileCheck", () => {
     expect(result.exitCode).toBe(0);
     expect(result.checkedAt).toBe("2026-06-08T12:00:00.000Z");
     expect(result.selectedEvidence).toMatchObject({
-      checksPassed: 16,
-      checksTotal: 16,
+      checksPassed: 17,
+      checksTotal: 17,
       composePath: "/opt/siteflow/compose.yaml",
       nginxPath: "/etc/nginx/sites-available/siteflow.conf"
     });
     expect(result.checks.every((check) => check.status === "pass")).toBe(true);
+  });
+
+  it("blocks install env profiles that enable trusted proxy by default", () => {
+    const assets = renderReferenceInstallProfile();
+    const env = assets.env.content.replace("SITEFLOW_TRUST_PROXY=\n", "SITEFLOW_TRUST_PROXY=loopback\n");
+    const result = evaluateInstallProfileAssets({
+      ...assets,
+      env: withContent(assets.env, env)
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "install_env_trusted_proxy_opt_in",
+          status: "fail"
+        })
+      ])
+    );
   });
 
   it("blocks Nginx profiles that trust inbound forwarded headers", () => {
@@ -120,6 +139,98 @@ describe("installProfileCheck", () => {
     );
   });
 
+  it("blocks Compose profiles that omit release evidence signing key secret files", () => {
+    const assets = renderReferenceInstallProfile();
+    const compose = assets.compose.content
+      .replace("      SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE: /run/secrets/siteflow_release_evidence_signing_key\n", "")
+      .replace("      - siteflow_release_evidence_signing_key\n", "")
+      .replace("  siteflow_release_evidence_signing_key:\n    file: /etc/siteflow/secrets/release-evidence-signing-key.secret\n", "");
+    const result = evaluateInstallProfileAssets({
+      ...assets,
+      compose: withContent(assets.compose, compose)
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "install_compose_secret_files",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
+  it("blocks profiles that omit explicit build and git timeouts", () => {
+    const assets = renderReferenceInstallProfile();
+    const env = assets.env.content
+      .replace("SITEFLOW_BUILD_STEP_TIMEOUT_MS=900000\n", "")
+      .replace("SITEFLOW_GIT_TIMEOUT_MS=300000\n", "");
+    const compose = assets.compose.content
+      .replace('      SITEFLOW_BUILD_STEP_TIMEOUT_MS: "900000"\n', "")
+      .replace('      SITEFLOW_GIT_TIMEOUT_MS: "300000"\n', "");
+    const result = evaluateInstallProfileAssets({
+      ...assets,
+      env: withContent(assets.env, env),
+      compose: withContent(assets.compose, compose)
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "install_env_non_secret_runtime",
+          status: "fail"
+        }),
+        expect.objectContaining({
+          name: "install_compose_worker_docker_runner",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
+  it("blocks Compose worker profiles without private Git credential path wiring", () => {
+    const assets = renderReferenceInstallProfile();
+    const compose = assets.compose.content
+      .replace('      SITEFLOW_GIT_SSH_KEY_PATH: "${SITEFLOW_GIT_SSH_KEY_PATH:-}"\n', "")
+      .replace('      SITEFLOW_GIT_KNOWN_HOSTS_PATH: "${SITEFLOW_GIT_KNOWN_HOSTS_PATH:-}"\n', "");
+    const result = evaluateInstallProfileAssets({
+      ...assets,
+      compose: withContent(assets.compose, compose)
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "install_compose_worker_docker_runner",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
+  it("blocks Compose profiles that omit git webhook secret file references", () => {
+    const assets = renderReferenceInstallProfile();
+    const compose = assets.compose.content
+      .replace("      SITEFLOW_GENERIC_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_generic_webhook_secret\n", "");
+    const result = evaluateInstallProfileAssets({
+      ...assets,
+      compose: withContent(assets.compose, compose)
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "install_compose_secret_files",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
   it("blocks Compose profiles that export Docker secret values into process env", () => {
     const assets = renderReferenceInstallProfile();
     const compose = assets.compose.content.replace(
@@ -186,10 +297,29 @@ describe("installProfileCheck", () => {
     );
   });
 
+  it("blocks Compose profiles that weaken dropped capabilities", () => {
+    const assets = renderReferenceInstallProfile();
+    const compose = assets.compose.content.replaceAll("      - ALL\n", "      - NET_RAW\n");
+    const result = evaluateInstallProfileAssets({
+      ...assets,
+      compose: withContent(assets.compose, compose)
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "install_compose_container_hardening",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
   it("blocks Compose worker profiles without Docker runner proof", () => {
     const assets = renderReferenceInstallProfile();
     const compose = assets.compose.content
-      .replace("        if ! docker info >/dev/null 2>&1; then\n          echo \"SITEFLOW_BUILD_RUNNER=docker requires access to a Docker daemon. This compose file mounts /var/run/docker.sock for trusted single-host operators.\" >&2\n          exit 1\n        fi\n", "")
+      .replace("        if ! docker info >/dev/null 2>&1; then\n          echo \"SITEFLOW_BUILD_RUNNER=docker requires access to the trusted single-host Docker socket.\" >&2\n          exit 1\n        fi\n", "")
       .replace("      - /var/run/docker.sock:/var/run/docker.sock\n", "");
     const result = evaluateInstallProfileAssets({
       ...assets,
@@ -201,6 +331,31 @@ describe("installProfileCheck", () => {
       expect.arrayContaining([
         expect.objectContaining({
           name: "install_compose_worker_docker_runner",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
+  it("blocks Compose worker profiles without Docker socket user and group posture", () => {
+    const assets = renderReferenceInstallProfile();
+    const compose = assets.compose.content
+      .replace('    user: "${SITEFLOW_WORKER_USER:-1000:1000}"\n', "")
+      .replace('    group_add:\n      - "${SITEFLOW_DOCKER_SOCKET_GID:?SITEFLOW_DOCKER_SOCKET_GID must match /var/run/docker.sock group id}"\n', "");
+    const result = evaluateInstallProfileAssets({
+      ...assets,
+      compose: withContent(assets.compose, compose)
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "install_compose_worker_docker_runner",
+          status: "fail"
+        }),
+        expect.objectContaining({
+          name: "install_compose_container_hardening",
           status: "fail"
         })
       ])
@@ -232,9 +387,28 @@ describe("installProfileCheck", () => {
   it("blocks Compose worker profiles without the runtime healthcheck", () => {
     const assets = renderReferenceInstallProfile();
     const compose = assets.compose.content.replace(
-      "    healthcheck:\n      test: [\"CMD\", \"node\", \"dist-worker/worker/index.js\", \"--healthcheck\"]\n      interval: 30s\n      timeout: 5s\n      retries: 5\n      start_period: 30s\n",
+      "    healthcheck:\n      test: [\"CMD\", \"node\", \"dist-worker/worker/index.js\", \"--healthcheck\"]\n      interval: 30s\n      timeout: 10s\n      retries: 5\n      start_period: 30s\n",
       ""
     );
+    const result = evaluateInstallProfileAssets({
+      ...assets,
+      compose: withContent(assets.compose, compose)
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "install_compose_worker_healthcheck",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
+  it("blocks Compose worker profiles with a shorter runtime healthcheck timeout", () => {
+    const assets = renderReferenceInstallProfile();
+    const compose = assets.compose.content.replace("      timeout: 10s\n", "      timeout: 5s\n");
     const result = evaluateInstallProfileAssets({
       ...assets,
       compose: withContent(assets.compose, compose)
@@ -254,6 +428,7 @@ describe("installProfileCheck", () => {
   it("blocks Compose profiles without backup evidence mount", () => {
     const assets = renderReferenceInstallProfile();
     const compose = assets.compose.content
+      .replace('      SITEFLOW_EVIDENCE_ROOT: "/var/lib/siteflow/evidence"\n', "")
       .replace('      SITEFLOW_BACKUP_AUTOMATION_RUN_RECORD: "/var/lib/siteflow/evidence/backup-automation-run.json"\n', "")
       .replace("      - /var/lib/siteflow/evidence:/var/lib/siteflow/evidence:ro\n", "");
     const result = evaluateInstallProfileAssets({

@@ -22,6 +22,16 @@ function validEvidence(overrides: Record<string, unknown> = {}) {
       repository: "acme/siteflow",
       branch: "main"
     },
+    target: {
+      environment: "production",
+      publicBaseUrl: "https://siteflow.example.com",
+      directApiUrl: "http://203.0.113.10:8787/healthz",
+      release: {
+        commitRef: "abc123",
+        repository: "acme/siteflow",
+        branch: "main"
+      }
+    },
     trustProxyPolicy: "loopback",
     deploymentTopology: {
       apiInstanceCount: 2,
@@ -98,8 +108,76 @@ describe("ingressEvidenceCheck", () => {
       },
       apiRateLimit: {
         edgeEnforced: true
-      }
+      },
+      metricsAccessControl: null
     });
+  });
+
+  it("passes and summarizes optional metrics private-scrape access-control evidence", () => {
+    const result = evaluateIngressEvidence(
+      validEvidence({
+        metricsAccessControl: {
+          status: "passed",
+          checkedAt: "2026-06-08T11:36:00.000Z",
+          privateScrapeException: true,
+          scrapePath: "/metrics",
+          protection: "reverse_proxy_allowlist",
+          publicAccessBlocked: true,
+          evidenceLocation: "CHG-123#metrics-private-scrape"
+        }
+      }),
+      {
+        evidencePath: "ingress-evidence.json",
+        targetEnvironment: "production",
+        now
+      }
+    );
+
+    expect(result.status).toBe("passed");
+    expect(result.selectedEvidence.metricsAccessControl).toMatchObject({
+      status: "passed",
+      timestamp: "2026-06-08T11:36:00.000Z",
+      privateScrapeException: true,
+      scrapePath: "/metrics",
+      protection: "reverse_proxy_allowlist",
+      publicAccessBlocked: true
+    });
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "metrics_access_control_optional", status: "pass" }),
+        expect.objectContaining({ name: "metrics_access_control_age", status: "pass" }),
+        expect.objectContaining({ name: "metrics_access_control_private_scrape", status: "pass" })
+      ])
+    );
+  });
+
+  it("blocks malformed metrics private-scrape access-control evidence when provided", () => {
+    const result = evaluateIngressEvidence(
+      validEvidence({
+        metricsAccessControl: {
+          status: "passed",
+          checkedAt: "2026-06-08T11:36:00.000Z",
+          privateScrapeException: true,
+          scrapePath: "/metrics",
+          protection: "public",
+          publicAccessBlocked: false
+        }
+      }),
+      {
+        evidencePath: "ingress-evidence.json",
+        now
+      }
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "metrics_access_control_private_scrape",
+          status: "fail"
+        })
+      ])
+    );
   });
 
   it("blocks schema version or release identity mismatch", () => {
@@ -152,6 +230,34 @@ describe("ingressEvidenceCheck", () => {
     expect(result.checks).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: "environment", status: "fail" })
+      ])
+    );
+  });
+
+  it("blocks evidence with missing or mismatched target facts", () => {
+    const result = evaluateIngressEvidence(
+      validEvidence({
+        target: {
+          environment: "production",
+          publicBaseUrl: "https://siteflow.example.com",
+          directApiUrl: "http://198.51.100.15:8787/healthz",
+          release: {
+            commitRef: "abc123",
+            repository: "acme/siteflow",
+            branch: "main"
+          }
+        }
+      }),
+      {
+        evidencePath: "ingress-evidence.json",
+        now
+      }
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "target_facts", status: "fail" })
       ])
     );
   });
@@ -650,7 +756,8 @@ describe("ingressEvidenceCheck", () => {
           status: "blocked",
           checked: true,
           reachable: false,
-          checkedAt: timestamp
+          checkedAt: timestamp,
+          target: "http://203.0.113.10:8787/healthz"
         },
         forwardedHeaders: {
           status: "passed",

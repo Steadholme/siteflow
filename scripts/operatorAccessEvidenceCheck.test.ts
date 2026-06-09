@@ -22,6 +22,15 @@ function validEvidence(overrides: Record<string, unknown> = {}) {
       repository: "acme/siteflow",
       branch: "main"
     },
+    target: {
+      environment: "production",
+      publicBaseUrl: "https://siteflow.example.com",
+      release: {
+        commitRef: "abc123",
+        repository: "acme/siteflow",
+        branch: "main"
+      }
+    },
     sessionCreate: {
       status: "passed",
       checkedAt: "2026-06-08T11:31:00.000Z",
@@ -234,6 +243,33 @@ describe("operatorAccessEvidenceCheck", () => {
     expect(result.checks).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: "environment", status: "fail" })
+      ])
+    );
+  });
+
+  it("blocks evidence with missing or mismatched target facts", () => {
+    const result = evaluateOperatorAccessEvidence(
+      validEvidence({
+        target: {
+          environment: "production",
+          publicBaseUrl: "https://staging.siteflow.example.com",
+          release: {
+            commitRef: "abc123",
+            repository: "acme/siteflow",
+            branch: "main"
+          }
+        }
+      }),
+      {
+        evidencePath: "operator-access-evidence.json",
+        now
+      }
+    );
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "target_facts", status: "fail" })
       ])
     );
   });

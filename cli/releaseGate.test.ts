@@ -18,6 +18,7 @@ const validCiWorkflow = [
   "      - run: npm ci",
   "      - run: npm run --silent release:source:check -- --json",
   "      - run: npm run --silent release:commit:plan -- --fail-on-blocked --json",
+  "      - run: npm run --silent release:evidence:pack-contract -- --json",
   "      - run: npm test -- --run",
   "      - run: npm run build",
   "      - run: npm run --silent release:artifacts:check -- --json",
@@ -27,13 +28,25 @@ const validCiWorkflow = [
 
 const requiredReleasePreflightEvidenceInputs = [
   "direct_api_url",
+  "release_image_digest",
   "release_image_run_id",
+  "source_provider_webhook_delivery_id",
+  "source_provider_deploy_key_path",
+  "source_provider_known_hosts_path",
   "trust_proxy_policy",
   "api_instance_count",
   "api_process_count",
   "ingress_count",
   "api_rate_limit_scope",
-  "api_rate_limit_enforcement_point"
+  "api_rate_limit_enforcement_point",
+  "operator_access_project_id",
+  "operator_access_denied_project_id",
+  "old_metrics_token_redacted_id",
+  "new_metrics_token_redacted_id",
+  "old_root_api_token_redacted_id",
+  "new_root_api_token_redacted_id",
+  "break_glass_source",
+  "break_glass_approver_count"
 ];
 
 const validReleasePreflightWorkflow = [
@@ -55,6 +68,8 @@ const validReleasePreflightWorkflow = [
   "      - run: echo 'build_image must be pinned'",
   "      - run: npm run --silent release:dependency:policy -- --json",
   "      - run: npm run --silent release:source:check -- --json",
+  "      - run: npm run --silent release:commit:plan -- --fail-on-blocked --json",
+  "      - run: npm run --silent release:evidence:pack-contract -- --json",
   "      - run: npm run build",
   "      - run: npx playwright install --with-deps chromium",
   "      - run: npm run test:e2e",
@@ -73,8 +88,27 @@ const validReleasePreflightWorkflow = [
   "      - env:",
   "          GITHUB_TOKEN: ${{ secrets.SITEFLOW_RELEASE_GITHUB_TOKEN || github.token }}",
   "          GH_TOKEN: ${{ secrets.SITEFLOW_RELEASE_GITHUB_TOKEN || github.token }}",
-  "        run: npm run --silent release:evidence:target-run -- --pack evidence/release-evidence-rehearsal-pack.json --confirm-target-environment production --run-record evidence/release-evidence-target-run.json --gap-report-dir evidence/gap-reports --set-env direct-api-url=SITEFLOW_DIRECT_API_URL --set-env release-image-run-id=SITEFLOW_RELEASE_IMAGE_RUN_ID --set-env SITEFLOW_TRUST_PROXY=SITEFLOW_TRUST_PROXY --set-env api-instance-count=SITEFLOW_API_INSTANCE_COUNT --set-env api-process-count=SITEFLOW_API_PROCESS_COUNT --set-env ingress-count=SITEFLOW_INGRESS_COUNT --set-env api-rate-limit-scope=SITEFLOW_API_RATE_LIMIT_SCOPE --set-env api-rate-limit-enforcement-point=SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT --json",
-  "      - run: npm run --silent release:evidence:gaps -- --pack evidence/release-evidence-rehearsal-pack.json --set-env direct-api-url=SITEFLOW_DIRECT_API_URL --set-env release-image-run-id=SITEFLOW_RELEASE_IMAGE_RUN_ID --set-env SITEFLOW_TRUST_PROXY=SITEFLOW_TRUST_PROXY --set-env api-instance-count=SITEFLOW_API_INSTANCE_COUNT --set-env api-process-count=SITEFLOW_API_PROCESS_COUNT --set-env ingress-count=SITEFLOW_INGRESS_COUNT --set-env api-rate-limit-scope=SITEFLOW_API_RATE_LIMIT_SCOPE --set-env api-rate-limit-enforcement-point=SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT --json",
+  "          SITEFLOW_API_TOKEN: ${{ secrets.SITEFLOW_API_TOKEN }}",
+  "          SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN: ${{ secrets.SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN }}",
+  "          SITEFLOW_OLD_METRICS_TOKEN: ${{ secrets.SITEFLOW_OLD_METRICS_TOKEN }}",
+  "          SITEFLOW_METRICS_TOKEN: ${{ secrets.SITEFLOW_METRICS_TOKEN }}",
+  "          SITEFLOW_OLD_API_TOKEN: ${{ secrets.SITEFLOW_OLD_API_TOKEN }}",
+  "          SITEFLOW_OBSERVABILITY_STACK_TOKEN: ${{ secrets.SITEFLOW_OBSERVABILITY_STACK_TOKEN }}",
+  "          SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID: ${{ secrets.SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID }}",
+  "          SITEFLOW_RELEASE_IMAGE_DIGEST: ${{ inputs.release_image_digest }}",
+  "          SITEFLOW_RELEASE_IMAGE_RUN_ID: ${{ inputs.release_image_run_id }}",
+  "        run: npm run --silent release:evidence:target-run -- --pack evidence/release-evidence-rehearsal-pack.json --confirm-target-environment production --run-record evidence/release-evidence-target-run.json --gap-report-dir evidence/gap-reports --set-env direct-api-url=SITEFLOW_DIRECT_API_URL --set-env release-image-digest=SITEFLOW_RELEASE_IMAGE_DIGEST --set-env release-image-run-id=SITEFLOW_RELEASE_IMAGE_RUN_ID --set-env webhook-delivery-id=SITEFLOW_SOURCE_PROVIDER_WEBHOOK_DELIVERY_ID --set-env deploy-key-path=SITEFLOW_SOURCE_PROVIDER_DEPLOY_KEY_PATH --set-env known-hosts-path=SITEFLOW_SOURCE_PROVIDER_KNOWN_HOSTS_PATH --set-env SITEFLOW_TRUST_PROXY=SITEFLOW_TRUST_PROXY --set-env api-instance-count=SITEFLOW_API_INSTANCE_COUNT --set-env api-process-count=SITEFLOW_API_PROCESS_COUNT --set-env ingress-count=SITEFLOW_INGRESS_COUNT --set-env api-rate-limit-scope=SITEFLOW_API_RATE_LIMIT_SCOPE --set-env api-rate-limit-enforcement-point=SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT --set-env operator-access-project-id=SITEFLOW_OPERATOR_ACCESS_PROJECT_ID --set-env operator-access-denied-project-id=SITEFLOW_OPERATOR_ACCESS_DENIED_PROJECT_ID --set-env old-metrics-token-redacted-id=SITEFLOW_OLD_METRICS_TOKEN_REDACTED_ID --set-env new-metrics-token-redacted-id=SITEFLOW_NEW_METRICS_TOKEN_REDACTED_ID --set-env old-root-api-token-redacted-id=SITEFLOW_OLD_ROOT_API_TOKEN_REDACTED_ID --set-env new-root-api-token-redacted-id=SITEFLOW_NEW_ROOT_API_TOKEN_REDACTED_ID --set-env break-glass-source=SITEFLOW_BREAK_GLASS_SOURCE --set-env break-glass-approver-count=SITEFLOW_BREAK_GLASS_APPROVER_COUNT --json",
+  "      - env:",
+  "          SITEFLOW_API_TOKEN: ${{ secrets.SITEFLOW_API_TOKEN }}",
+  "          SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN: ${{ secrets.SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN }}",
+  "          SITEFLOW_OLD_METRICS_TOKEN: ${{ secrets.SITEFLOW_OLD_METRICS_TOKEN }}",
+  "          SITEFLOW_METRICS_TOKEN: ${{ secrets.SITEFLOW_METRICS_TOKEN }}",
+  "          SITEFLOW_OLD_API_TOKEN: ${{ secrets.SITEFLOW_OLD_API_TOKEN }}",
+  "          SITEFLOW_OBSERVABILITY_STACK_TOKEN: ${{ secrets.SITEFLOW_OBSERVABILITY_STACK_TOKEN }}",
+  "          SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID: ${{ secrets.SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID }}",
+  "          SITEFLOW_RELEASE_IMAGE_DIGEST: ${{ inputs.release_image_digest }}",
+  "          SITEFLOW_RELEASE_IMAGE_RUN_ID: ${{ inputs.release_image_run_id }}",
+  "        run: npm run --silent release:evidence:gaps -- --pack evidence/release-evidence-rehearsal-pack.json --set-env direct-api-url=SITEFLOW_DIRECT_API_URL --set-env release-image-digest=SITEFLOW_RELEASE_IMAGE_DIGEST --set-env release-image-run-id=SITEFLOW_RELEASE_IMAGE_RUN_ID --set-env webhook-delivery-id=SITEFLOW_SOURCE_PROVIDER_WEBHOOK_DELIVERY_ID --set-env deploy-key-path=SITEFLOW_SOURCE_PROVIDER_DEPLOY_KEY_PATH --set-env known-hosts-path=SITEFLOW_SOURCE_PROVIDER_KNOWN_HOSTS_PATH --set-env SITEFLOW_TRUST_PROXY=SITEFLOW_TRUST_PROXY --set-env api-instance-count=SITEFLOW_API_INSTANCE_COUNT --set-env api-process-count=SITEFLOW_API_PROCESS_COUNT --set-env ingress-count=SITEFLOW_INGRESS_COUNT --set-env api-rate-limit-scope=SITEFLOW_API_RATE_LIMIT_SCOPE --set-env api-rate-limit-enforcement-point=SITEFLOW_API_RATE_LIMIT_ENFORCEMENT_POINT --set-env operator-access-project-id=SITEFLOW_OPERATOR_ACCESS_PROJECT_ID --set-env operator-access-denied-project-id=SITEFLOW_OPERATOR_ACCESS_DENIED_PROJECT_ID --set-env old-metrics-token-redacted-id=SITEFLOW_OLD_METRICS_TOKEN_REDACTED_ID --set-env new-metrics-token-redacted-id=SITEFLOW_NEW_METRICS_TOKEN_REDACTED_ID --set-env old-root-api-token-redacted-id=SITEFLOW_OLD_ROOT_API_TOKEN_REDACTED_ID --set-env new-root-api-token-redacted-id=SITEFLOW_NEW_ROOT_API_TOKEN_REDACTED_ID --set-env break-glass-source=SITEFLOW_BREAK_GLASS_SOURCE --set-env break-glass-approver-count=SITEFLOW_BREAK_GLASS_APPROVER_COUNT --json",
   "      - run: rm -f \"$SITEFLOW_TARGET_ENV_FILE\"",
   "      - uses: actions/upload-artifact@v4",
   "        with:",
@@ -84,6 +118,70 @@ const validReleasePreflightWorkflow = [
   "            playwright-report/**",
   "            test-results/**"
 ].join("\n");
+
+const validReleaseImageWorkflow = [
+  "name: Release Image",
+  "on:",
+  "  workflow_dispatch:",
+  "  push:",
+  "    tags:",
+  "      - \"v*\"",
+  "permissions:",
+  "  contents: read",
+  "  packages: write",
+  "jobs:",
+  "  publish:",
+  "    steps:",
+  "      - run: npm run --silent release:dependency:policy -- --json",
+  "      - run: npm ci",
+  "      - run: npm run --silent release:source:check -- --json",
+  "      - run: npm run --silent release:commit:plan -- --fail-on-blocked --json",
+  "      - run: npm run --silent release:evidence:pack-contract -- --json",
+  "      - run: npm test -- --run",
+  "      - run: npm run build",
+  "      - run: npm run --silent release:artifacts:check -- --json",
+  "      - uses: docker/build-push-action@v6",
+  "        with:",
+  "          provenance: true",
+  "          sbom: true",
+  "      - run: docker buildx imagetools inspect --raw ghcr.io/siteflow/siteflow@sha256:abc",
+  "      - run: echo '{}' > release-image-evidence.json",
+  "      - uses: actions/upload-artifact@v4",
+  "        with:",
+  "          name: release-image-evidence",
+  "          path: release-image-evidence.json",
+  "      - name: Gate image attestation evidence",
+  "        run: |",
+  "          const failed = [",
+  "            ...(Array.isArray(attestations.provenance?.failedChecks) ? attestations.provenance.failedChecks : []),",
+  "            ...(Array.isArray(attestations.sbom?.failedChecks) ? attestations.sbom.failedChecks : [])",
+  "          ];",
+  "          if (failed.length || attestations.provenance?.present !== true || attestations.sbom?.present !== true) {",
+  "            throw new Error(\"Published image provenance/SBOM attestation evidence is incomplete.\");",
+  "          }"
+].join("\n");
+
+const validPackageJson = JSON.stringify({
+  scripts: {
+    build: "npm run clean:build-artifacts && tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json && npm run build:scripts && npm run build:cli && npm run build:server && npm run build:worker && vite build",
+    "build:scripts": "tsc --noEmit -p tsconfig.scripts.json",
+    "clean:build-artifacts": "node scripts/cleanBuildArtifacts.mjs",
+    "build:cli": "tsc -p tsconfig.cli.json",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build:worker": "tsc -p tsconfig.worker.json",
+    siteflow: "node dist-cli/cli/index.js",
+    "release:dependency:policy": "node scripts/releaseDependencyPolicyCheck.mjs",
+    "release:source:check": "node scripts/runCompiledScript.mjs releaseSourceTreeCheck.js",
+    "release:commit:plan": "node scripts/runCompiledScript.mjs releaseCommitReadinessPlan.js",
+    "release:evidence:pack-contract": "node scripts/runCompiledScript.mjs releaseEvidencePackContractCheck.js",
+    "release:evidence:rehearsal-pack": "node scripts/runCompiledScript.mjs releaseEvidenceRehearsalPack.js",
+    "release:evidence:target-run": "node scripts/runCompiledScript.mjs releaseEvidenceTargetRun.js",
+    "release:evidence:gaps": "node scripts/runCompiledScript.mjs releaseEvidenceGapReport.js",
+    "release:artifacts:check": "node scripts/runCompiledScript.mjs releaseArtifactCheck.js",
+    test: "vitest",
+    "test:e2e": "playwright test"
+  }
+}, null, 2);
 
 const validProductionDocs = [
   "# Production",
@@ -96,6 +194,8 @@ const validProductionDocs = [
   "SITEFLOW_API_TOKEN",
   "SITEFLOW_APP_SECRET",
   "SITEFLOW_SEALING_KEY",
+  "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY",
+  "SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID",
   "SITEFLOW_METRICS_TOKEN",
   "SITEFLOW_ALLOW_UNAUTHENTICATED_METRICS",
   "VITE_SITEFLOW_ALLOW_BROWSER_TOKEN_FALLBACK",
@@ -114,6 +214,14 @@ const validProductionDocs = [
   "SITEFLOW_PREBUILT_MAX_FILES",
   "SITEFLOW_BUILD_STEP_TIMEOUT_MS",
   "SITEFLOW_GIT_TIMEOUT_MS",
+  "SITEFLOW_BUILD_MEMORY",
+  "SITEFLOW_BUILD_CPUS",
+  "SITEFLOW_BUILD_PIDS_LIMIT",
+  "SITEFLOW_TRUST_PROXY",
+  "SITEFLOW_WORKER_USER",
+  "SITEFLOW_DOCKER_SOCKET_GID",
+  "SITEFLOW_GIT_SSH_KEY_PATH",
+  "SITEFLOW_GIT_KNOWN_HOSTS_PATH",
   "SITEFLOW_BUILD_NETWORK"
 ].join("\n");
 
@@ -144,22 +252,36 @@ const validProductionCompose = [
   "      SITEFLOW_APP_SECRET_FILE: /run/secrets/siteflow_app_secret",
   "      SITEFLOW_API_TOKEN_FILE: /run/secrets/siteflow_api_token",
   "      SITEFLOW_METRICS_TOKEN_FILE: /run/secrets/siteflow_metrics_token",
+  "      SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE: /run/secrets/siteflow_release_evidence_signing_key",
+  "      SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID: sha256:1111111111111111",
   "      SITEFLOW_POSTGRES_PASSWORD_FILE: /run/secrets/siteflow_postgres_password",
+  "      SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_github_webhook_secret",
+  "      SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_gitlab_webhook_secret",
+  "      SITEFLOW_GITEA_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_gitea_webhook_secret",
+  "      SITEFLOW_GENERIC_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_generic_webhook_secret",
   "      SITEFLOW_BACKUP_AUTOMATION_RUN_RECORD: /var/lib/siteflow/evidence/backup-automation-run.json",
   "      SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES: 536870912",
   "      SITEFLOW_PREBUILT_MAX_FILES: 20000",
+  "      SITEFLOW_TRUST_PROXY: \"${SITEFLOW_TRUST_PROXY:-}\"",
   "    secrets:",
   "      - siteflow_app_secret",
   "      - siteflow_api_token",
   "      - siteflow_metrics_token",
+  "      - siteflow_release_evidence_signing_key",
   "      - siteflow_postgres_password",
+  "      - siteflow_github_webhook_secret",
+  "      - siteflow_gitlab_webhook_secret",
+  "      - siteflow_gitea_webhook_secret",
+  "      - siteflow_generic_webhook_secret",
   "    healthcheck:",
   "      test: fetch /readyz",
+  "    ports:",
+  "      - \"${SITEFLOW_API_BIND:-127.0.0.1}:8787:8787\"",
   "  worker:",
   "    image: ${SITEFLOW_IMAGE:?SITEFLOW_IMAGE must be the digest-pinned release image for production}",
-  "    user: \"${SITEFLOW_WORKER_USER:-0:0}\"",
+  "    user: \"${SITEFLOW_WORKER_USER:-1000:1000}\"",
   "    group_add:",
-  "      - \"${SITEFLOW_DOCKER_SOCKET_GID:-0}\"",
+  "      - \"${SITEFLOW_DOCKER_SOCKET_GID:?SITEFLOW_DOCKER_SOCKET_GID must match /var/run/docker.sock group id}\"",
   "    init: true",
   "    read_only: true",
   "    cap_drop:",
@@ -181,6 +303,13 @@ const validProductionCompose = [
   "      SITEFLOW_BUILD_MAX_ARTIFACT_BYTES: 536870912",
   "      SITEFLOW_BUILD_MAX_ARTIFACT_FILES: 20000",
   "      SITEFLOW_BUILD_MIN_FREE_BYTES: 1073741824",
+  "      SITEFLOW_BUILD_STEP_TIMEOUT_MS: 900000",
+  "      SITEFLOW_GIT_TIMEOUT_MS: 300000",
+  "      SITEFLOW_BUILD_MEMORY: 1g",
+  "      SITEFLOW_BUILD_CPUS: 2",
+  "      SITEFLOW_BUILD_PIDS_LIMIT: 256",
+  "      SITEFLOW_GIT_SSH_KEY_PATH: \"${SITEFLOW_GIT_SSH_KEY_PATH:-}\"",
+  "      SITEFLOW_GIT_KNOWN_HOSTS_PATH: \"${SITEFLOW_GIT_KNOWN_HOSTS_PATH:-}\"",
   "    secrets:",
   "      - siteflow_app_secret",
   "      - siteflow_postgres_password",
@@ -188,6 +317,12 @@ const validProductionCompose = [
   "      - type: bind",
   "        source: /var/run/docker.sock",
   "        target: /var/run/docker.sock",
+  "    command: |",
+  "      command -v docker",
+  "      docker info",
+  "      exec node dist-worker/worker/index.js",
+  "    healthcheck:",
+  "      test: node dist-worker/worker/index.js --healthcheck",
   "secrets:",
   "  siteflow_app_secret:",
   "    file: /etc/siteflow/secrets/app-secret.secret",
@@ -195,8 +330,18 @@ const validProductionCompose = [
   "    file: /etc/siteflow/secrets/api-token.secret",
   "  siteflow_metrics_token:",
   "    file: /etc/siteflow/secrets/metrics-token.secret",
+  "  siteflow_release_evidence_signing_key:",
+  "    file: /etc/siteflow/secrets/release-evidence-signing-key.secret",
   "  siteflow_postgres_password:",
-  "    file: /etc/siteflow/secrets/postgres-password.secret"
+  "    file: /etc/siteflow/secrets/postgres-password.secret",
+  "  siteflow_github_webhook_secret:",
+  "    file: /etc/siteflow/secrets/github-webhook.secret",
+  "  siteflow_gitlab_webhook_secret:",
+  "    file: /etc/siteflow/secrets/gitlab-webhook.secret",
+  "  siteflow_gitea_webhook_secret:",
+  "    file: /etc/siteflow/secrets/gitea-webhook.secret",
+  "  siteflow_generic_webhook_secret:",
+  "    file: /etc/siteflow/secrets/generic-webhook.secret"
 ].join("\n");
 
 const validProductionDeploymentDoc = [
@@ -208,11 +353,29 @@ const validProductionDeploymentDoc = [
   "SITEFLOW_POSTGRES_IMAGE",
   "SITEFLOW_BUILD_IMAGE",
   "SITEFLOW_BUILD_MIN_FREE_BYTES",
+  "SITEFLOW_BUILD_STEP_TIMEOUT_MS",
+  "SITEFLOW_GIT_TIMEOUT_MS",
+  "SITEFLOW_BUILD_MEMORY",
+  "SITEFLOW_BUILD_CPUS",
+  "SITEFLOW_BUILD_PIDS_LIMIT",
   "SITEFLOW_BUILD_MAX_ARTIFACT_BYTES",
   "SITEFLOW_BUILD_MAX_ARTIFACT_FILES",
   "SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES",
   "SITEFLOW_PREBUILT_MAX_FILES",
+  "SITEFLOW_TRUST_PROXY",
+  "SITEFLOW_WORKER_USER",
+  "SITEFLOW_DOCKER_SOCKET_GID",
+  "SITEFLOW_GIT_SSH_KEY_PATH",
+  "SITEFLOW_GIT_KNOWN_HOSTS_PATH",
+  "SITEFLOW_APP_SECRET_FILE",
+  "SITEFLOW_API_TOKEN_FILE",
+  "SITEFLOW_METRICS_TOKEN_FILE",
+  "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE",
   "SITEFLOW_POSTGRES_PASSWORD_FILE",
+  "SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE",
+  "SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE",
+  "SITEFLOW_GITEA_WEBHOOK_SECRET_FILE",
+  "SITEFLOW_GENERIC_WEBHOOK_SECRET_FILE",
   "docker compose -f docker-compose.production.yml config"
 ].join("\n");
 
@@ -226,6 +389,7 @@ const pinnedBuildImage = "node:20-bookworm-slim@sha256:aaaaaaaaaaaaaaaaaaaaaaaaa
 const strongApiToken = "siteflow-api-token-0123456789abcdef";
 const strongAppSecret = "siteflow-app-secret-0123456789abcdef";
 const strongMetricsToken = "siteflow-metrics-token-0123456789abcdef";
+const strongReleaseEvidenceSigningKey = "siteflow-release-evidence-key-0123456789abcdef";
 
 const validProductionEnv = {
   SITEFLOW_ENV: "production",
@@ -235,6 +399,7 @@ const validProductionEnv = {
   SITEFLOW_PUBLIC_SCHEME: "https",
   SITEFLOW_API_TOKEN: strongApiToken,
   SITEFLOW_APP_SECRET: strongAppSecret,
+  SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY: strongReleaseEvidenceSigningKey,
   SITEFLOW_METRICS_TOKEN: strongMetricsToken,
   SITEFLOW_BUILD_RUNNER: "docker",
   SITEFLOW_BUILD_IMAGE: pinnedBuildImage,
@@ -245,19 +410,127 @@ const validProductionEnv = {
   SITEFLOW_PREBUILT_MAX_FILES: "20000",
   SITEFLOW_BUILD_STEP_TIMEOUT_MS: "900000",
   SITEFLOW_GIT_TIMEOUT_MS: "300000",
+  SITEFLOW_BUILD_MEMORY: "1g",
+  SITEFLOW_BUILD_CPUS: "2",
+  SITEFLOW_BUILD_PIDS_LIMIT: "256",
+  SITEFLOW_WORKER_USER: "1000:1000",
+  SITEFLOW_DOCKER_SOCKET_GID: "998",
   SITEFLOW_BUILD_NETWORK: "none"
 };
+
+const releaseCommitSha = "abc123def456abc123def456abc123def456abcd";
+
+const validGitHubRequiredStatusChecksResponse = {
+  contexts: ["Install, test, and build"],
+  checks: []
+};
+
+const validGitHubBranchProtectionResponse = {
+  required_status_checks: validGitHubRequiredStatusChecksResponse,
+  required_pull_request_reviews: {
+    required_approving_review_count: 1
+  },
+  allow_force_pushes: {
+    enabled: false
+  },
+  required_linear_history: {
+    enabled: true
+  },
+  required_signatures: {
+    enabled: true
+  }
+};
+
+function gitHubJson(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" }
+  });
+}
+
+function createGitHubPromotionFetch(options: {
+  requests?: string[];
+  requiredStatusChecks?: unknown;
+  requiredStatusChecksStatus?: number;
+  requiredStatusChecksMessage?: string;
+  branchProtection?: unknown;
+  branchProtectionStatus?: number;
+  branchProtectionMessage?: string;
+  rulesets?: unknown;
+  rulesetsStatus?: number;
+  rulesetsMessage?: string;
+  branchHeadSha?: string;
+  checkRun?: {
+    name?: string;
+    status?: string;
+    conclusion?: string | null;
+    html_url?: string;
+  };
+} = {}): ReleaseGateFetch {
+  return async (input) => {
+    const url = input.toString();
+    options.requests?.push(url);
+
+    if (url.includes("/required_status_checks")) {
+      return gitHubJson(
+        options.requiredStatusChecksStatus && options.requiredStatusChecksStatus >= 400
+          ? { message: options.requiredStatusChecksMessage ?? "Resource not accessible by integration" }
+          : options.requiredStatusChecks ?? validGitHubRequiredStatusChecksResponse,
+        options.requiredStatusChecksStatus ?? 200
+      );
+    }
+
+    if (/\/branches\/[^/]+\/protection$/.test(url)) {
+      return gitHubJson(
+        options.branchProtectionStatus && options.branchProtectionStatus >= 400
+          ? { message: options.branchProtectionMessage ?? "Resource not accessible by integration" }
+          : options.branchProtection ?? validGitHubBranchProtectionResponse,
+        options.branchProtectionStatus ?? 200
+      );
+    }
+
+    if (url.includes("/rulesets")) {
+      return gitHubJson(
+        options.rulesetsStatus && options.rulesetsStatus >= 400
+          ? { message: options.rulesetsMessage ?? "Resource not accessible by integration" }
+          : options.rulesets ?? [],
+        options.rulesetsStatus ?? 200
+      );
+    }
+
+    if (/\/branches\/[^/]+$/.test(url)) {
+      return gitHubJson({
+        commit: { sha: options.branchHeadSha ?? releaseCommitSha }
+      });
+    }
+
+    return gitHubJson({
+      total_count: 1,
+      check_runs: [
+        {
+          name: "Install, test, and build",
+          status: "completed",
+          conclusion: "success",
+          html_url: "https://github.example.test/checks/1",
+          ...options.checkRun
+        }
+      ]
+    });
+  };
+}
 
 async function createReleaseRoot(options: {
   ci?: boolean;
   releasePreflight?: boolean;
+  releaseImage?: boolean;
+  packageJson?: boolean;
   docs?: boolean;
   compose?: boolean;
   deploymentDoc?: boolean;
 } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-release-gate-"));
 
-  if (options.ci !== false || options.releasePreflight !== false) {
+  if (options.ci !== false || options.releasePreflight !== false || options.releaseImage !== false) {
     await mkdir(path.join(root, ".github", "workflows"), { recursive: true });
   }
 
@@ -267,6 +540,14 @@ async function createReleaseRoot(options: {
 
   if (options.releasePreflight !== false) {
     await writeFile(path.join(root, ".github", "workflows", "release-preflight.yml"), validReleasePreflightWorkflow);
+  }
+
+  if (options.releaseImage !== false) {
+    await writeFile(path.join(root, ".github", "workflows", "release-image.yml"), validReleaseImageWorkflow);
+  }
+
+  if (options.packageJson !== false) {
+    await writeFile(path.join(root, "package.json"), validPackageJson);
   }
 
   if (options.docs !== false) {
@@ -358,6 +639,7 @@ describe("release gate", () => {
             "release:dependency:policy",
             "release:source:check",
             "release:commit:plan -- --fail-on-blocked",
+            "release:evidence:pack-contract",
             "release:artifacts:check",
             "release-gate --allow-dirty --allow-manual-branch-protection"
           ]
@@ -383,6 +665,186 @@ describe("release gate", () => {
       expect(report.checks).toContainEqual(expect.objectContaining({
         id: "local.releasePreflightWorkflow",
         status: "fail"
+      }));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails when the release image workflow is missing", async () => {
+    const root = await createReleaseRoot({ releaseImage: false });
+
+    try {
+      const report = await runReleaseGate({
+        root,
+        env: {},
+        runner: cleanRunner,
+        allowManualBranchProtection: true
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "local.releaseImageWorkflow",
+        status: "fail"
+      }));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails when the release image workflow omits pack contract checks", async () => {
+    const root = await createReleaseRoot();
+
+    try {
+      await writeFile(
+        path.join(root, ".github", "workflows", "release-image.yml"),
+        validReleaseImageWorkflow.replace("      - run: npm run --silent release:evidence:pack-contract -- --json\n", "")
+      );
+
+      const report = await runReleaseGate({
+        root,
+        env: {},
+        runner: cleanRunner,
+        allowManualBranchProtection: true
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "local.releaseImageWorkflow",
+        status: "fail",
+        details: expect.objectContaining({
+          missingTerms: expect.arrayContaining(["release:evidence:pack-contract"])
+        })
+      }));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    [
+      "attestation gate step",
+      "      - name: Gate image attestation evidence\n",
+      "",
+      "Gate image attestation evidence"
+    ],
+    [
+      "provenance failed-check aggregation",
+      "attestations.provenance?.failedChecks",
+      "attestations.provenance?.warnings",
+      "attestations.provenance?.failedChecks"
+    ],
+    [
+      "SBOM present gate",
+      "attestations.sbom?.present !== true",
+      "attestations.sbom?.present === false",
+      "attestations.sbom?.present !== true"
+    ]
+  ])("fails when the release image workflow omits %s", async (_label, original, replacement, missingTerm) => {
+    const root = await createReleaseRoot();
+
+    try {
+      await writeFile(
+        path.join(root, ".github", "workflows", "release-image.yml"),
+        validReleaseImageWorkflow.replace(original, replacement)
+      );
+
+      const report = await runReleaseGate({
+        root,
+        env: {},
+        runner: cleanRunner,
+        allowManualBranchProtection: true
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "local.releaseImageWorkflow",
+        status: "fail",
+        details: expect.objectContaining({
+          missingTerms: expect.arrayContaining([missingTerm])
+        })
+      }));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails when package.json is missing", async () => {
+    const root = await createReleaseRoot({ packageJson: false });
+
+    try {
+      const report = await runReleaseGate({
+        root,
+        env: {},
+        runner: cleanRunner,
+        allowManualBranchProtection: true
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "local.packageScripts",
+        status: "fail"
+      }));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails when package.json omits a production release script used by workflows", async () => {
+    const root = await createReleaseRoot();
+    const packageJson = JSON.parse(validPackageJson) as { scripts: Record<string, string> };
+    delete packageJson.scripts["release:evidence:pack-contract"];
+
+    try {
+      await writeFile(path.join(root, "package.json"), JSON.stringify(packageJson, null, 2));
+
+      const report = await runReleaseGate({
+        root,
+        env: {},
+        runner: cleanRunner,
+        allowManualBranchProtection: true
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "local.packageScripts",
+        status: "fail",
+        details: expect.objectContaining({
+          missingScripts: expect.arrayContaining(["release:evidence:pack-contract"])
+        })
+      }));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails when a production release package script drifts to the wrong implementation", async () => {
+    const root = await createReleaseRoot();
+    const packageJson = JSON.parse(validPackageJson) as { scripts: Record<string, string> };
+    packageJson.scripts["release:evidence:pack-contract"] = "node scripts/runCompiledScript.mjs releaseEvidenceBundleCheck.js";
+
+    try {
+      await writeFile(path.join(root, "package.json"), JSON.stringify(packageJson, null, 2));
+
+      const report = await runReleaseGate({
+        root,
+        env: {},
+        runner: cleanRunner,
+        allowManualBranchProtection: true
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "local.packageScripts",
+        status: "fail",
+        details: expect.objectContaining({
+          driftedScripts: expect.arrayContaining([
+            expect.objectContaining({
+              script: "release:evidence:pack-contract",
+              missingTerms: ["node scripts/runCompiledScript.mjs releaseEvidencePackContractCheck.js"]
+            })
+          ])
+        })
       }));
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -568,9 +1030,186 @@ describe("release gate", () => {
 
   it.each([
     [
+      "API privileged mode",
+      [
+        "    security_opt:",
+        "      - no-new-privileges:true"
+      ].join("\n"),
+      [
+        "    security_opt:",
+        "      - no-new-privileges:true",
+        "    privileged: true"
+      ].join("\n"),
+      "api must not run privileged"
+    ],
+    [
+      "worker capability add",
+      [
+        "    group_add:",
+        "      - \"${SITEFLOW_DOCKER_SOCKET_GID:?SITEFLOW_DOCKER_SOCKET_GID must match /var/run/docker.sock group id}\"",
+        "    init: true",
+        "    read_only: true",
+        "    cap_drop:",
+        "      - ALL"
+      ].join("\n"),
+      [
+        "    group_add:",
+        "      - \"${SITEFLOW_DOCKER_SOCKET_GID:?SITEFLOW_DOCKER_SOCKET_GID must match /var/run/docker.sock group id}\"",
+        "    init: true",
+        "    read_only: true",
+        "    cap_drop:",
+        "      - ALL",
+        "    cap_add:",
+        "      - SYS_ADMIN"
+      ].join("\n"),
+      "worker must not add Linux capabilities"
+    ],
+    [
+      "worker unconfined seccomp",
+      [
+        "    security_opt:",
+        "      - no-new-privileges:true",
+        "    depends_on:",
+        "      postgres:",
+        "        condition: service_healthy",
+        "      api:"
+      ].join("\n"),
+      [
+        "    security_opt:",
+        "      - no-new-privileges:true",
+        "      - seccomp=unconfined",
+        "    depends_on:",
+        "      postgres:",
+        "        condition: service_healthy",
+        "      api:"
+      ].join("\n"),
+      "worker must not disable seccomp or AppArmor"
+    ],
+    [
+      "worker host network mode",
+      [
+        "    group_add:",
+        "      - \"${SITEFLOW_DOCKER_SOCKET_GID:?SITEFLOW_DOCKER_SOCKET_GID must match /var/run/docker.sock group id}\"",
+        "    init: true",
+        "    read_only: true"
+      ].join("\n"),
+      [
+        "    group_add:",
+        "      - \"${SITEFLOW_DOCKER_SOCKET_GID:?SITEFLOW_DOCKER_SOCKET_GID must match /var/run/docker.sock group id}\"",
+        "    init: true",
+        "    network_mode: host",
+        "    read_only: true"
+      ].join("\n"),
+      "worker must not use host network mode"
+    ]
+  ])("fails when production compose enables %s", async (_label, searchText, replacementText, expectedTerm) => {
+    const root = await createReleaseRoot();
+
+    try {
+      await writeFile(
+        path.join(root, "docker-compose.production.yml"),
+        validProductionCompose.replace(searchText, replacementText)
+      );
+
+      const report = await runReleaseGate({
+        root,
+        env: {},
+        runner: cleanRunner,
+        allowManualBranchProtection: true
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "local.productionCompose",
+        status: "fail",
+        details: expect.objectContaining({
+          missingComposeTerms: expect.arrayContaining([expectedTerm])
+        })
+      }));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails when production compose defaults API trusted proxy policy to loopback", async () => {
+    const root = await createReleaseRoot();
+
+    try {
+      await writeFile(
+        path.join(root, "docker-compose.production.yml"),
+        validProductionCompose.replace(
+          '      SITEFLOW_TRUST_PROXY: "${SITEFLOW_TRUST_PROXY:-}"',
+          '      SITEFLOW_TRUST_PROXY: "${SITEFLOW_TRUST_PROXY:-loopback}"'
+        )
+      );
+
+      const report = await runReleaseGate({
+        root,
+        env: {},
+        runner: cleanRunner,
+        allowManualBranchProtection: true
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "local.productionCompose",
+        status: "fail",
+        details: expect.objectContaining({
+          missingComposeTerms: expect.arrayContaining(["api SITEFLOW_TRUST_PROXY must default to disabled/unset"])
+        })
+      }));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails when production compose defaults worker socket posture to root and gid 0", async () => {
+    const root = await createReleaseRoot();
+
+    try {
+      await writeFile(
+        path.join(root, "docker-compose.production.yml"),
+        validProductionCompose
+          .replace('    user: "${SITEFLOW_WORKER_USER:-1000:1000}"', '    user: "${SITEFLOW_WORKER_USER:-0:0}"')
+          .replace(
+            '      - "${SITEFLOW_DOCKER_SOCKET_GID:?SITEFLOW_DOCKER_SOCKET_GID must match /var/run/docker.sock group id}"',
+            '      - "${SITEFLOW_DOCKER_SOCKET_GID:-0}"'
+          )
+      );
+
+      const report = await runReleaseGate({
+        root,
+        env: {},
+        runner: cleanRunner,
+        allowManualBranchProtection: true
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "local.productionCompose",
+        status: "fail",
+        details: expect.objectContaining({
+          missingComposeTerms: expect.arrayContaining([
+            "worker SITEFLOW_WORKER_USER must default to a non-root user",
+            "worker SITEFLOW_DOCKER_SOCKET_GID must be explicitly required instead of defaulting to 0"
+          ])
+        })
+      }));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    [
       "API prebuilt upload limit",
       "      SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES: 536870912\n",
       "api SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES:"
+    ],
+    [
+      "API trusted proxy opt-in",
+      "      SITEFLOW_TRUST_PROXY: \"${SITEFLOW_TRUST_PROXY:-}\"\n",
+      "api SITEFLOW_TRUST_PROXY:"
     ],
     [
       "API readiness healthcheck",
@@ -578,9 +1217,29 @@ describe("release gate", () => {
       "api /readyz"
     ],
     [
+      "API loopback port binding",
+      "      - \"${SITEFLOW_API_BIND:-127.0.0.1}:8787:8787\"\n",
+      "api ${SITEFLOW_API_BIND:-127.0.0.1}:8787:8787"
+    ],
+    [
       "worker Docker socket group override",
-      "    group_add:\n      - \"${SITEFLOW_DOCKER_SOCKET_GID:-0}\"\n",
+      "    group_add:\n      - \"${SITEFLOW_DOCKER_SOCKET_GID:?SITEFLOW_DOCKER_SOCKET_GID must match /var/run/docker.sock group id}\"\n",
       "worker group_add:"
+    ],
+    [
+      "worker Docker CLI preflight",
+      "      command -v docker\n",
+      "worker command -v docker"
+    ],
+    [
+      "worker Docker daemon preflight",
+      "      docker info\n",
+      "worker docker info"
+    ],
+    [
+      "worker healthcheck",
+      "      test: node dist-worker/worker/index.js --healthcheck\n",
+      "worker --healthcheck"
     ],
     [
       "worker build artifact file limit",
@@ -588,9 +1247,39 @@ describe("release gate", () => {
       "worker SITEFLOW_BUILD_MAX_ARTIFACT_FILES:"
     ],
     [
+      "worker build memory limit",
+      "      SITEFLOW_BUILD_MEMORY: 1g\n",
+      "worker SITEFLOW_BUILD_MEMORY:"
+    ],
+    [
+      "worker build CPU limit",
+      "      SITEFLOW_BUILD_CPUS: 2\n",
+      "worker SITEFLOW_BUILD_CPUS:"
+    ],
+    [
+      "worker build PIDs limit",
+      "      SITEFLOW_BUILD_PIDS_LIMIT: 256\n",
+      "worker SITEFLOW_BUILD_PIDS_LIMIT:"
+    ],
+    [
+      "worker Git SSH key path",
+      "      SITEFLOW_GIT_SSH_KEY_PATH: \"${SITEFLOW_GIT_SSH_KEY_PATH:-}\"\n",
+      "worker SITEFLOW_GIT_SSH_KEY_PATH:"
+    ],
+    [
+      "worker Git known_hosts path",
+      "      SITEFLOW_GIT_KNOWN_HOSTS_PATH: \"${SITEFLOW_GIT_KNOWN_HOSTS_PATH:-}\"\n",
+      "worker SITEFLOW_GIT_KNOWN_HOSTS_PATH:"
+    ],
+    [
       "API Postgres password file",
       "      SITEFLOW_POSTGRES_PASSWORD_FILE: /run/secrets/siteflow_postgres_password\n",
       "api SITEFLOW_POSTGRES_PASSWORD_FILE:"
+    ],
+    [
+      "API GitHub webhook secret file",
+      "      SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_github_webhook_secret\n",
+      "api SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE:"
     ],
     [
       "worker Postgres password file",
@@ -603,6 +1292,11 @@ describe("release gate", () => {
       "top-level secret siteflow_api_token"
     ],
     [
+      "top-level release evidence signing key secret",
+      "  siteflow_release_evidence_signing_key:\n    file: /etc/siteflow/secrets/release-evidence-signing-key.secret\n",
+      "top-level secret siteflow_release_evidence_signing_key"
+    ],
+    [
       "postgres password secret mount",
       "      - siteflow_postgres_password\n    healthcheck:",
       "postgres secret siteflow_postgres_password"
@@ -611,6 +1305,11 @@ describe("release gate", () => {
       "API token secret mount",
       "      - siteflow_api_token\n",
       "api secret siteflow_api_token"
+    ],
+    [
+      "API generic webhook secret mount",
+      "      - siteflow_generic_webhook_secret\n",
+      "api secret siteflow_generic_webhook_secret"
     ]
   ])("fails when production compose omits %s", async (_label, removedText, missingTerm) => {
     const root = await createReleaseRoot();
@@ -666,6 +1365,73 @@ describe("release gate", () => {
         status: "fail",
         details: expect.objectContaining({
           missingComposeTerms: expect.arrayContaining(["worker secret siteflow_app_secret"])
+        })
+      }));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails when production compose exposes the API on a bare host port", async () => {
+    const root = await createReleaseRoot();
+
+    try {
+      await writeFile(
+        path.join(root, "docker-compose.production.yml"),
+        validProductionCompose.replace(
+          "      - \"${SITEFLOW_API_BIND:-127.0.0.1}:8787:8787\"",
+          "      - \"8787:8787\""
+        )
+      );
+
+      const report = await runReleaseGate({
+        root,
+        env: {},
+        runner: cleanRunner,
+        allowManualBranchProtection: true
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "local.productionCompose",
+        status: "fail",
+        details: expect.objectContaining({
+          missingComposeTerms: expect.arrayContaining([
+            "api ${SITEFLOW_API_BIND:-127.0.0.1}:8787:8787",
+            "api must default to loopback port binding and must not expose bare 8787:8787"
+          ])
+        })
+      }));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails when production compose defines an unexpected service", async () => {
+    const root = await createReleaseRoot();
+
+    try {
+      await writeFile(
+        path.join(root, "docker-compose.production.yml"),
+        validProductionCompose.replace(
+          "\nsecrets:",
+          "\n  debug:\n    image: alpine:latest\nsecrets:"
+        )
+      );
+
+      const report = await runReleaseGate({
+        root,
+        env: {},
+        runner: cleanRunner,
+        allowManualBranchProtection: true
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "local.productionCompose",
+        status: "fail",
+        details: expect.objectContaining({
+          missingComposeTerms: expect.arrayContaining(["unexpected service(s): debug"])
         })
       }));
     } finally {
@@ -864,6 +1630,141 @@ describe("release gate", () => {
         status: "fail",
         details: expect.objectContaining({
           forbiddenCommandTerms: expect.arrayContaining(["release:evidence:target-run --plan-only"])
+        })
+      }));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails when release preflight target-run omits a required evidence placeholder mapping", async () => {
+    const root = await createReleaseRoot();
+
+    try {
+      await writeFile(
+        path.join(root, ".github", "workflows", "release-preflight.yml"),
+        validReleasePreflightWorkflow.replace(
+          " --set-env webhook-delivery-id=SITEFLOW_SOURCE_PROVIDER_WEBHOOK_DELIVERY_ID",
+          ""
+        )
+      );
+
+      const report = await runReleaseGate({
+        root,
+        env: {},
+        runner: cleanRunner,
+        allowManualBranchProtection: true
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "local.releasePreflightWorkflow",
+        status: "fail",
+        details: expect.objectContaining({
+          missingTerms: expect.arrayContaining(["release:evidence:target-run --set-env webhook-delivery-id"])
+        })
+      }));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails when release preflight maps the release image digest placeholder to the wrong env", async () => {
+    const root = await createReleaseRoot();
+
+    try {
+      await writeFile(
+        path.join(root, ".github", "workflows", "release-preflight.yml"),
+        validReleasePreflightWorkflow.replace(
+          "--set-env release-image-digest=SITEFLOW_RELEASE_IMAGE_DIGEST",
+          "--set-env release-image-digest=SITEFLOW_WRONG_RELEASE_IMAGE_DIGEST"
+        )
+      );
+
+      const report = await runReleaseGate({
+        root,
+        env: {},
+        runner: cleanRunner,
+        allowManualBranchProtection: true
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "local.releasePreflightWorkflow",
+        status: "fail",
+        details: expect.objectContaining({
+          missingTerms: expect.arrayContaining([
+            "release:evidence:target-run --set-env release-image-digest=SITEFLOW_RELEASE_IMAGE_DIGEST"
+          ])
+        })
+      }));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails when release preflight does not bind the digest env to the workflow input", async () => {
+    const root = await createReleaseRoot();
+
+    try {
+      await writeFile(
+        path.join(root, ".github", "workflows", "release-preflight.yml"),
+        validReleasePreflightWorkflow.replaceAll(
+          "          SITEFLOW_RELEASE_IMAGE_DIGEST: ${{ inputs.release_image_digest }}",
+          "          SITEFLOW_RELEASE_IMAGE_DIGEST: ${{ inputs.wrong_release_image_digest }}"
+        )
+      );
+
+      const report = await runReleaseGate({
+        root,
+        env: {},
+        runner: cleanRunner,
+        allowManualBranchProtection: true
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "local.releasePreflightWorkflow",
+        status: "fail",
+        details: expect.objectContaining({
+          missingTerms: expect.arrayContaining([
+            "SITEFLOW_RELEASE_IMAGE_DIGEST: ${{ inputs.release_image_digest }}"
+          ])
+        })
+      }));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails when the release preflight gap report step cannot read the observability target stack token env", async () => {
+    const root = await createReleaseRoot();
+
+    try {
+      const firstTokenEnv = "          SITEFLOW_OBSERVABILITY_STACK_TOKEN: ${{ secrets.SITEFLOW_OBSERVABILITY_STACK_TOKEN }}\n";
+      const firstIndex = validReleasePreflightWorkflow.indexOf(firstTokenEnv);
+      const secondIndex = validReleasePreflightWorkflow.indexOf(firstTokenEnv, firstIndex + firstTokenEnv.length);
+
+      await writeFile(
+        path.join(root, ".github", "workflows", "release-preflight.yml"),
+        `${validReleasePreflightWorkflow.slice(0, secondIndex)}${validReleasePreflightWorkflow.slice(secondIndex + firstTokenEnv.length)}`
+      );
+
+      const report = await runReleaseGate({
+        root,
+        env: {},
+        runner: cleanRunner,
+        allowManualBranchProtection: true
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "local.releasePreflightWorkflow",
+        status: "fail",
+        details: expect.objectContaining({
+          missingTerms: expect.arrayContaining([
+            "release:evidence:gaps SITEFLOW_OBSERVABILITY_STACK_TOKEN: ${{ secrets.SITEFLOW_OBSERVABILITY_STACK_TOKEN }}"
+          ])
         })
       }));
     } finally {
@@ -1239,47 +2140,40 @@ describe("release gate", () => {
     }
   });
 
-  it("passes promotion when the exact release commit has the required GitHub check run", async () => {
+  it("passes promotion when rulesets prove the branch hardening requirements", async () => {
     const root = await createReleaseRoot();
-    const requests: string[] = [];
-    const fetch: ReleaseGateFetch = async (input) => {
-      const url = input.toString();
-      requests.push(url);
-
-      if (url.includes("/required_status_checks")) {
-        return new Response(JSON.stringify({
-          contexts: ["Install, test, and build"],
-          checks: []
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
-      }
-
-      if (/\/branches\/[^/]+$/.test(url)) {
-        return new Response(JSON.stringify({
-          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
-      }
-
-      return new Response(JSON.stringify({
-        total_count: 1,
-        check_runs: [
-          {
-            name: "Install, test, and build",
-            status: "completed",
-            conclusion: "success",
-            html_url: "https://github.example.test/checks/1"
-          }
-        ]
-      }), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      });
-    };
+    const fetch = createGitHubPromotionFetch({
+      branchProtection: {
+        required_status_checks: validGitHubRequiredStatusChecksResponse
+      },
+      rulesets: [
+        {
+          name: "production",
+          target: "branch",
+          enforcement: "active",
+          conditions: {
+            ref_name: {
+              include: ["refs/heads/main"],
+              exclude: []
+            }
+          },
+          rules: [
+            {
+              type: "required_status_checks",
+              parameters: {
+                required_status_checks: [
+                  { context: "Install, test, and build" }
+                ]
+              }
+            },
+            { type: "pull_request", parameters: { required_approving_review_count: 1 } },
+            { type: "non_fast_forward" },
+            { type: "required_linear_history" },
+            { type: "required_signatures" }
+          ]
+        }
+      ]
+    });
 
     try {
       const report = await runReleaseGate({
@@ -1289,7 +2183,199 @@ describe("release gate", () => {
           GITHUB_TOKEN: "ghs_test",
           GITHUB_REPOSITORY: "acme/siteflow"
         },
-        commitSha: "abc123def456abc123def456abc123def456abcd",
+        commitSha: releaseCommitSha,
+        promotion: true,
+        runner: cleanRunner,
+        fetch
+      });
+
+      expect(report.status).toBe("pass");
+      expect(report.promotionEvidence.branchProtection).toMatchObject({
+        status: "pass",
+        requiredStatusChecks: ["Install, test, and build"],
+        pullRequestReviewsRequired: true,
+        forcePushesBlocked: true,
+        linearHistoryRequired: true,
+        signedCommitsRequired: true,
+        hardeningSources: expect.arrayContaining([
+          "ruleset.production.pull_request",
+          "ruleset.production.non_fast_forward",
+          "ruleset.production.required_linear_history",
+          "ruleset.production.required_signatures"
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("requires manual verification in promotion when GitHub hardening fields and rulesets are inaccessible", async () => {
+    const root = await createReleaseRoot();
+    const fetch = createGitHubPromotionFetch({
+      branchProtection: {
+        required_status_checks: validGitHubRequiredStatusChecksResponse
+      },
+      rulesetsStatus: 403,
+      rulesetsMessage: "Resource not accessible by integration"
+    });
+
+    try {
+      const report = await runReleaseGate({
+        root,
+        env: {
+          ...validProductionEnv,
+          GITHUB_TOKEN: "ghs_test",
+          GITHUB_REPOSITORY: "acme/siteflow"
+        },
+        commitSha: releaseCommitSha,
+        promotion: true,
+        runner: cleanRunner,
+        fetch
+      });
+
+      expect(report.status).toBe("manual_required");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "external.githubBranchProtection",
+        status: "manual_required",
+        details: expect.objectContaining({
+          pullRequestReviewsRequired: null,
+          forcePushesBlocked: null,
+          linearHistoryRequired: null,
+          hardeningUnknowns: expect.arrayContaining([
+            "required pull request reviews",
+            "force-push prohibition",
+            "required linear history"
+          ]),
+          apiIssues: expect.arrayContaining(["Resource not accessible by integration"])
+        })
+      }));
+      expect(report.promotionEvidence).toMatchObject({
+        gateStatus: "manual_required",
+        manualRequired: true,
+        manualRequiredCheckIds: ["external.githubBranchProtection"],
+        branchProtection: {
+          status: "manual_required",
+          pullRequestReviewsRequired: null,
+          forcePushesBlocked: null,
+          linearHistoryRequired: null,
+          hardeningUnknowns: expect.arrayContaining(["force-push prohibition"])
+        },
+        protectedBranchCommit: {
+          status: "pass"
+        },
+        commitStatus: {
+          status: "pass"
+        }
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("requires manual verification in promotion when required status checks cannot be read", async () => {
+    const root = await createReleaseRoot();
+    const fetch = createGitHubPromotionFetch({
+      requiredStatusChecksStatus: 403,
+      requiredStatusChecksMessage: "Resource not accessible by integration"
+    });
+
+    try {
+      const report = await runReleaseGate({
+        root,
+        env: {
+          ...validProductionEnv,
+          GITHUB_TOKEN: "ghs_test",
+          GITHUB_REPOSITORY: "acme/siteflow"
+        },
+        commitSha: releaseCommitSha,
+        promotion: true,
+        runner: cleanRunner,
+        fetch
+      });
+
+      expect(report.status).toBe("manual_required");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "external.githubBranchProtection",
+        status: "manual_required",
+        summary: "Resource not accessible by integration"
+      }));
+      expect(report.promotionEvidence).toMatchObject({
+        gateStatus: "manual_required",
+        manualRequired: true,
+        manualRequiredCheckIds: ["external.githubBranchProtection"],
+        branchProtection: {
+          status: "manual_required"
+        },
+        protectedBranchCommit: {
+          status: "pass"
+        },
+        commitStatus: {
+          status: "pass"
+        }
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails promotion when GitHub branch protection allows force pushes", async () => {
+    const root = await createReleaseRoot();
+    const fetch = createGitHubPromotionFetch({
+      branchProtection: {
+        ...validGitHubBranchProtectionResponse,
+        allow_force_pushes: {
+          enabled: true
+        }
+      }
+    });
+
+    try {
+      const report = await runReleaseGate({
+        root,
+        env: {
+          ...validProductionEnv,
+          GITHUB_TOKEN: "ghs_test",
+          GITHUB_REPOSITORY: "acme/siteflow"
+        },
+        commitSha: releaseCommitSha,
+        promotion: true,
+        runner: cleanRunner,
+        fetch
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "external.githubBranchProtection",
+        status: "fail",
+        details: expect.objectContaining({
+          forcePushesBlocked: false,
+          hardeningFailures: expect.arrayContaining(["force-push prohibition"])
+        })
+      }));
+      expect(report.promotionEvidence.branchProtection).toMatchObject({
+        status: "fail",
+        forcePushesBlocked: false,
+        hardeningFailures: expect.arrayContaining(["force-push prohibition"])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("passes promotion when the exact release commit has the required GitHub check run", async () => {
+    const root = await createReleaseRoot();
+    const requests: string[] = [];
+    const fetch = createGitHubPromotionFetch({ requests });
+
+    try {
+      const report = await runReleaseGate({
+        root,
+        env: {
+          ...validProductionEnv,
+          GITHUB_TOKEN: "ghs_test",
+          GITHUB_REPOSITORY: "acme/siteflow"
+        },
+        commitSha: releaseCommitSha,
         promotion: true,
         runner: cleanRunner,
         fetch
@@ -1298,6 +2384,7 @@ describe("release gate", () => {
       expect(report.status).toBe("pass");
       expect(requests).toEqual([
         "https://api.github.com/repos/acme/siteflow/branches/main/protection/required_status_checks",
+        "https://api.github.com/repos/acme/siteflow/branches/main/protection",
         "https://api.github.com/repos/acme/siteflow/branches/main",
         "https://api.github.com/repos/acme/siteflow/commits/abc123def456abc123def456abc123def456abcd/check-runs?check_name=Install%2C+test%2C+and+build"
       ]);
@@ -1314,7 +2401,11 @@ describe("release gate", () => {
         requiredStatusCheck: "Install, test, and build",
         branchProtection: {
           status: "pass",
-          requiredStatusChecks: ["Install, test, and build"]
+          requiredStatusChecks: ["Install, test, and build"],
+          pullRequestReviewsRequired: true,
+          forcePushesBlocked: true,
+          linearHistoryRequired: true,
+          signedCommitsRequired: true
         },
         protectedBranchCommit: {
           status: "pass",
@@ -1356,7 +2447,11 @@ describe("release gate", () => {
           gitTimeoutStatus: "pass",
           gitTimeoutMs: 300000,
           buildNetworkStatus: "pass",
-          buildNetwork: "none"
+          buildNetwork: "none",
+          workerUserStatus: "pass",
+          workerUser: "1000:1000",
+          dockerSocketGidStatus: "pass",
+          dockerSocketGid: 998
         },
         dirtyWorktree: {
           status: "pass",
@@ -1376,43 +2471,7 @@ describe("release gate", () => {
       stdout: " M cli/releaseGate.ts\n",
       stderr: ""
     });
-    const fetch: ReleaseGateFetch = async (input) => {
-      const url = input.toString();
-
-      if (url.includes("/required_status_checks")) {
-        return new Response(JSON.stringify({
-          contexts: ["Install, test, and build"],
-          checks: []
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
-      }
-
-      if (/\/branches\/[^/]+$/.test(url)) {
-        return new Response(JSON.stringify({
-          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
-      }
-
-      return new Response(JSON.stringify({
-        total_count: 1,
-        check_runs: [
-          {
-            name: "Install, test, and build",
-            status: "completed",
-            conclusion: "success",
-            html_url: "https://github.example.test/checks/1"
-          }
-        ]
-      }), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      });
-    };
+    const fetch = createGitHubPromotionFetch();
 
     try {
       const report = await runReleaseGate({
@@ -1423,7 +2482,7 @@ describe("release gate", () => {
           GITHUB_REPOSITORY: "acme/siteflow"
         },
         allowDirty: true,
-        commitSha: "abc123def456abc123def456abc123def456abcd",
+        commitSha: releaseCommitSha,
         promotion: true,
         runner: dirtyRunner,
         fetch
@@ -1457,42 +2516,11 @@ describe("release gate", () => {
 
   it("fails promotion when the required release commit check run has not passed", async () => {
     const root = await createReleaseRoot();
-    const fetch: ReleaseGateFetch = async (input) => {
-      const url = input.toString();
-
-      if (url.includes("/required_status_checks")) {
-        return new Response(JSON.stringify({
-          contexts: ["Install, test, and build"],
-          checks: []
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
+    const fetch = createGitHubPromotionFetch({
+      checkRun: {
+        conclusion: "failure"
       }
-
-      if (/\/branches\/[^/]+$/.test(url)) {
-        return new Response(JSON.stringify({
-          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
-      }
-
-      return new Response(JSON.stringify({
-        total_count: 1,
-        check_runs: [
-          {
-            name: "Install, test, and build",
-            status: "completed",
-            conclusion: "failure"
-          }
-        ]
-      }), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      });
-    };
+    });
 
     try {
       const report = await runReleaseGate({
@@ -1502,7 +2530,7 @@ describe("release gate", () => {
           GITHUB_TOKEN: "ghs_test",
           GITHUB_REPOSITORY: "acme/siteflow"
         },
-        commitSha: "abc123def456abc123def456abc123def456abcd",
+        commitSha: releaseCommitSha,
         promotion: true,
         runner: cleanRunner,
         fetch
@@ -1674,7 +2702,11 @@ describe("release gate", () => {
           buildStepTimeoutStatus: "pass",
           gitTimeoutStatus: "pass",
           buildNetworkStatus: "pass",
-          buildNetwork: "none"
+          buildNetwork: "none",
+          workerUserStatus: "pass",
+          workerUser: "1000:1000",
+          dockerSocketGidStatus: "pass",
+          dockerSocketGid: 998
         }
       });
     } finally {
@@ -1684,41 +2716,7 @@ describe("release gate", () => {
 
   it("fails promotion runtime env when metrics token is missing", async () => {
     const root = await createReleaseRoot();
-    const fetch: ReleaseGateFetch = async (input) => {
-      const url = input.toString();
-
-      if (url.includes("/required_status_checks")) {
-        return new Response(JSON.stringify({
-          contexts: ["Install, test, and build"],
-          checks: []
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
-      }
-
-      if (/\/branches\/[^/]+$/.test(url)) {
-        return new Response(JSON.stringify({
-          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
-      }
-
-      return new Response(JSON.stringify({
-        check_runs: [
-          {
-            name: "Install, test, and build",
-            status: "completed",
-            conclusion: "success"
-          }
-        ]
-      }), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      });
-    };
+    const fetch = createGitHubPromotionFetch();
 
     try {
       const {
@@ -1732,7 +2730,7 @@ describe("release gate", () => {
           GITHUB_TOKEN: "ghs_test",
           GITHUB_REPOSITORY: "acme/siteflow"
         },
-        commitSha: "abc123def456abc123def456abc123def456abcd",
+        commitSha: releaseCommitSha,
         promotion: true,
         runner: cleanRunner,
         fetch
@@ -1881,6 +2879,7 @@ describe("release gate", () => {
       "SITEFLOW_PUBLIC_SCHEME=https",
       `SITEFLOW_API_TOKEN=${strongApiToken}`,
       `SITEFLOW_APP_SECRET=${strongAppSecret}`,
+      `SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY=${strongReleaseEvidenceSigningKey}`,
       `SITEFLOW_METRICS_TOKEN=${strongMetricsToken}`,
       "SITEFLOW_BUILD_RUNNER=docker",
       `SITEFLOW_BUILD_IMAGE=${pinnedBuildImage}`,
@@ -1891,6 +2890,11 @@ describe("release gate", () => {
       "SITEFLOW_PREBUILT_MAX_FILES=20000",
       "SITEFLOW_BUILD_STEP_TIMEOUT_MS=900000",
       "SITEFLOW_GIT_TIMEOUT_MS=300000",
+      "SITEFLOW_BUILD_MEMORY=1g",
+      "SITEFLOW_BUILD_CPUS=2",
+      "SITEFLOW_BUILD_PIDS_LIMIT=256",
+      "SITEFLOW_WORKER_USER=1000:1000",
+      "SITEFLOW_DOCKER_SOCKET_GID=998",
       "SITEFLOW_BUILD_NETWORK=none",
       "VITE_SITEFLOW_ALLOW_BROWSER_TOKEN_FALLBACK=0"
     ].join("\n"));
@@ -1932,8 +2936,18 @@ describe("release gate", () => {
         buildStepTimeoutMs: 900000,
         gitTimeoutStatus: "pass",
         gitTimeoutMs: 300000,
+        buildMemoryStatus: "pass",
+        buildMemory: "1g",
+        buildCpusStatus: "pass",
+        buildCpus: 2,
+        buildPidsLimitStatus: "pass",
+        buildPidsLimit: 256,
         buildNetworkStatus: "pass",
-        buildNetwork: "none"
+        buildNetwork: "none",
+        workerUserStatus: "pass",
+        workerUser: "1000:1000",
+        dockerSocketGidStatus: "pass",
+        dockerSocketGid: 998
       });
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -1947,8 +2961,13 @@ describe("release gate", () => {
     await mkdir(secretsDir, { recursive: true });
     await writeFile(path.join(secretsDir, "api-token.secret"), `${strongApiToken}\n`);
     await writeFile(path.join(secretsDir, "metrics-token.secret"), `${strongMetricsToken}\n`);
+    await writeFile(path.join(secretsDir, "release-evidence-signing-key.secret"), `${strongReleaseEvidenceSigningKey}\n`);
     await writeFile(path.join(secretsDir, "app-secret.secret"), `${strongAppSecret}\n`);
     await writeFile(path.join(secretsDir, "postgres-password.secret"), "postgres-secret\n");
+    await writeFile(path.join(secretsDir, "github-webhook.secret"), "github-webhook-secret-0123456789\n");
+    await writeFile(path.join(secretsDir, "gitlab-webhook.secret"), "gitlab-webhook-secret-0123456789\n");
+    await writeFile(path.join(secretsDir, "gitea-webhook.secret"), "gitea-webhook-secret-0123456789a\n");
+    await writeFile(path.join(secretsDir, "generic-webhook.secret"), "generic-webhook-secret-012345678\n");
 
     await writeFile(path.join(root, envFile), [
       "SITEFLOW_ENV=production",
@@ -1958,8 +2977,13 @@ describe("release gate", () => {
       "SITEFLOW_PUBLIC_SCHEME=https",
       "SITEFLOW_API_TOKEN_FILE=release-secrets/api-token.secret",
       "SITEFLOW_APP_SECRET_FILE=release-secrets/app-secret.secret",
+      "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE=release-secrets/release-evidence-signing-key.secret",
       "SITEFLOW_METRICS_TOKEN_FILE=release-secrets/metrics-token.secret",
       "SITEFLOW_POSTGRES_PASSWORD_FILE=release-secrets/postgres-password.secret",
+      "SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE=release-secrets/github-webhook.secret",
+      "SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE=release-secrets/gitlab-webhook.secret",
+      "SITEFLOW_GITEA_WEBHOOK_SECRET_FILE=release-secrets/gitea-webhook.secret",
+      "SITEFLOW_GENERIC_WEBHOOK_SECRET_FILE=release-secrets/generic-webhook.secret",
       "SITEFLOW_BUILD_RUNNER=docker",
       `SITEFLOW_BUILD_IMAGE=${pinnedBuildImage}`,
       "SITEFLOW_BUILD_MAX_ARTIFACT_BYTES=536870912",
@@ -1969,6 +2993,11 @@ describe("release gate", () => {
       "SITEFLOW_PREBUILT_MAX_FILES=20000",
       "SITEFLOW_BUILD_STEP_TIMEOUT_MS=900000",
       "SITEFLOW_GIT_TIMEOUT_MS=300000",
+      "SITEFLOW_BUILD_MEMORY=1g",
+      "SITEFLOW_BUILD_CPUS=2",
+      "SITEFLOW_BUILD_PIDS_LIMIT=256",
+      "SITEFLOW_WORKER_USER=1000:1000",
+      "SITEFLOW_DOCKER_SOCKET_GID=998",
       "SITEFLOW_BUILD_NETWORK=none",
       "VITE_SITEFLOW_ALLOW_BROWSER_TOKEN_FALLBACK=0"
     ].join("\n"));
@@ -1988,10 +3017,193 @@ describe("release gate", () => {
         metricsTokenConfigured: true,
         apiTokenStrengthStatus: "pass",
         metricsTokenStrengthStatus: "pass",
+        releaseEvidenceSigningKeyStrengthStatus: "pass",
+        releaseEvidenceSigningKeySource: "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE",
         appSecretStrengthStatus: "pass",
         appSecretSource: "SITEFLOW_APP_SECRET_FILE",
+        gitWebhookSecretStrengthStatus: "pass",
+        gitWebhookSecretSources: [
+          "SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE",
+          "SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE",
+          "SITEFLOW_GITEA_WEBHOOK_SECRET_FILE",
+          "SITEFLOW_GENERIC_WEBHOOK_SECRET_FILE"
+        ],
         postgresPasswordStatus: "pass",
         postgresPasswordSource: "SITEFLOW_POSTGRES_PASSWORD_FILE"
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails promotion runtime env from an env file when Docker socket gid is missing", async () => {
+    const root = await createReleaseRoot();
+    const envFile = "release.env";
+    const fetch = createGitHubPromotionFetch();
+    const {
+      SITEFLOW_DOCKER_SOCKET_GID: _dockerSocketGid,
+      ...envWithoutDockerSocketGid
+    } = validProductionEnv;
+
+    await writeFile(
+      path.join(root, envFile),
+      Object.entries(envWithoutDockerSocketGid)
+        .map(([key, value]) => `${key}=${value}`)
+        .join("\n")
+    );
+
+    try {
+      const report = await runReleaseGate({
+        root,
+        env: {
+          GITHUB_TOKEN: "ghs_test",
+          GITHUB_REPOSITORY: "acme/siteflow"
+        },
+        envFile,
+        commitSha: releaseCommitSha,
+        promotion: true,
+        runner: cleanRunner,
+        fetch
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "local.requiredEnv",
+        status: "fail",
+        details: expect.objectContaining({
+          workerUserStatus: "pass",
+          workerUser: "1000:1000",
+          dockerSocketGidStatus: "fail",
+          dockerSocketGid: null,
+          missing: expect.arrayContaining([
+            expect.objectContaining({
+              id: "runtime.workerSocketPosture",
+              keys: ["SITEFLOW_WORKER_USER", "SITEFLOW_DOCKER_SOCKET_GID"]
+            })
+          ]),
+          runtimeControlViolations: expect.arrayContaining([
+            "SITEFLOW_DOCKER_SOCKET_GID is required and must match /var/run/docker.sock group id on the target host."
+          ])
+        })
+      }));
+      expect(report.promotionEvidence.runtimeEnv).toMatchObject({
+        status: "fail",
+        workerUserStatus: "pass",
+        workerUser: "1000:1000",
+        dockerSocketGidStatus: "fail",
+        dockerSocketGid: null,
+        missing: expect.arrayContaining([
+          expect.objectContaining({ id: "runtime.workerSocketPosture" })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails promotion runtime env when worker user is root", async () => {
+    const root = await createReleaseRoot();
+    const fetch = createGitHubPromotionFetch();
+
+    try {
+      const report = await runReleaseGate({
+        root,
+        env: {
+          ...validProductionEnv,
+          SITEFLOW_WORKER_USER: "0:0",
+          GITHUB_TOKEN: "ghs_test",
+          GITHUB_REPOSITORY: "acme/siteflow"
+        },
+        commitSha: releaseCommitSha,
+        promotion: true,
+        runner: cleanRunner,
+        fetch
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "local.requiredEnv",
+        status: "fail",
+        details: expect.objectContaining({
+          workerUserStatus: "fail",
+          workerUser: "0:0",
+          dockerSocketGidStatus: "pass",
+          dockerSocketGid: 998,
+          missing: expect.arrayContaining([
+            expect.objectContaining({
+              id: "runtime.workerSocketPosture",
+              keys: ["SITEFLOW_WORKER_USER", "SITEFLOW_DOCKER_SOCKET_GID"]
+            })
+          ]),
+          runtimeControlViolations: expect.arrayContaining([
+            "SITEFLOW_WORKER_USER must not run the socket-mounted production worker as root."
+          ])
+        })
+      }));
+      expect(report.promotionEvidence.runtimeEnv).toMatchObject({
+        status: "fail",
+        workerUserStatus: "fail",
+        workerUser: "0:0",
+        dockerSocketGidStatus: "pass",
+        dockerSocketGid: 998,
+        missing: expect.arrayContaining([
+          expect.objectContaining({ id: "runtime.workerSocketPosture" })
+        ])
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails runtime env when Docker build resource limits are missing or invalid", async () => {
+    const root = await createReleaseRoot();
+
+    try {
+      const report = await runReleaseGate({
+        root,
+        env: {
+          ...validProductionEnv,
+          SITEFLOW_BUILD_MEMORY: "0g",
+          SITEFLOW_BUILD_CPUS: "0",
+          SITEFLOW_BUILD_PIDS_LIMIT: "0"
+        },
+        requireRuntimeEnv: true,
+        runner: cleanRunner,
+        allowManualBranchProtection: true
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "local.requiredEnv",
+        status: "fail",
+        details: expect.objectContaining({
+          buildMemoryStatus: "fail",
+          buildMemory: null,
+          buildCpusStatus: "fail",
+          buildCpus: null,
+          buildPidsLimitStatus: "fail",
+          buildPidsLimit: null,
+          missing: expect.arrayContaining([
+            expect.objectContaining({
+              id: "runtime.buildResourceLimits",
+              keys: ["SITEFLOW_BUILD_MEMORY", "SITEFLOW_BUILD_CPUS", "SITEFLOW_BUILD_PIDS_LIMIT"]
+            })
+          ]),
+          runtimeControlViolations: expect.arrayContaining([
+            "SITEFLOW_BUILD_MEMORY must be a positive Docker memory value such as 512m or 1g.",
+            "SITEFLOW_BUILD_CPUS must be a positive number.",
+            "SITEFLOW_BUILD_PIDS_LIMIT must be a positive integer."
+          ])
+        })
+      }));
+      expect(report.promotionEvidence.runtimeEnv).toMatchObject({
+        status: "fail",
+        buildMemoryStatus: "fail",
+        buildMemory: null,
+        buildCpusStatus: "fail",
+        buildCpus: null,
+        buildPidsLimitStatus: "fail",
+        buildPidsLimit: null
       });
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -2104,6 +3316,46 @@ describe("release gate", () => {
     }
   });
 
+  it("fails runtime env when a git webhook *_FILE secret is weak", async () => {
+    const root = await createReleaseRoot();
+    const weakWebhookSecretPath = path.join(root, "weak-github-webhook.secret");
+    await writeFile(weakWebhookSecretPath, "weak-github-webhook-secret\n");
+
+    try {
+      const report = await runReleaseGate({
+        root,
+        env: {
+          ...validProductionEnv,
+          SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE: weakWebhookSecretPath
+        },
+        requireRuntimeEnv: true,
+        runner: cleanRunner,
+        allowManualBranchProtection: true
+      });
+
+      expect(report.status).toBe("fail");
+      expect(report.checks).toContainEqual(expect.objectContaining({
+        id: "local.requiredEnv",
+        status: "fail",
+        details: expect.objectContaining({
+          gitWebhookSecretStrengthStatus: "fail",
+          gitWebhookSecretSources: ["SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE"],
+          secretStrengthViolations: expect.arrayContaining([
+            expect.stringContaining("SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE")
+          ]),
+          missing: expect.arrayContaining([
+            expect.objectContaining({
+              id: "runtime.gitWebhookSecrets"
+            })
+          ])
+        })
+      }));
+      expect(JSON.stringify(report)).not.toContain("weak-github-webhook-secret");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("fails runtime env when a *_FILE secret is empty", async () => {
     const root = await createReleaseRoot();
     const emptyMetricsTokenPath = path.join(root, "empty-metrics-token.secret");
@@ -2163,41 +3415,7 @@ describe("release gate", () => {
 
   it("fails promotion runtime env when runtime resource controls are not explicit", async () => {
     const root = await createReleaseRoot();
-    const fetch: ReleaseGateFetch = async (input) => {
-      const url = input.toString();
-
-      if (url.includes("/required_status_checks")) {
-        return new Response(JSON.stringify({
-          contexts: ["Install, test, and build"],
-          checks: []
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
-      }
-
-      if (/\/branches\/[^/]+$/.test(url)) {
-        return new Response(JSON.stringify({
-          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
-      }
-
-      return new Response(JSON.stringify({
-        check_runs: [
-          {
-            name: "Install, test, and build",
-            status: "completed",
-            conclusion: "success"
-          }
-        ]
-      }), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      });
-    };
+    const fetch = createGitHubPromotionFetch();
 
     try {
       const {
@@ -2218,7 +3436,7 @@ describe("release gate", () => {
           GITHUB_TOKEN: "ghs_test",
           GITHUB_REPOSITORY: "acme/siteflow"
         },
-        commitSha: "abc123def456abc123def456abc123def456abcd",
+        commitSha: releaseCommitSha,
         promotion: true,
         runner: cleanRunner,
         fetch
@@ -2297,41 +3515,7 @@ describe("release gate", () => {
 
   it("fails promotion runtime env when browser token fallback is enabled", async () => {
     const root = await createReleaseRoot();
-    const fetch: ReleaseGateFetch = async (input) => {
-      const url = input.toString();
-
-      if (url.includes("/required_status_checks")) {
-        return new Response(JSON.stringify({
-          contexts: ["Install, test, and build"],
-          checks: []
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
-      }
-
-      if (/\/branches\/[^/]+$/.test(url)) {
-        return new Response(JSON.stringify({
-          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
-      }
-
-      return new Response(JSON.stringify({
-        check_runs: [
-          {
-            name: "Install, test, and build",
-            status: "completed",
-            conclusion: "success"
-          }
-        ]
-      }), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      });
-    };
+    const fetch = createGitHubPromotionFetch();
 
     try {
       const report = await runReleaseGate({
@@ -2342,7 +3526,7 @@ describe("release gate", () => {
           GITHUB_TOKEN: "ghs_test",
           GITHUB_REPOSITORY: "acme/siteflow"
         },
-        commitSha: "abc123def456abc123def456abc123def456abcd",
+        commitSha: releaseCommitSha,
         promotion: true,
         runner: cleanRunner,
         fetch
@@ -2377,41 +3561,7 @@ describe("release gate", () => {
 
   it("fails promotion runtime env when runtime resource controls are unsafe", async () => {
     const root = await createReleaseRoot();
-    const fetch: ReleaseGateFetch = async (input) => {
-      const url = input.toString();
-
-      if (url.includes("/required_status_checks")) {
-        return new Response(JSON.stringify({
-          contexts: ["Install, test, and build"],
-          checks: []
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
-      }
-
-      if (/\/branches\/[^/]+$/.test(url)) {
-        return new Response(JSON.stringify({
-          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
-      }
-
-      return new Response(JSON.stringify({
-        check_runs: [
-          {
-            name: "Install, test, and build",
-            status: "completed",
-            conclusion: "success"
-          }
-        ]
-      }), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      });
-    };
+    const fetch = createGitHubPromotionFetch();
 
     try {
       const report = await runReleaseGate({
@@ -2429,7 +3579,7 @@ describe("release gate", () => {
           GITHUB_TOKEN: "ghs_test",
           GITHUB_REPOSITORY: "acme/siteflow"
         },
-        commitSha: "abc123def456abc123def456abc123def456abcd",
+        commitSha: releaseCommitSha,
         promotion: true,
         runner: cleanRunner,
         fetch
@@ -2480,41 +3630,7 @@ describe("release gate", () => {
 
   it("fails promotion runtime env when Docker runner and image policy are missing", async () => {
     const root = await createReleaseRoot();
-    const fetch: ReleaseGateFetch = async (input) => {
-      const url = input.toString();
-
-      if (url.includes("/required_status_checks")) {
-        return new Response(JSON.stringify({
-          contexts: ["Install, test, and build"],
-          checks: []
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
-      }
-
-      if (/\/branches\/[^/]+$/.test(url)) {
-        return new Response(JSON.stringify({
-          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
-      }
-
-      return new Response(JSON.stringify({
-        check_runs: [
-          {
-            name: "Install, test, and build",
-            status: "completed",
-            conclusion: "success"
-          }
-        ]
-      }), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      });
-    };
+    const fetch = createGitHubPromotionFetch();
 
     try {
       const {
@@ -2529,7 +3645,7 @@ describe("release gate", () => {
           GITHUB_TOKEN: "ghs_test",
           GITHUB_REPOSITORY: "acme/siteflow"
         },
-        commitSha: "abc123def456abc123def456abc123def456abcd",
+        commitSha: releaseCommitSha,
         promotion: true,
         runner: cleanRunner,
         fetch
@@ -2581,41 +3697,7 @@ describe("release gate", () => {
 
   it("fails promotion runtime env when the Docker image is mutable without an allowlist", async () => {
     const root = await createReleaseRoot();
-    const fetch: ReleaseGateFetch = async (input) => {
-      const url = input.toString();
-
-      if (url.includes("/required_status_checks")) {
-        return new Response(JSON.stringify({
-          contexts: ["Install, test, and build"],
-          checks: []
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
-      }
-
-      if (/\/branches\/[^/]+$/.test(url)) {
-        return new Response(JSON.stringify({
-          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
-      }
-
-      return new Response(JSON.stringify({
-        check_runs: [
-          {
-            name: "Install, test, and build",
-            status: "completed",
-            conclusion: "success"
-          }
-        ]
-      }), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      });
-    };
+    const fetch = createGitHubPromotionFetch();
 
     try {
       const report = await runReleaseGate({
@@ -2626,7 +3708,7 @@ describe("release gate", () => {
           GITHUB_TOKEN: "ghs_test",
           GITHUB_REPOSITORY: "acme/siteflow"
         },
-        commitSha: "abc123def456abc123def456abc123def456abcd",
+        commitSha: releaseCommitSha,
         promotion: true,
         runner: cleanRunner,
         fetch
@@ -2674,41 +3756,7 @@ describe("release gate", () => {
 
   it("allows trusted production host builds but records the exception in promotion evidence", async () => {
     const root = await createReleaseRoot();
-    const fetch: ReleaseGateFetch = async (input) => {
-      const url = input.toString();
-
-      if (url.includes("/required_status_checks")) {
-        return new Response(JSON.stringify({
-          contexts: ["Install, test, and build"],
-          checks: []
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
-      }
-
-      if (/\/branches\/[^/]+$/.test(url)) {
-        return new Response(JSON.stringify({
-          commit: { sha: "abc123def456abc123def456abc123def456abcd" }
-        }), {
-          status: 200,
-          headers: { "content-type": "application/json" }
-        });
-      }
-
-      return new Response(JSON.stringify({
-        check_runs: [
-          {
-            name: "Install, test, and build",
-            status: "completed",
-            conclusion: "success"
-          }
-        ]
-      }), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      });
-    };
+    const fetch = createGitHubPromotionFetch();
 
     try {
       const {
@@ -2724,7 +3772,7 @@ describe("release gate", () => {
           GITHUB_TOKEN: "ghs_test",
           GITHUB_REPOSITORY: "acme/siteflow"
         },
-        commitSha: "abc123def456abc123def456abc123def456abcd",
+        commitSha: releaseCommitSha,
         promotion: true,
         runner: cleanRunner,
         fetch

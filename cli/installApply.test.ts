@@ -21,6 +21,7 @@ function productionPlanInput() {
     version: "0.1.0-test",
     image: runtimeImage,
     postgresImage,
+    dockerSocketGid: "998",
     buildImage
   };
 }
@@ -72,38 +73,53 @@ describe("install apply", () => {
       const envFile = await readFile(mapped(root, "/etc/siteflow/siteflow.env"), "utf8");
       const composeFile = await readFile(mapped(root, "/opt/siteflow/compose.yaml"), "utf8");
       expect(envFile).toContain("SITEFLOW_BASE_DOMAIN=w33d.xyz");
-      expect(envFile).toContain("SITEFLOW_TRUST_PROXY=loopback");
+      expect(envFile).toContain("SITEFLOW_TRUST_PROXY=");
+      expect(envFile).not.toContain("SITEFLOW_TRUST_PROXY=loopback");
+      expect(envFile).toContain("SITEFLOW_WORKER_USER=1000:1000");
+      expect(envFile).toContain("SITEFLOW_DOCKER_SOCKET_GID=998");
       expect(envFile).toContain(`SITEFLOW_IMAGE=${runtimeImage}`);
       expect(envFile).toContain(`SITEFLOW_BUILD_IMAGE=${buildImage}`);
       expect(envFile).not.toContain("SITEFLOW_BUILD_IMAGE_ALLOWLIST");
       expect(envFile).toContain("SITEFLOW_BUILD_MAX_ARTIFACT_BYTES=536870912");
       expect(envFile).toContain("SITEFLOW_BUILD_MIN_FREE_BYTES=1073741824");
+      expect(envFile).toContain("SITEFLOW_BUILD_STEP_TIMEOUT_MS=900000");
+      expect(envFile).toContain("SITEFLOW_GIT_TIMEOUT_MS=300000");
       expect(envFile).toContain("SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES=536870912");
       expect(composeFile).toContain("SITEFLOW_API_TOKEN_FILE");
       expect(composeFile).toContain("SITEFLOW_METRICS_TOKEN_FILE");
-      expect(composeFile).toContain('SITEFLOW_TRUST_PROXY: "loopback"');
+      expect(composeFile).toContain("SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE");
+      expect(composeFile).toContain('SITEFLOW_TRUST_PROXY: ""');
+      expect(composeFile).not.toContain('SITEFLOW_TRUST_PROXY: "loopback"');
       expect(composeFile).toContain(`image: ${runtimeImage}`);
       expect(composeFile).toContain(`image: ${postgresImage}`);
       expect(composeFile).toContain(`SITEFLOW_BUILD_IMAGE: "${buildImage}"`);
+      expect(composeFile).toContain('SITEFLOW_BUILD_STEP_TIMEOUT_MS: "900000"');
+      expect(composeFile).toContain('SITEFLOW_GIT_TIMEOUT_MS: "300000"');
+      expect(composeFile).toContain('SITEFLOW_GIT_SSH_KEY_PATH: "${SITEFLOW_GIT_SSH_KEY_PATH:-}"');
+      expect(composeFile).toContain('SITEFLOW_GIT_KNOWN_HOSTS_PATH: "${SITEFLOW_GIT_KNOWN_HOSTS_PATH:-}"');
       expect(composeFile).not.toContain("SITEFLOW_BUILD_IMAGE_ALLOWLIST");
       expect(composeFile).toContain('DATABASE_URL: "postgres://siteflow@postgres:5432/siteflow"');
+      expect(composeFile).toContain('SITEFLOW_EVIDENCE_ROOT: "/var/lib/siteflow/evidence"');
       expect(composeFile).toContain('SITEFLOW_BACKUP_AUTOMATION_RUN_RECORD: "/var/lib/siteflow/evidence/backup-automation-run.json"');
       expect(composeFile).toContain("- /var/lib/siteflow/evidence:/var/lib/siteflow/evidence:ro");
       expect(composeFile).toContain('    user: "1000:1000"');
-      expect(composeFile).toContain('    user: "${SITEFLOW_WORKER_USER:-0:0}"');
+      expect(composeFile).toContain('    user: "${SITEFLOW_WORKER_USER:-1000:1000}"');
       expect(composeFile).toContain("    group_add:");
-      expect(composeFile).toContain('      - "${SITEFLOW_DOCKER_SOCKET_GID:-0}"');
+      expect(composeFile).toContain('      - "${SITEFLOW_DOCKER_SOCKET_GID:?SITEFLOW_DOCKER_SOCKET_GID must match /var/run/docker.sock group id}"');
       expect(composeFile.match(/init: true/g)).toHaveLength(2);
       expect(composeFile.match(/read_only: true/g)).toHaveLength(2);
       expect(composeFile.match(/no-new-privileges:true/g)).toHaveLength(2);
       expect(composeFile.match(/condition: service_healthy/g)).toHaveLength(3);
       expect(composeFile).toContain("fetch('http://127.0.0.1:8787/readyz')");
+      expect(composeFile).toContain("requires access to the trusted single-host Docker socket");
+      expect(composeFile).toContain("      timeout: 10s");
       expect(composeFile).not.toContain("export SITEFLOW_");
       expect(composeFile).not.toContain("$(cat /run/secrets/");
       expect(composeFile).toContain("  worker:");
-      expect(await readFile(mapped(root, "/etc/systemd/system/siteflow.service"), "utf8")).toContain("docker compose -f /opt/siteflow/compose.yaml up -d");
+      expect(await readFile(mapped(root, "/etc/systemd/system/siteflow.service"), "utf8")).toContain("docker compose --env-file /etc/siteflow/siteflow.env -f /opt/siteflow/compose.yaml up -d");
       expect(await readFile(mapped(root, "/etc/siteflow/secrets/api-token.secret"), "utf8")).toMatch(/^[A-Za-z0-9_-]+\n$/);
       expect(await readFile(mapped(root, "/etc/siteflow/secrets/metrics-token.secret"), "utf8")).toMatch(/^[A-Za-z0-9_-]+\n$/);
+      expect(await readFile(mapped(root, "/etc/siteflow/secrets/release-evidence-signing-key.secret"), "utf8")).toMatch(/^[A-Za-z0-9_-]+\n$/);
       expect(await readFile(mapped(root, "/etc/siteflow/secrets/github-webhook.secret"), "utf8")).toMatch(/^[A-Za-z0-9_-]+\n$/);
       expect(await readFile(mapped(root, "/etc/siteflow/secrets/gitlab-webhook.secret"), "utf8")).toMatch(/^[A-Za-z0-9_-]+\n$/);
       expect(await readFile(mapped(root, "/etc/siteflow/secrets/gitea-webhook.secret"), "utf8")).toMatch(/^[A-Za-z0-9_-]+\n$/);
@@ -136,6 +152,7 @@ describe("install apply", () => {
         pollIntervalMs: 5000
       });
       expect(state.secrets.metricsTokenRef).toBe("/etc/siteflow/secrets/metrics-token.secret");
+      expect(state.secrets.releaseEvidenceSigningKeyRef).toBe("/etc/siteflow/secrets/release-evidence-signing-key.secret");
       expect(state.router.activeRevision).toMatch(/^nginx-rev-[a-f0-9]{12}$/);
     } finally {
       await rm(root, { recursive: true, force: true });

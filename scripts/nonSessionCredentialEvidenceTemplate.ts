@@ -162,6 +162,10 @@ function providerManagedCredential(type: string, checkedAt: string) {
 
 export function createNonSessionCredentialEvidenceTemplate(options: NonSessionCredentialEvidenceTemplateOptions) {
   const checkedAt = options.checkedAt ? validIsoTimestamp(options.checkedAt) : (options.now?.() ?? new Date()).toISOString();
+  const targetEnvironment = requiredValue(options.targetEnvironment, "--target-environment");
+  const commitRef = requiredValue(options.commitRef, "--commit-ref");
+  const repository = requiredValue(options.repo, "--repo");
+  const branch = requiredValue(options.branch, "--branch");
 
   return {
     schemaVersion: "siteflow.nonSessionCredentialEvidence.v1",
@@ -170,11 +174,19 @@ export function createNonSessionCredentialEvidenceTemplate(options: NonSessionCr
     dryRun: true,
     template: true,
     checkedAt,
-    targetEnvironment: requiredValue(options.targetEnvironment, "--target-environment"),
+    targetEnvironment,
     release: {
-      commitRef: requiredValue(options.commitRef, "--commit-ref"),
-      repository: requiredValue(options.repo, "--repo"),
-      branch: requiredValue(options.branch, "--branch")
+      commitRef,
+      repository,
+      branch
+    },
+    target: {
+      environment: targetEnvironment,
+      release: {
+        commitRef,
+        repository,
+        branch
+      }
     },
     instructions: [
       "Replace every todo/null field with observations from the target or target-equivalent credential rotation run.",

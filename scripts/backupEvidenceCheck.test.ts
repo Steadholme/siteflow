@@ -423,7 +423,10 @@ describe("backupEvidenceCheck", () => {
       status: "fetched",
       backupPath: "/evidence/fetched-backups/siteflow-20260607",
       offHostLocation: "s3://siteflow-prod-backups/siteflow-20260607",
-      provider: "s3"
+      provider: "s3",
+      treeSha256: "b".repeat(64),
+      objectCount: 4,
+      totalBytes: 512
     });
     expect(withOffHost.selectedEvidence.backupProviderSecurityAudit).toMatchObject({
       status: "passed",

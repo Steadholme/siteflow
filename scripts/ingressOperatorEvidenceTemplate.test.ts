@@ -110,6 +110,15 @@ function filledOperatorEvidence() {
       enforcementPoint: "ingress",
       evidenceLocation: "CHG-123#ingress-rate-limit"
     },
+    metricsAccessControl: {
+      ...template.metricsAccessControl,
+      status: "passed",
+      privateScrapeException: true,
+      scrapePath: "/metrics",
+      protection: "reverse_proxy_allowlist",
+      publicAccessBlocked: true,
+      evidenceLocation: "CHG-123#metrics-private-scrape"
+    },
     operator: {
       ...template.operator,
       status: "passed",
@@ -219,6 +228,9 @@ describe("ingressOperatorEvidenceTemplate", () => {
         proxySourcePolicy: {
           configured: "loopback"
         },
+        metricsAccessControl: {
+          scrapePath: "/metrics"
+        },
         operatorName: "Platform Operator",
         ticketId: "CHG-123"
       });
@@ -271,6 +283,11 @@ describe("ingressOperatorEvidenceTemplate", () => {
               edgeEnforced: true,
               sharedAcrossInstances: true,
               enforcementPoint: "ingress"
+            }),
+            metricsAccessControl: expect.objectContaining({
+              privateScrapeException: true,
+              protection: "reverse_proxy_allowlist",
+              publicAccessBlocked: true
             })
           }
         }
@@ -283,6 +300,10 @@ describe("ingressOperatorEvidenceTemplate", () => {
         proxySourcePolicy: expect.objectContaining({
           finalHopMatched: true,
           allSourcesTrusted: false
+        }),
+        metricsAccessControl: expect.objectContaining({
+          privateScrapeException: true,
+          publicAccessBlocked: true
         })
       });
     } finally {

@@ -44,16 +44,19 @@ services:
       DATABASE_URL: "postgres://${SITEFLOW_POSTGRES_USER:-siteflow}@postgres:5432/${SITEFLOW_POSTGRES_DB:-siteflow}"
       SITEFLOW_API_PORT: "8787"
       SITEFLOW_ARTIFACT_ROOT: ${SITEFLOW_ARTIFACT_ROOT:-/var/lib/siteflow/artifacts}
+      SITEFLOW_EVIDENCE_ROOT: ${SITEFLOW_EVIDENCE_ROOT:-/var/lib/siteflow/evidence}
       SITEFLOW_BACKUP_AUTOMATION_RUN_RECORD: ${SITEFLOW_BACKUP_AUTOMATION_RUN_RECORD:-/var/lib/siteflow/evidence/backup-automation-run.json}
       SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES: ${SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES:-536870912}
       SITEFLOW_PREBUILT_MAX_FILES: ${SITEFLOW_PREBUILT_MAX_FILES:-20000}
       SITEFLOW_PUBLIC_SCHEME: ${SITEFLOW_PUBLIC_SCHEME:-https}
-      SITEFLOW_TRUST_PROXY: ${SITEFLOW_TRUST_PROXY:-loopback}
+      SITEFLOW_TRUST_PROXY: "${SITEFLOW_TRUST_PROXY:-}"
       SITEFLOW_BASE_DOMAIN: ${SITEFLOW_BASE_DOMAIN:?SITEFLOW_BASE_DOMAIN is required for production preview routes}
       SITEFLOW_ALLOWED_ORIGIN: ${SITEFLOW_ALLOWED_ORIGIN:-}
       SITEFLOW_APP_SECRET_FILE: /run/secrets/siteflow_app_secret
       SITEFLOW_API_TOKEN_FILE: /run/secrets/siteflow_api_token
       SITEFLOW_METRICS_TOKEN_FILE: /run/secrets/siteflow_metrics_token
+      SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE: /run/secrets/siteflow_release_evidence_signing_key
+      SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID: ${SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID:-}
       SITEFLOW_POSTGRES_PASSWORD_FILE: /run/secrets/siteflow_postgres_password
       SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_github_webhook_secret
       SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_gitlab_webhook_secret
@@ -75,6 +78,7 @@ services:
       - siteflow_app_secret
       - siteflow_api_token
       - siteflow_metrics_token
+      - siteflow_release_evidence_signing_key
       - siteflow_postgres_password
       - siteflow_github_webhook_secret
       - siteflow_gitlab_webhook_secret
@@ -90,9 +94,9 @@ services:
   worker:
     image: ${SITEFLOW_IMAGE:?SITEFLOW_IMAGE must be the digest-pinned release image for production}
     restart: unless-stopped
-    user: "${SITEFLOW_WORKER_USER:-0:0}"
+    user: "${SITEFLOW_WORKER_USER:-1000:1000}"
     group_add:
-      - "${SITEFLOW_DOCKER_SOCKET_GID:-0}"
+      - "${SITEFLOW_DOCKER_SOCKET_GID:?SITEFLOW_DOCKER_SOCKET_GID must match /var/run/docker.sock group id}"
     init: true
     read_only: true
     cap_drop:
@@ -124,6 +128,10 @@ services:
       SITEFLOW_BUILD_MAX_ARTIFACT_BYTES: ${SITEFLOW_BUILD_MAX_ARTIFACT_BYTES:-536870912}
       SITEFLOW_BUILD_MAX_ARTIFACT_FILES: ${SITEFLOW_BUILD_MAX_ARTIFACT_FILES:-20000}
       SITEFLOW_BUILD_MIN_FREE_BYTES: ${SITEFLOW_BUILD_MIN_FREE_BYTES:?SITEFLOW_BUILD_MIN_FREE_BYTES is required for production promotion evidence}
+      SITEFLOW_BUILD_STEP_TIMEOUT_MS: ${SITEFLOW_BUILD_STEP_TIMEOUT_MS:-900000}
+      SITEFLOW_GIT_TIMEOUT_MS: ${SITEFLOW_GIT_TIMEOUT_MS:-300000}
+      SITEFLOW_GIT_SSH_KEY_PATH: "${SITEFLOW_GIT_SSH_KEY_PATH:-}"
+      SITEFLOW_GIT_KNOWN_HOSTS_PATH: "${SITEFLOW_GIT_KNOWN_HOSTS_PATH:-}"
       SITEFLOW_WORKER_POLL_INTERVAL_MS: ${SITEFLOW_WORKER_POLL_INTERVAL_MS:-5000}
       TMPDIR: ${SITEFLOW_ARTIFACT_ROOT:-/var/lib/siteflow/artifacts}
       SITEFLOW_APP_SECRET_FILE: /run/secrets/siteflow_app_secret
@@ -169,6 +177,8 @@ secrets:
     file: ${SITEFLOW_CONFIG_DIR:-/etc/siteflow}/secrets/api-token.secret
   siteflow_metrics_token:
     file: ${SITEFLOW_CONFIG_DIR:-/etc/siteflow}/secrets/metrics-token.secret
+  siteflow_release_evidence_signing_key:
+    file: ${SITEFLOW_CONFIG_DIR:-/etc/siteflow}/secrets/release-evidence-signing-key.secret
   siteflow_postgres_password:
     file: ${SITEFLOW_CONFIG_DIR:-/etc/siteflow}/secrets/postgres-password.secret
   siteflow_github_webhook_secret:

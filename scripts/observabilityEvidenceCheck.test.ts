@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   evaluateObservabilityEvidence,
+  requiredObservabilityEvidenceCheckNames,
   runObservabilityEvidenceCheckCli
 } from "./observabilityEvidenceCheck";
 import { requiredSiteFlowMetricNames } from "../src/lib/observabilityMetrics.ts";
@@ -282,7 +283,8 @@ describe("observabilityEvidenceCheck", () => {
     expect(result.checks.every((check) => check.status === "pass")).toBe(true);
     expect(result.selectedEvidence.metricsScrape).toMatchObject({
       status: "scraped",
-      timestamp: "2026-06-07T11:46:00.000Z"
+      timestamp: "2026-06-07T11:46:00.000Z",
+      authenticated: true
     });
     expect(result.selectedEvidence.backupAutomationRun).toMatchObject({
       status: "completed",
@@ -303,6 +305,38 @@ describe("observabilityEvidenceCheck", () => {
       status: "passed",
       timestamp: "2026-06-07T11:58:00.000Z"
     });
+  });
+
+  it("exports a required-check contract covered by successful evaluator output", () => {
+    const result = evaluateObservabilityEvidence(
+      validEvidence({
+        release: {
+          commitRef,
+          repository,
+          branch,
+          targetEnvironment: "production"
+        }
+      }),
+      {
+      evidencePath: "observability-evidence.json",
+      now,
+        maxAgeHours: 24,
+        commitRef,
+        repo: repository,
+        branch,
+        targetEnvironment: "production"
+      }
+    );
+    const checkNames = new Set(result.checks.map((check) => check.name));
+
+    expect(new Set(requiredObservabilityEvidenceCheckNames).size).toBe(requiredObservabilityEvidenceCheckNames.length);
+    expect(requiredObservabilityEvidenceCheckNames).toEqual(
+      expect.arrayContaining([
+        "observability_apply_proof_non_dry_run",
+        "observability_target_stack_proof_non_dry_run"
+      ])
+    );
+    expect(requiredObservabilityEvidenceCheckNames.every((name) => checkNames.has(name))).toBe(true);
   });
 
   it("blocks raw secret-like values in merged observability evidence", () => {
@@ -452,6 +486,35 @@ describe("observabilityEvidenceCheck", () => {
         })
       ])
     );
+  });
+
+  it("preserves metrics private-scrape exception evidence in the selected summary", () => {
+    const result = evaluateObservabilityEvidence(
+      validEvidence({
+        metricsScrape: {
+          status: "scraped",
+          scrapedAt: "2026-06-07T11:46:00.000Z",
+          endpoint: "/metrics",
+          authenticated: false,
+          privateScrapeException: true,
+          observedStatusCode: 200,
+          metricNames: requiredSiteFlowMetricNames
+        }
+      }),
+      {
+        evidencePath: "observability-evidence.json",
+        now
+      }
+    );
+
+    expect(result.status).toBe("passed");
+    expect(result.selectedEvidence.metricsScrape).toMatchObject({
+      status: "scraped",
+      timestamp: "2026-06-07T11:46:00.000Z",
+      authenticated: false,
+      privateScrapeException: true,
+      observedStatusCode: 200
+    });
   });
 
   it("blocks metrics evidence without the expected SiteFlow metric names", () => {
@@ -738,6 +801,17 @@ describe("observabilityEvidenceCheck", () => {
         now
       }
     );
+    const dryRun = evaluateObservabilityEvidence(
+      validEvidence({
+        observabilityApplyProof: observabilityApplyProof({
+          dryRun: true
+        })
+      }),
+      {
+        evidencePath: "observability-evidence.json",
+        now
+      }
+    );
 
     expect(missing.status).toBe("blocked");
     expect(missing.checks).toEqual(
@@ -753,6 +827,15 @@ describe("observabilityEvidenceCheck", () => {
       expect.arrayContaining([
         expect.objectContaining({
           name: "observability_apply_proof_assets",
+          status: "fail"
+        })
+      ])
+    );
+    expect(dryRun.status).toBe("blocked");
+    expect(dryRun.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "observability_apply_proof_non_dry_run",
           status: "fail"
         })
       ])
@@ -804,6 +887,53 @@ describe("observabilityEvidenceCheck", () => {
         now
       }
     );
+    const partialPrometheusRules = evaluateObservabilityEvidence(
+      validEvidence({
+        observabilityProvisioning: {
+          ...observabilityProvisioning(),
+          renderedAssets: [
+            { path: "prometheus-scrape.yaml", kind: "prometheus_scrape", sha256: prometheusScrapeSha },
+            {
+              path: "prometheus-rules.yaml",
+              kind: "prometheus_rules",
+              sha256: prometheusRulesSha,
+              content: [
+                "groups:",
+                "  - name: siteflow",
+                "    rules:",
+                "      - alert: SiteFlowHighErrorRate",
+                "      - alert: SiteFlowBackupAutomationStale",
+                ""
+              ].join("\n")
+            },
+            { path: "alertmanager-route.yaml", kind: "alertmanager_route", sha256: alertmanagerRouteSha },
+            { path: "grafana-dashboard.json", kind: "grafana_dashboard", sha256: grafanaDashboardSha }
+          ]
+        },
+        observabilityTargetStackProof: observabilityTargetStackProof({
+          prometheusRules: {
+            ...(observabilityTargetStackProof().prometheusRules as Record<string, unknown>),
+            matchedAlertNames: ["SiteFlowHighErrorRate"],
+            missingAlertNames: []
+          }
+        })
+      }),
+      {
+        evidencePath: "observability-evidence.json",
+        now
+      }
+    );
+    const dryRun = evaluateObservabilityEvidence(
+      validEvidence({
+        observabilityTargetStackProof: observabilityTargetStackProof({
+          mode: "dry-run"
+        })
+      }),
+      {
+        evidencePath: "observability-evidence.json",
+        now
+      }
+    );
 
     expect(missing.status).toBe("blocked");
     expect(missing.checks).toEqual(
@@ -819,6 +949,24 @@ describe("observabilityEvidenceCheck", () => {
       expect.arrayContaining([
         expect.objectContaining({
           name: "observability_target_stack_grafana_dashboard",
+          status: "fail"
+        })
+      ])
+    );
+    expect(partialPrometheusRules.status).toBe("blocked");
+    expect(partialPrometheusRules.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "observability_target_stack_prometheus_rules",
+          status: "fail"
+        })
+      ])
+    );
+    expect(dryRun.status).toBe("blocked");
+    expect(dryRun.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "observability_target_stack_proof_non_dry_run",
           status: "fail"
         })
       ])

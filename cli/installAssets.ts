@@ -29,6 +29,8 @@ export interface SiteFlowEnvFileOptions {
   image: string;
   baseDomain?: string;
   siteflowEnv?: "development" | "production";
+  workerUser?: string;
+  dockerSocketGid?: string;
   workerPollIntervalMs?: number;
   buildImage?: string;
   buildImageAllowlist?: string[];
@@ -47,6 +49,7 @@ export interface ComposeFileOptions extends SiteFlowEnvFileOptions {
 export interface SystemdUnitOptions {
   composeFile: string;
   workingDirectory: string;
+  envFile?: string;
   unitName?: string;
   path?: string;
 }
@@ -111,12 +114,39 @@ function normalizeWorkerPollIntervalMs(value: number | undefined) {
   return intervalMs;
 }
 
+export const defaultWorkerUser = "1000:1000";
 export const defaultProductionBuildImage = "node:20-bookworm-slim";
 export const defaultBuildMaxArtifactBytes = "536870912";
 export const defaultBuildMaxArtifactFiles = "20000";
 export const defaultBuildMinFreeBytes = "1073741824";
+export const defaultBuildStepTimeoutMs = "900000";
+export const defaultGitTimeoutMs = "300000";
 export const defaultPrebuiltMaxUploadBytes = "536870912";
 export const defaultPrebuiltMaxFiles = "20000";
+
+export function normalizeWorkerUser(value: string | undefined) {
+  const normalized = (value ?? defaultWorkerUser).trim();
+
+  if (!/^[1-9]\d*(?::[1-9]\d*)?$/.test(normalized)) {
+    throw new Error("SITEFLOW_WORKER_USER must be a non-root numeric user or user:group value.");
+  }
+
+  return normalized;
+}
+
+export function normalizeDockerSocketGid(value: string | undefined) {
+  const normalized = value?.trim();
+
+  if (!normalized) {
+    throw new Error("SITEFLOW_DOCKER_SOCKET_GID is required and must match /var/run/docker.sock group id.");
+  }
+
+  if (!/^\d+$/.test(normalized)) {
+    throw new Error("SITEFLOW_DOCKER_SOCKET_GID must be a numeric group id.");
+  }
+
+  return normalized;
+}
 
 function hasDockerDigest(image: string) {
   return /@sha256:[a-f0-9]{64}$/i.test(image);
@@ -324,6 +354,8 @@ export function renderSiteFlowEnvFile(options: SiteFlowEnvFileOptions): Rendered
     : normalizeProductionImage(options.image, "SITEFLOW_IMAGE");
   const buildImage = normalizeBuildImage(options.buildImage);
   const buildImageAllowlist = normalizeBuildImageAllowlist(options.buildImageAllowlist, buildImage);
+  const workerUser = normalizeWorkerUser(options.workerUser);
+  const dockerSocketGid = normalizeDockerSocketGid(options.dockerSocketGid);
   const lines = [
     `SITEFLOW_ENV=${options.siteflowEnv ?? "production"}`,
     `SITEFLOW_VERSION=${options.version}`,
@@ -331,13 +363,17 @@ export function renderSiteFlowEnvFile(options: SiteFlowEnvFileOptions): Rendered
     `SITEFLOW_API_PORT=${options.apiPort}`,
     `SITEFLOW_ARTIFACT_ROOT=${options.artifactRoot}`,
     `SITEFLOW_PUBLIC_SCHEME=${options.publicScheme}`,
-    "SITEFLOW_TRUST_PROXY=loopback",
+    "SITEFLOW_TRUST_PROXY=",
+    `SITEFLOW_WORKER_USER=${workerUser}`,
+    `SITEFLOW_DOCKER_SOCKET_GID=${dockerSocketGid}`,
     `SITEFLOW_WORKER_POLL_INTERVAL_MS=${normalizeWorkerPollIntervalMs(options.workerPollIntervalMs)}`,
     "SITEFLOW_BUILD_RUNNER=docker",
     "SITEFLOW_BUILD_NETWORK=none",
     `SITEFLOW_BUILD_MAX_ARTIFACT_BYTES=${defaultBuildMaxArtifactBytes}`,
     `SITEFLOW_BUILD_MAX_ARTIFACT_FILES=${defaultBuildMaxArtifactFiles}`,
     `SITEFLOW_BUILD_MIN_FREE_BYTES=${defaultBuildMinFreeBytes}`,
+    `SITEFLOW_BUILD_STEP_TIMEOUT_MS=${defaultBuildStepTimeoutMs}`,
+    `SITEFLOW_GIT_TIMEOUT_MS=${defaultGitTimeoutMs}`,
     `SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES=${defaultPrebuiltMaxUploadBytes}`,
     `SITEFLOW_PREBUILT_MAX_FILES=${defaultPrebuiltMaxFiles}`,
     ...buildImageEnvLines(buildImage, buildImageAllowlist)
@@ -367,16 +403,18 @@ export function renderComposeFile(options: ComposeFileOptions): RenderedInstallA
   const workerPollIntervalMs = normalizeWorkerPollIntervalMs(options.workerPollIntervalMs);
   const buildImage = normalizeBuildImage(options.buildImage);
   const buildImageAllowlist = normalizeBuildImageAllowlist(options.buildImageAllowlist, buildImage);
+  const workerUser = normalizeWorkerUser(options.workerUser);
   const sharedEnvLines = [
     `      SITEFLOW_ENV: "${options.siteflowEnv ?? "production"}"`,
     `      SITEFLOW_ARTIFACT_ROOT: "${options.artifactRoot}"`,
     `      SITEFLOW_PUBLIC_SCHEME: "${options.publicScheme}"`,
-    '      SITEFLOW_TRUST_PROXY: "loopback"'
+    '      SITEFLOW_TRUST_PROXY: ""'
   ];
   const apiEnvLines = [
     ...sharedEnvLines,
     `      DATABASE_URL: "postgres://${databaseUser}@postgres:5432/${databaseName}"`,
     `      SITEFLOW_API_PORT: "${apiPort}"`,
+    `      SITEFLOW_EVIDENCE_ROOT: "${evidenceRoot}"`,
     `      SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES: "${defaultPrebuiltMaxUploadBytes}"`,
     `      SITEFLOW_PREBUILT_MAX_FILES: "${defaultPrebuiltMaxFiles}"`,
     `      SITEFLOW_BACKUP_AUTOMATION_RUN_RECORD: "${backupAutomationRunRecord}"`
@@ -389,6 +427,10 @@ export function renderComposeFile(options: ComposeFileOptions): RenderedInstallA
     `      SITEFLOW_BUILD_MAX_ARTIFACT_BYTES: "${defaultBuildMaxArtifactBytes}"`,
     `      SITEFLOW_BUILD_MAX_ARTIFACT_FILES: "${defaultBuildMaxArtifactFiles}"`,
     `      SITEFLOW_BUILD_MIN_FREE_BYTES: "${defaultBuildMinFreeBytes}"`,
+    `      SITEFLOW_BUILD_STEP_TIMEOUT_MS: "${defaultBuildStepTimeoutMs}"`,
+    `      SITEFLOW_GIT_TIMEOUT_MS: "${defaultGitTimeoutMs}"`,
+    '      SITEFLOW_GIT_SSH_KEY_PATH: "${SITEFLOW_GIT_SSH_KEY_PATH:-}"',
+    '      SITEFLOW_GIT_KNOWN_HOSTS_PATH: "${SITEFLOW_GIT_KNOWN_HOSTS_PATH:-}"',
     ...buildImageEnvLines(buildImage, buildImageAllowlist, "      "),
     `      TMPDIR: "${options.artifactRoot}"`,
     `      SITEFLOW_WORKER_POLL_INTERVAL_MS: "${workerPollIntervalMs}"`
@@ -439,6 +481,7 @@ export function renderComposeFile(options: ComposeFileOptions): RenderedInstallA
     "      SITEFLOW_APP_SECRET_FILE: /run/secrets/siteflow_app_secret",
     "      SITEFLOW_API_TOKEN_FILE: /run/secrets/siteflow_api_token",
     "      SITEFLOW_METRICS_TOKEN_FILE: /run/secrets/siteflow_metrics_token",
+    "      SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE: /run/secrets/siteflow_release_evidence_signing_key",
     "      SITEFLOW_POSTGRES_PASSWORD_FILE: /run/secrets/siteflow_postgres_password",
     "      SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_github_webhook_secret",
     "      SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE: /run/secrets/siteflow_gitlab_webhook_secret",
@@ -455,6 +498,7 @@ export function renderComposeFile(options: ComposeFileOptions): RenderedInstallA
     "      - siteflow_app_secret",
     "      - siteflow_api_token",
     "      - siteflow_metrics_token",
+    "      - siteflow_release_evidence_signing_key",
     "      - siteflow_postgres_password",
     "      - siteflow_github_webhook_secret",
     "      - siteflow_gitlab_webhook_secret",
@@ -470,9 +514,9 @@ export function renderComposeFile(options: ComposeFileOptions): RenderedInstallA
     "  worker:",
     `    image: ${runtimeImage}`,
     "    restart: unless-stopped",
-    '    user: "${SITEFLOW_WORKER_USER:-0:0}"',
+    `    user: "\${SITEFLOW_WORKER_USER:-${workerUser}}"`,
     "    group_add:",
-    '      - "${SITEFLOW_DOCKER_SOCKET_GID:-0}"',
+    '      - "${SITEFLOW_DOCKER_SOCKET_GID:?SITEFLOW_DOCKER_SOCKET_GID must match /var/run/docker.sock group id}"',
     "    init: true",
     "    read_only: true",
     "    cap_drop:",
@@ -498,7 +542,7 @@ export function renderComposeFile(options: ComposeFileOptions): RenderedInstallA
     "          exit 1",
     "        fi",
     "        if ! docker info >/dev/null 2>&1; then",
-    "          echo \"SITEFLOW_BUILD_RUNNER=docker requires access to a Docker daemon. This compose file mounts /var/run/docker.sock for trusted single-host operators.\" >&2",
+    "          echo \"SITEFLOW_BUILD_RUNNER=docker requires access to the trusted single-host Docker socket.\" >&2",
     "          exit 1",
     "        fi",
     "        exec node dist-worker/worker/index.js",
@@ -513,11 +557,11 @@ export function renderComposeFile(options: ComposeFileOptions): RenderedInstallA
     "    healthcheck:",
     '      test: ["CMD", "node", "dist-worker/worker/index.js", "--healthcheck"]',
     "      interval: 30s",
-    "      timeout: 5s",
+    "      timeout: 10s",
     "      retries: 5",
     "      start_period: 30s",
-    "    # Trusted single-host operator profile: the Docker socket lets this worker control the host Docker daemon.",
-    "    # This is a minimum production runner, not a multi-tenant sandbox boundary.",
+    "    # Trusted single-host operator profile: the socket-mounted worker controls",
+    "    # the host Docker daemon and is not a multi-tenant sandbox boundary.",
     "",
     "secrets:",
     "  siteflow_app_secret:",
@@ -526,6 +570,8 @@ export function renderComposeFile(options: ComposeFileOptions): RenderedInstallA
     `    file: ${options.configDir}/secrets/api-token.secret`,
     "  siteflow_metrics_token:",
     `    file: ${options.configDir}/secrets/metrics-token.secret`,
+    "  siteflow_release_evidence_signing_key:",
+    `    file: ${options.configDir}/secrets/release-evidence-signing-key.secret`,
     "  siteflow_postgres_password:",
     `    file: ${options.configDir}/secrets/postgres-password.secret`,
     "  siteflow_github_webhook_secret:",
@@ -543,6 +589,7 @@ export function renderComposeFile(options: ComposeFileOptions): RenderedInstallA
 
 export function renderSystemdUnit(options: SystemdUnitOptions): RenderedInstallAsset {
   const unitName = options.unitName ?? "siteflow.service";
+  const envFileArgs = options.envFile ? `--env-file ${options.envFile} ` : "";
   const content = [
     "# Generated by SiteFlow. Do not edit manually.",
     "[Unit]",
@@ -555,8 +602,8 @@ export function renderSystemdUnit(options: SystemdUnitOptions): RenderedInstallA
     "Type=oneshot",
     "RemainAfterExit=yes",
     `WorkingDirectory=${options.workingDirectory}`,
-    `ExecStart=/usr/bin/docker compose -f ${options.composeFile} up -d`,
-    `ExecStop=/usr/bin/docker compose -f ${options.composeFile} down`,
+    `ExecStart=/usr/bin/docker compose ${envFileArgs}-f ${options.composeFile} up -d`,
+    `ExecStop=/usr/bin/docker compose ${envFileArgs}-f ${options.composeFile} down`,
     "TimeoutStartSec=0",
     "",
     "[Install]",

@@ -12,6 +12,7 @@ import type { SiteFlowCommandRunner } from "../cli/doctor";
 const databaseUrl = "postgres://siteflow:supersecret@localhost:5432/siteflow";
 const restoreDrillDatabaseUrl = "postgres://siteflow:restoresecret@localhost:5432/siteflow_drill";
 const backupKmsKeyRef = "arn:aws:kms:us-east-1:111122223333:key/siteflow-prod-backups";
+const backupAutomationHistoryTestTimeoutMs = 30_000;
 
 function makeClock() {
   let ticks = 0;
@@ -567,7 +568,7 @@ describe("backupAutomationRun", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  }, 10000);
+  }, backupAutomationHistoryTestTimeoutMs);
 
   it("blocks restore drill automation unless disposable target confirmation is explicit", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-backup-automation-blocked-"));

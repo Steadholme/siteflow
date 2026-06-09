@@ -14,6 +14,7 @@ const repository = "acme/siteflow";
 const branch = "main";
 const releaseEvidencePathLabel = "evidence/release-evidence.json";
 const artifactChecksum = `sha256:${"a".repeat(64)}`;
+const payloadDigest = `sha256:${"d".repeat(64)}`;
 
 async function writeJson(root: string, relativePath: string, value: unknown) {
   const filePath = path.join(root, relativePath);
@@ -23,17 +24,17 @@ async function writeJson(root: string, relativePath: string, value: unknown) {
   return filePath;
 }
 
-function releaseEvidenceBundle() {
+function releaseEvidenceBundle(targetEnvironment = "production") {
   return {
     schemaVersion: "siteflow.releaseEvidence.v1",
     name: "siteflow-release-evidence-bundle",
     checkedAt: "2026-06-08T10:00:00.000Z",
-    targetEnvironment: "production",
+    targetEnvironment,
     release: {
       commitRef,
       repository,
       branch,
-      targetEnvironment: "production",
+      targetEnvironment,
       releaseTicket: "REL-2026-0608",
       operatorName: "release-operator"
     },
@@ -49,7 +50,7 @@ function releaseEvidenceBundle() {
   };
 }
 
-function deploymentDetail(overrides: Record<string, unknown> = {}) {
+function deploymentDetail(overrides: Record<string, unknown> = {}, targetEnvironment = "production") {
   return {
     project: {
       id: "project-acme-dashboard",
@@ -59,7 +60,7 @@ function deploymentDetail(overrides: Record<string, unknown> = {}) {
       id: "dep-production",
       projectId: "project-acme-dashboard",
       status: "ready",
-      environment: "production",
+      environment: targetEnvironment,
       version: "2026.06.08"
     },
     lineage: {
@@ -72,17 +73,18 @@ function deploymentDetail(overrides: Record<string, unknown> = {}) {
       },
       routeRevision: {
         id: "route-production",
-        channel: "production",
+        channel: targetEnvironment,
         deploymentId: "dep-production",
         status: "applied",
         releaseEvidence: {
           evidencePath: releaseEvidencePathLabel,
           checkedAt: "2026-06-08T10:05:00.000Z",
+          payloadDigest,
           status: "passed",
           commitRef,
           repository,
           branch,
-          targetEnvironment: "production",
+          targetEnvironment,
           releaseTicket: "REL-2026-0608",
           operatorName: "release-operator"
         }
@@ -112,6 +114,7 @@ function deploymentDetailWithFunctions(functions: Array<Record<string, unknown>>
         releaseEvidence: {
           evidencePath: releaseEvidencePathLabel,
           checkedAt: "2026-06-08T10:05:00.000Z",
+          payloadDigest,
           status: "passed",
           commitRef,
           repository,
@@ -131,6 +134,7 @@ function bundleCheck(status: "passed" | "blocked" = "passed"): ReleaseEvidenceBu
     status,
     checkedAt: "2026-06-08T10:03:00.000Z",
     evidencePath: releaseEvidencePathLabel,
+    payloadDigest,
     thresholds: {
       maxEvidenceAgeHours: 168,
       allowHostBuildException: false
@@ -159,6 +163,49 @@ function bundleCheck(status: "passed" | "blocked" = "passed"): ReleaseEvidenceBu
   };
 }
 
+function passingReadinessProbe() {
+  return {
+    endpoint: "/readyz",
+    statusCode: 200,
+    checkedAt: "2026-06-08T11:59:00.000Z"
+  };
+}
+
+function passingMetricsProbe() {
+  return {
+    endpoint: "/metrics",
+    statusCode: 200,
+    checkedAt: "2026-06-08T11:59:00.000Z"
+  };
+}
+
+function acceptedProductionProbeException(overrides: Record<string, unknown> = {}) {
+  return {
+    status: "accepted",
+    targetEnvironment: "production",
+    channel: "production",
+    ticket: "INC-2026-0608",
+    reason: "Target probe collector outage; production traffic remains held under incident control.",
+    approvedBy: "release-manager",
+    expiresAt: "2026-06-08T13:00:00.000Z",
+    release: {
+      commitRef,
+      repository,
+      branch,
+      targetEnvironment: "production"
+    },
+    deployment: {
+      id: "dep-production",
+      projectId: "project-acme-dashboard",
+      environment: "production"
+    },
+    project: {
+      id: "project-acme-dashboard"
+    },
+    ...overrides
+  };
+}
+
 describe("releasePostPromotionEvidenceCheck", () => {
   it("passes when the production route stores matching release evidence metadata", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-post-promote-pass-"));
@@ -171,8 +218,8 @@ describe("releasePostPromotionEvidenceCheck", () => {
         deploymentId: "dep-production",
         projectId: "project-acme-dashboard",
         expectedEvidencePath: releaseEvidencePathLabel,
-        readinessProbe: { statusCode: 200 },
-        metricsProbe: { status: "passed" },
+        readinessProbe: passingReadinessProbe(),
+        metricsProbe: passingMetricsProbe(),
         evaluateBundle: () => bundleCheck(),
         now
       });
@@ -189,9 +236,492 @@ describe("releasePostPromotionEvidenceCheck", () => {
         targetEnvironment: "production",
         routeRevisionId: "route-production",
         routeEvidenceStatus: "passed",
-        routeEvidenceCheckedAt: "2026-06-08T10:05:00.000Z"
+        routeEvidenceCheckedAt: "2026-06-08T10:05:00.000Z",
+        routeEvidencePayloadDigest: payloadDigest
       });
       expect(result.checks.every((check) => check.status === "pass")).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks when route release evidence metadata omits payloadDigest", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-post-promote-missing-digest-"));
+
+    try {
+      const evidencePath = await writeJson(root, "release-evidence.json", releaseEvidenceBundle());
+      const detail = deploymentDetail();
+      delete (detail.lineage.routeRevision.releaseEvidence as Record<string, unknown>).payloadDigest;
+
+      const result = await runReleasePostPromotionEvidenceCheck({
+        releaseEvidencePath: evidencePath,
+        deploymentDetail: detail,
+        readinessProbe: passingReadinessProbe(),
+        metricsProbe: passingMetricsProbe(),
+        evaluateBundle: () => bundleCheck(),
+        now
+      });
+      const digest = result.checks.find((check) => check.name === "route_release_evidence_payload_digest");
+
+      expect(result.status).toBe("blocked");
+      expect(result.selectedEvidence.routeEvidencePayloadDigest).toBeNull();
+      expect(digest).toMatchObject({
+        status: "fail",
+        details: {
+          expectedPayloadDigest: payloadDigest,
+          actualPayloadDigest: null
+        }
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks when route release evidence metadata payloadDigest differs from the checked bundle", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-post-promote-wrong-digest-"));
+
+    try {
+      const evidencePath = await writeJson(root, "release-evidence.json", releaseEvidenceBundle());
+      const detail = deploymentDetail();
+      detail.lineage.routeRevision.releaseEvidence.payloadDigest = `sha256:${"e".repeat(64)}`;
+
+      const result = await runReleasePostPromotionEvidenceCheck({
+        releaseEvidencePath: evidencePath,
+        deploymentDetail: detail,
+        readinessProbe: passingReadinessProbe(),
+        metricsProbe: passingMetricsProbe(),
+        evaluateBundle: () => bundleCheck(),
+        now
+      });
+      const digest = result.checks.find((check) => check.name === "route_release_evidence_payload_digest");
+
+      expect(result.status).toBe("blocked");
+      expect(result.selectedEvidence.routeEvidencePayloadDigest).toBe(`sha256:${"e".repeat(64)}`);
+      expect(digest).toMatchObject({
+        status: "fail",
+        details: {
+          expectedPayloadDigest: payloadDigest,
+          actualPayloadDigest: `sha256:${"e".repeat(64)}`
+        }
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks production by default when readiness and metrics probes are missing", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-post-promote-missing-probes-"));
+
+    try {
+      const evidencePath = await writeJson(root, "release-evidence.json", releaseEvidenceBundle());
+      const result = await runReleasePostPromotionEvidenceCheck({
+        releaseEvidencePath: evidencePath,
+        deploymentDetail: deploymentDetail(),
+        evaluateBundle: () => bundleCheck(),
+        now
+      });
+      const readinessRequired = result.checks.find((check) => check.name === "production_readiness_probe_required");
+      const metricsRequired = result.checks.find((check) => check.name === "production_metrics_probe_required");
+      const exception = result.checks.find((check) => check.name === "production_probe_exception");
+
+      expect(result.status).toBe("blocked");
+      expect(readinessRequired).toMatchObject({
+        status: "fail",
+        details: {
+          readinessProbePresent: false,
+          productionExceptionAccepted: false
+        }
+      });
+      expect(metricsRequired).toMatchObject({
+        status: "fail",
+        details: {
+          metricsProbePresent: false,
+          productionExceptionAccepted: false
+        }
+      });
+      expect(exception).toMatchObject({
+        status: "fail",
+        details: {
+          present: false,
+          passed: false
+        }
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks production when route evidence path does not match the default release evidence path", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-post-promote-default-path-"));
+
+    try {
+      const evidencePath = await writeJson(root, "release-evidence.json", releaseEvidenceBundle());
+      const result = await runReleasePostPromotionEvidenceCheck({
+        releaseEvidencePath: evidencePath,
+        deploymentDetail: deploymentDetail(),
+        readinessProbe: passingReadinessProbe(),
+        metricsProbe: passingMetricsProbe(),
+        evaluateBundle: () => bundleCheck(),
+        now
+      });
+      const routeEvidencePath = result.checks.find((check) => check.name === "route_release_evidence_path");
+
+      expect(result.status).toBe("blocked");
+      expect(routeEvidencePath).toMatchObject({
+        status: "fail",
+        details: {
+          expectedEvidencePath: evidencePath,
+          actualEvidencePath: releaseEvidencePathLabel
+        }
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("passes production without probes when accepted production exception evidence is provided", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-post-promote-exception-"));
+
+    try {
+      const evidencePath = await writeJson(root, "release-evidence.json", releaseEvidenceBundle());
+      const result = await runReleasePostPromotionEvidenceCheck({
+        releaseEvidencePath: evidencePath,
+        deploymentDetail: deploymentDetail(),
+        expectedEvidencePath: releaseEvidencePathLabel,
+        productionExceptionEvidence: acceptedProductionProbeException(),
+        evaluateBundle: () => bundleCheck(),
+        now
+      });
+      const readinessRequired = result.checks.find((check) => check.name === "production_readiness_probe_required");
+      const metricsRequired = result.checks.find((check) => check.name === "production_metrics_probe_required");
+      const exception = result.checks.find((check) => check.name === "production_probe_exception");
+
+      expect(result.status).toBe("passed");
+      expect(readinessRequired).toMatchObject({
+        status: "pass",
+        details: {
+          readinessProbePresent: false,
+          productionExceptionAccepted: true
+        }
+      });
+      expect(metricsRequired).toMatchObject({
+        status: "pass",
+        details: {
+          metricsProbePresent: false,
+          productionExceptionAccepted: true
+        }
+      });
+      expect(exception).toMatchObject({
+        status: "pass",
+        details: {
+          passed: true,
+          targetEnvironment: "production",
+          ticket: "INC-2026-0608",
+          approved: true,
+          unexpired: true,
+          identityBound: true,
+          releaseMatches: true,
+          deploymentMatches: true,
+          projectMatches: true,
+          channelMatches: true
+        }
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks production probe exceptions that are not bound to the release and deployment identity", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-post-promote-exception-missing-binding-"));
+
+    try {
+      const evidencePath = await writeJson(root, "release-evidence.json", releaseEvidenceBundle());
+      const result = await runReleasePostPromotionEvidenceCheck({
+        releaseEvidencePath: evidencePath,
+        deploymentDetail: deploymentDetail(),
+        expectedEvidencePath: releaseEvidencePathLabel,
+        productionExceptionEvidence: {
+          status: "accepted",
+          targetEnvironment: "production",
+          ticket: "INC-2026-0608",
+          reason: "Target probe collector outage; production traffic remains held under incident control.",
+          approvedBy: "release-manager",
+          expiresAt: "2026-06-08T13:00:00.000Z"
+        },
+        evaluateBundle: () => bundleCheck(),
+        now
+      });
+      const exception = result.checks.find((check) => check.name === "production_probe_exception");
+
+      expect(result.status).toBe("blocked");
+      expect(exception).toMatchObject({
+        status: "fail",
+        details: {
+          passed: false,
+          identityBound: false,
+          releaseMatches: false,
+          deploymentMatches: false,
+          projectMatches: false,
+          channelMatches: false,
+          expectedRelease: {
+            commitRef,
+            repository,
+            branch
+          },
+          actualRelease: {
+            commitRef: null,
+            repository: null,
+            branch: null
+          },
+          expectedDeployment: {
+            deploymentId: "dep-production",
+            projectId: "project-acme-dashboard",
+            channel: "production"
+          },
+          actualDeployment: {
+            deploymentId: null,
+            projectId: null,
+            channel: null
+          }
+        }
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks production probe exceptions whose release or deployment binding does not match", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-post-promote-exception-binding-mismatch-"));
+
+    try {
+      const evidencePath = await writeJson(root, "release-evidence.json", releaseEvidenceBundle());
+      const result = await runReleasePostPromotionEvidenceCheck({
+        releaseEvidencePath: evidencePath,
+        deploymentDetail: deploymentDetail(),
+        expectedEvidencePath: releaseEvidencePathLabel,
+        productionExceptionEvidence: acceptedProductionProbeException({
+          channel: "staging",
+          release: {
+            commitRef: "different-commit",
+            repository,
+            branch,
+            targetEnvironment: "production"
+          },
+          deployment: {
+            id: "dep-staging",
+            projectId: "project-staging",
+            environment: "staging"
+          },
+          project: {
+            id: "project-staging"
+          }
+        }),
+        evaluateBundle: () => bundleCheck(),
+        now
+      });
+      const exception = result.checks.find((check) => check.name === "production_probe_exception");
+
+      expect(result.status).toBe("blocked");
+      expect(exception).toMatchObject({
+        status: "fail",
+        details: {
+          passed: false,
+          identityBound: false,
+          releaseMatches: false,
+          deploymentMatches: false,
+          projectMatches: false,
+          channelMatches: false,
+          actualRelease: {
+            commitRef: "different-commit",
+            repository,
+            branch
+          },
+          actualDeployment: {
+            deploymentId: "dep-staging",
+            projectId: "project-staging",
+            channel: "staging"
+          }
+        }
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks raw secret-like values in post-promotion attached evidence", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-post-promote-secret-attachments-"));
+
+    try {
+      const evidencePath = await writeJson(root, "release-evidence.json", releaseEvidenceBundle());
+      const result = await runReleasePostPromotionEvidenceCheck({
+        releaseEvidencePath: evidencePath,
+        deploymentDetail: deploymentDetail({
+          diagnostics: {
+            authorization: "Bearer abcdefghijklmnop"
+          }
+        }),
+        expectedEvidencePath: releaseEvidencePathLabel,
+        readinessProbe: {
+          ...passingReadinessProbe(),
+          rawSecret: "super-secret-value"
+        },
+        metricsProbe: {
+          ...passingMetricsProbe(),
+          token: "ABCDEF1234567890"
+        },
+        productionExceptionEvidence: acceptedProductionProbeException({
+          audit: {
+            rawToken: "raw-token-value"
+          }
+        }),
+        evaluateBundle: () => bundleCheck(),
+        now
+      });
+      const secretScan = result.checks.find((check) => check.name === "post_promotion_attached_evidence_no_raw_secrets");
+
+      expect(result.status).toBe("blocked");
+      expect(secretScan).toMatchObject({
+        status: "fail",
+        details: {
+          findingCount: expect.any(Number)
+        }
+      });
+      expect(secretScan?.message).toContain("raw secret-like values");
+      expect(secretScan?.message).toContain("$.deploymentDetail.diagnostics.authorization");
+      expect(secretScan?.message).toContain("$.readinessProbe.rawSecret");
+      expect(secretScan?.message).toContain("$.metricsProbe.token");
+      expect(secretScan?.message).toContain("$.productionExceptionEvidence.audit.rawToken");
+      expect(secretScan?.message).not.toContain("abcdefghijklmnop");
+      expect(secretScan?.message).not.toContain("super-secret-value");
+      expect(secretScan?.message).not.toContain("ABCDEF1234567890");
+      expect(secretScan?.message).not.toContain("raw-token-value");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks production readiness probes that redirect instead of returning 200", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-post-promote-readiness-redirect-"));
+
+    try {
+      const evidencePath = await writeJson(root, "release-evidence.json", releaseEvidenceBundle());
+      const result = await runReleasePostPromotionEvidenceCheck({
+        releaseEvidencePath: evidencePath,
+        deploymentDetail: deploymentDetail(),
+        expectedEvidencePath: releaseEvidencePathLabel,
+        readinessProbe: {
+          endpoint: "/readyz",
+          statusCode: 302,
+          checkedAt: "2026-06-08T11:59:00.000Z"
+        },
+        metricsProbe: passingMetricsProbe(),
+        evaluateBundle: () => bundleCheck(),
+        now
+      });
+      const readinessProbe = result.checks.find((check) => check.name === "readiness_probe_passed");
+
+      expect(result.status).toBe("blocked");
+      expect(readinessProbe).toMatchObject({
+        status: "fail",
+        details: {
+          httpStatus: 302,
+          endpoint: "/readyz",
+          endpointMatches: true,
+          timestampFresh: true
+        }
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks production metrics probes that omit a fresh timestamp", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-post-promote-metrics-timestamp-"));
+
+    try {
+      const evidencePath = await writeJson(root, "release-evidence.json", releaseEvidenceBundle());
+      const result = await runReleasePostPromotionEvidenceCheck({
+        releaseEvidencePath: evidencePath,
+        deploymentDetail: deploymentDetail(),
+        expectedEvidencePath: releaseEvidencePathLabel,
+        readinessProbe: passingReadinessProbe(),
+        metricsProbe: {
+          endpoint: "/metrics",
+          statusCode: 200
+        },
+        evaluateBundle: () => bundleCheck(),
+        now
+      });
+      const metricsProbe = result.checks.find((check) => check.name === "metrics_probe_passed");
+
+      expect(result.status).toBe("blocked");
+      expect(metricsProbe).toMatchObject({
+        status: "fail",
+        details: {
+          httpStatus: 200,
+          endpoint: "/metrics",
+          endpointMatches: true,
+          checkedAt: null,
+          timestampFresh: false
+        }
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks production probes that target the wrong endpoint", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-post-promote-wrong-endpoint-"));
+
+    try {
+      const evidencePath = await writeJson(root, "release-evidence.json", releaseEvidenceBundle());
+      const result = await runReleasePostPromotionEvidenceCheck({
+        releaseEvidencePath: evidencePath,
+        deploymentDetail: deploymentDetail(),
+        expectedEvidencePath: releaseEvidencePathLabel,
+        readinessProbe: {
+          endpoint: "/healthz",
+          statusCode: 200,
+          checkedAt: "2026-06-08T11:59:00.000Z"
+        },
+        metricsProbe: passingMetricsProbe(),
+        evaluateBundle: () => bundleCheck(),
+        now
+      });
+      const readinessProbe = result.checks.find((check) => check.name === "readiness_probe_passed");
+
+      expect(result.status).toBe("blocked");
+      expect(readinessProbe).toMatchObject({
+        status: "fail",
+        details: {
+          endpoint: "/healthz",
+          expectedEndpoint: "/readyz",
+          endpointMatches: false,
+          timestampFresh: true
+        }
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not require probes for non-production channels", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-post-promote-non-production-"));
+
+    try {
+      const evidencePath = await writeJson(root, "release-evidence.json", releaseEvidenceBundle("staging"));
+      const result = await runReleasePostPromotionEvidenceCheck({
+        releaseEvidencePath: evidencePath,
+        deploymentDetail: deploymentDetail({}, "staging"),
+        channel: "staging",
+        evaluateBundle: () => bundleCheck(),
+        now
+      });
+
+      expect(result.status).toBe("passed");
+      expect(result.checks.find((check) => check.name === "production_readiness_probe_required")).toBeUndefined();
+      expect(result.checks.find((check) => check.name === "production_metrics_probe_required")).toBeUndefined();
+      expect(result.checks.find((check) => check.name === "production_probe_exception")).toBeUndefined();
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -398,6 +928,7 @@ describe("releasePostPromotionEvidenceCheck", () => {
       const evidencePath = await writeJson(root, "release-evidence.json", releaseEvidenceBundle());
       const result = await runReleasePostPromotionEvidenceCheck({
         releaseEvidencePath: evidencePath,
+        expectedEvidencePath: releaseEvidencePathLabel,
         deploymentDetail: deploymentDetailWithFunctions([
           {
             path: "/api/revalidate",
@@ -406,6 +937,8 @@ describe("releasePostPromotionEvidenceCheck", () => {
             handler: "default"
           }
         ]),
+        readinessProbe: passingReadinessProbe(),
+        metricsProbe: passingMetricsProbe(),
         evaluateBundle: () => bundleCheck(),
         now
       });
@@ -437,6 +970,7 @@ describe("releasePostPromotionEvidenceCheck", () => {
       const evidencePath = await writeJson(root, "release-evidence.json", releaseEvidenceBundle());
       const result = await runReleasePostPromotionEvidenceCheck({
         releaseEvidencePath: evidencePath,
+        expectedEvidencePath: releaseEvidencePathLabel,
         deploymentDetail: deploymentDetailWithFunctions([
           {
             path: "/api/revalidate",
@@ -446,6 +980,8 @@ describe("releasePostPromotionEvidenceCheck", () => {
             handler: "default"
           }
         ]),
+        readinessProbe: passingReadinessProbe(),
+        metricsProbe: passingMetricsProbe(),
         evaluateBundle: () => bundleCheck(),
         now
       });
@@ -476,6 +1012,7 @@ describe("releasePostPromotionEvidenceCheck", () => {
       const evidencePath = await writeJson(root, "release-evidence.json", releaseEvidenceBundle());
       const result = await runReleasePostPromotionEvidenceCheck({
         releaseEvidencePath: evidencePath,
+        expectedEvidencePath: releaseEvidencePathLabel,
         deploymentDetail: deploymentDetailWithFunctions([
           {
             path: "/api/revalidate",
@@ -485,6 +1022,8 @@ describe("releasePostPromotionEvidenceCheck", () => {
             handler: "default"
           }
         ]),
+        readinessProbe: passingReadinessProbe(),
+        metricsProbe: passingMetricsProbe(),
         evaluateBundle: () => bundleCheck(),
         now
       });
@@ -560,6 +1099,8 @@ describe("releasePostPromotionEvidenceCheck", () => {
         deploymentId: "dep-production",
         projectId: "project-acme-dashboard",
         expectedEvidencePath: releaseEvidencePathLabel,
+        readinessProbe: passingReadinessProbe(),
+        metricsProbe: passingMetricsProbe(),
         fetch: async (input, init) => {
           requests.push({
             url: input.toString(),
@@ -594,6 +1135,7 @@ describe("releasePostPromotionEvidenceCheck", () => {
       "--deployment", "dep-production",
       "--project", "project-acme-dashboard",
       "--expected-evidence-path", releaseEvidencePathLabel,
+      "--production-exception", "exception.json",
       "--json"
     ])).toEqual({
       releaseEvidencePath: "release.json",
@@ -601,6 +1143,7 @@ describe("releasePostPromotionEvidenceCheck", () => {
       deploymentId: "dep-production",
       projectId: "project-acme-dashboard",
       expectedEvidencePath: releaseEvidencePathLabel,
+      productionExceptionPath: "exception.json",
       json: true,
       help: false
     });

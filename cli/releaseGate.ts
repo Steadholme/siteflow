@@ -42,6 +42,13 @@ export interface ReleaseGatePromotionEvidence {
     branch: string;
     requiredStatusCheck: string;
     requiredStatusChecks?: string[];
+    pullRequestReviewsRequired?: boolean | null;
+    forcePushesBlocked?: boolean | null;
+    linearHistoryRequired?: boolean | null;
+    signedCommitsRequired?: boolean | null;
+    hardeningSources?: string[];
+    hardeningUnknowns?: string[];
+    hardeningFailures?: string[];
   };
   protectedBranchCommit: {
     status: ReleaseGateCheckStatus;
@@ -67,8 +74,12 @@ export interface ReleaseGatePromotionEvidence {
     unauthenticatedMetricsAllowed: boolean | null;
     apiTokenStrengthStatus: ReleaseGateCheckStatus | null;
     metricsTokenStrengthStatus: ReleaseGateCheckStatus | null;
+    releaseEvidenceSigningKeyStrengthStatus: ReleaseGateCheckStatus | null;
+    releaseEvidenceSigningKeySource: string | null;
     appSecretStrengthStatus: ReleaseGateCheckStatus | null;
     appSecretSource: string | null;
+    gitWebhookSecretStrengthStatus: ReleaseGateCheckStatus | null;
+    gitWebhookSecretSources: string[];
     postgresPasswordStatus: ReleaseGateCheckStatus | null;
     postgresPasswordSource: string | null;
     browserTokenFallbackEnabled: boolean | null;
@@ -99,8 +110,18 @@ export interface ReleaseGatePromotionEvidence {
     buildStepTimeoutMs: number | null;
     gitTimeoutStatus: ReleaseGateCheckStatus | null;
     gitTimeoutMs: number | null;
+    buildMemoryStatus: ReleaseGateCheckStatus | null;
+    buildMemory: string | null;
+    buildCpusStatus: ReleaseGateCheckStatus | null;
+    buildCpus: number | null;
+    buildPidsLimitStatus: ReleaseGateCheckStatus | null;
+    buildPidsLimit: number | null;
     buildNetworkStatus: ReleaseGateCheckStatus | null;
     buildNetwork: string | null;
+    workerUserStatus: ReleaseGateCheckStatus | null;
+    workerUser: string | null;
+    dockerSocketGidStatus: ReleaseGateCheckStatus | null;
+    dockerSocketGid: number | null;
     runtimeControlViolations?: unknown;
     secretStrengthViolations?: unknown;
     missing?: unknown;
@@ -158,8 +179,15 @@ interface RequiredEnvGroup {
   summary: string;
 }
 
+interface RequiredPackageScript {
+  name: string;
+  terms: string[];
+}
+
 const ciWorkflowPath = path.join(".github", "workflows", "ci.yml");
 const releasePreflightWorkflowPath = path.join(".github", "workflows", "release-preflight.yml");
+const releaseImageWorkflowPath = path.join(".github", "workflows", "release-image.yml");
+const packageJsonPath = "package.json";
 const productionDocsPath = path.join("docs", "production-readiness.md");
 const productionComposePath = "docker-compose.production.yml";
 const productionDeploymentDocPath = path.join("docs", "deployment", "production-single-host.md");
@@ -168,15 +196,39 @@ const requiredCiCommands = [
   "release:dependency:policy",
   "release:source:check",
   "release:commit:plan -- --fail-on-blocked",
+  "release:evidence:pack-contract",
   "npm test",
   "npm run build",
   "release:artifacts:check",
   "npm run test:e2e",
   "release-gate --allow-dirty --allow-manual-branch-protection"
 ];
+const requiredReleasePreflightEvidenceSetEnvTerms = [
+  "--set-env direct-api-url",
+  "--set-env release-image-digest=SITEFLOW_RELEASE_IMAGE_DIGEST",
+  "--set-env release-image-run-id=SITEFLOW_RELEASE_IMAGE_RUN_ID",
+  "--set-env webhook-delivery-id",
+  "--set-env deploy-key-path",
+  "--set-env known-hosts-path",
+  "--set-env SITEFLOW_TRUST_PROXY",
+  "--set-env api-instance-count",
+  "--set-env api-process-count",
+  "--set-env ingress-count",
+  "--set-env api-rate-limit-scope",
+  "--set-env api-rate-limit-enforcement-point",
+  "--set-env operator-access-project-id",
+  "--set-env operator-access-denied-project-id",
+  "--set-env old-metrics-token-redacted-id",
+  "--set-env new-metrics-token-redacted-id",
+  "--set-env old-root-api-token-redacted-id",
+  "--set-env new-root-api-token-redacted-id",
+  "--set-env break-glass-source",
+  "--set-env break-glass-approver-count"
+];
 const requiredReleasePreflightTerms = [
   "workflow_dispatch",
   "direct_api_url:",
+  "release_image_digest:",
   "release_image_run_id:",
   "trust_proxy_policy:",
   "api_instance_count:",
@@ -184,6 +236,14 @@ const requiredReleasePreflightTerms = [
   "ingress_count:",
   "api_rate_limit_scope:",
   "api_rate_limit_enforcement_point:",
+  "operator_access_project_id:",
+  "operator_access_denied_project_id:",
+  "old_metrics_token_redacted_id:",
+  "new_metrics_token_redacted_id:",
+  "old_root_api_token_redacted_id:",
+  "new_root_api_token_redacted_id:",
+  "break_glass_source:",
+  "break_glass_approver_count:",
   "release-gate",
   "--promotion",
   "--env-file",
@@ -203,17 +263,21 @@ const requiredReleasePreflightTerms = [
   "--run-record",
   "--gap-report-dir",
   "release:evidence:gaps",
+  "release_image_digest",
   "release_image_run_id",
+  "SITEFLOW_RELEASE_IMAGE_DIGEST: ${{ inputs.release_image_digest }}",
+  "SITEFLOW_RELEASE_IMAGE_RUN_ID: ${{ inputs.release_image_run_id }}",
+  "source_provider_webhook_delivery_id:",
+  "source_provider_deploy_key_path:",
+  "source_provider_known_hosts_path:",
   "SITEFLOW_RELEASE_GITHUB_TOKEN",
+  "SITEFLOW_OPERATOR_LOW_SCOPE_TOKEN",
+  "SITEFLOW_OLD_METRICS_TOKEN",
+  "SITEFLOW_METRICS_TOKEN",
+  "SITEFLOW_OLD_API_TOKEN",
+  "SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID",
   "GH_TOKEN",
-  "--set-env direct-api-url",
-  "--set-env release-image-run-id",
-  "--set-env SITEFLOW_TRUST_PROXY",
-  "--set-env api-instance-count",
-  "--set-env api-process-count",
-  "--set-env ingress-count",
-  "--set-env api-rate-limit-scope",
-  "--set-env api-rate-limit-enforcement-point",
+  ...requiredReleasePreflightEvidenceSetEnvTerms,
   "SITEFLOW_TARGET_ENV_FILE",
   "actions: read",
   "actions/upload-artifact",
@@ -222,16 +286,127 @@ const requiredReleasePreflightTerms = [
   "build_image must be pinned",
   "release:dependency:policy",
   "release:source:check",
+  "release:commit:plan -- --fail-on-blocked",
+  "release:evidence:pack-contract",
   "npm run build"
+];
+const requiredReleaseImageTerms = [
+  "workflow_dispatch",
+  "packages: write",
+  "release:dependency:policy",
+  "release:source:check",
+  "release:commit:plan -- --fail-on-blocked",
+  "release:evidence:pack-contract",
+  "npm test -- --run",
+  "npm run build",
+  "release:artifacts:check",
+  "docker/build-push-action",
+  "provenance: true",
+  "sbom: true",
+  "docker buildx imagetools inspect --raw",
+  "release-image-evidence.json",
+  "actions/upload-artifact",
+  "release-image-evidence",
+  "Gate image attestation evidence",
+  "attestations.provenance?.failedChecks",
+  "attestations.sbom?.failedChecks",
+  "attestations.provenance?.present !== true",
+  "attestations.sbom?.present !== true"
+];
+const requiredPackageScripts: RequiredPackageScript[] = [
+  {
+    name: "build",
+    terms: [
+      "npm run clean:build-artifacts",
+      "tsc --noEmit -p tsconfig.json",
+      "tsc --noEmit -p tsconfig.node.json",
+      "npm run build:scripts",
+      "npm run build:cli",
+      "npm run build:server",
+      "npm run build:worker",
+      "vite build"
+    ]
+  },
+  {
+    name: "build:scripts",
+    terms: ["tsc --noEmit -p tsconfig.scripts.json"]
+  },
+  {
+    name: "build:cli",
+    terms: ["tsc -p tsconfig.cli.json"]
+  },
+  {
+    name: "build:server",
+    terms: ["tsc -p tsconfig.server.json"]
+  },
+  {
+    name: "build:worker",
+    terms: ["tsc -p tsconfig.worker.json"]
+  },
+  {
+    name: "siteflow",
+    terms: ["node dist-cli/cli/index.js"]
+  },
+  {
+    name: "release:dependency:policy",
+    terms: ["node scripts/releaseDependencyPolicyCheck.mjs"]
+  },
+  {
+    name: "release:source:check",
+    terms: ["node scripts/runCompiledScript.mjs releaseSourceTreeCheck.js"]
+  },
+  {
+    name: "release:commit:plan",
+    terms: ["node scripts/runCompiledScript.mjs releaseCommitReadinessPlan.js"]
+  },
+  {
+    name: "release:evidence:pack-contract",
+    terms: ["node scripts/runCompiledScript.mjs releaseEvidencePackContractCheck.js"]
+  },
+  {
+    name: "release:evidence:rehearsal-pack",
+    terms: ["node scripts/runCompiledScript.mjs releaseEvidenceRehearsalPack.js"]
+  },
+  {
+    name: "release:evidence:target-run",
+    terms: ["node scripts/runCompiledScript.mjs releaseEvidenceTargetRun.js"]
+  },
+  {
+    name: "release:evidence:gaps",
+    terms: ["node scripts/runCompiledScript.mjs releaseEvidenceGapReport.js"]
+  },
+  {
+    name: "release:artifacts:check",
+    terms: ["node scripts/runCompiledScript.mjs releaseArtifactCheck.js"]
+  },
+  {
+    name: "test",
+    terms: ["vitest"]
+  },
+  {
+    name: "test:e2e",
+    terms: ["playwright test"]
+  }
 ];
 const requiredReleasePreflightCommandTerms = [
   {
     command: "release:evidence:target-run",
-    terms: ["--pack", "--confirm-target-environment", "--run-record", "--gap-report-dir"]
+    terms: [
+      "--pack",
+      "--confirm-target-environment",
+      "--run-record",
+      "--gap-report-dir",
+      "SITEFLOW_OBSERVABILITY_STACK_TOKEN: ${{ secrets.SITEFLOW_OBSERVABILITY_STACK_TOKEN }}",
+      ...requiredReleasePreflightEvidenceSetEnvTerms
+    ]
   },
   {
     command: "release:evidence:gaps",
-    terms: ["--pack"]
+    terms: [
+      "--pack",
+      "SITEFLOW_OBSERVABILITY_STACK_TOKEN: ${{ secrets.SITEFLOW_OBSERVABILITY_STACK_TOKEN }}",
+      ...requiredReleasePreflightEvidenceSetEnvTerms
+    ]
   }
 ];
 const forbiddenReleasePreflightCommandTerms = [
@@ -257,11 +432,29 @@ const requiredProductionDeploymentDocTerms = [
   "SITEFLOW_POSTGRES_IMAGE",
   "SITEFLOW_BUILD_IMAGE",
   "SITEFLOW_BUILD_MIN_FREE_BYTES",
+  "SITEFLOW_BUILD_STEP_TIMEOUT_MS",
+  "SITEFLOW_GIT_TIMEOUT_MS",
+  "SITEFLOW_BUILD_MEMORY",
+  "SITEFLOW_BUILD_CPUS",
+  "SITEFLOW_BUILD_PIDS_LIMIT",
   "SITEFLOW_BUILD_MAX_ARTIFACT_BYTES",
   "SITEFLOW_BUILD_MAX_ARTIFACT_FILES",
   "SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES",
   "SITEFLOW_PREBUILT_MAX_FILES",
+  "SITEFLOW_TRUST_PROXY",
+  "SITEFLOW_WORKER_USER",
+  "SITEFLOW_DOCKER_SOCKET_GID",
+  "SITEFLOW_GIT_SSH_KEY_PATH",
+  "SITEFLOW_GIT_KNOWN_HOSTS_PATH",
+  "SITEFLOW_APP_SECRET_FILE",
+  "SITEFLOW_API_TOKEN_FILE",
+  "SITEFLOW_METRICS_TOKEN_FILE",
+  "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE",
   "SITEFLOW_POSTGRES_PASSWORD_FILE",
+  "SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE",
+  "SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE",
+  "SITEFLOW_GITEA_WEBHOOK_SECRET_FILE",
+  "SITEFLOW_GENERIC_WEBHOOK_SECRET_FILE",
   "docker compose -f docker-compose.production.yml config"
 ];
 const maxDirtyWorktreeEntries = 200;
@@ -275,6 +468,8 @@ const requiredDocumentedEnvNames = [
   "SITEFLOW_API_TOKEN",
   "SITEFLOW_APP_SECRET",
   "SITEFLOW_SEALING_KEY",
+  "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY",
+  "SITEFLOW_RELEASE_EVIDENCE_REQUIRED_SIGNING_KEY_ID",
   "SITEFLOW_METRICS_TOKEN",
   "SITEFLOW_ALLOW_UNAUTHENTICATED_METRICS",
   "VITE_SITEFLOW_ALLOW_BROWSER_TOKEN_FALLBACK",
@@ -291,7 +486,22 @@ const requiredDocumentedEnvNames = [
   "SITEFLOW_PREBUILT_MAX_FILES",
   "SITEFLOW_BUILD_STEP_TIMEOUT_MS",
   "SITEFLOW_GIT_TIMEOUT_MS",
+  "SITEFLOW_BUILD_MEMORY",
+  "SITEFLOW_BUILD_CPUS",
+  "SITEFLOW_BUILD_PIDS_LIMIT",
+  "SITEFLOW_TRUST_PROXY",
+  "SITEFLOW_WORKER_USER",
+  "SITEFLOW_DOCKER_SOCKET_GID",
+  "SITEFLOW_GIT_SSH_KEY_PATH",
+  "SITEFLOW_GIT_KNOWN_HOSTS_PATH",
   "SITEFLOW_BUILD_NETWORK"
+];
+
+const gitWebhookSecretKeys = [
+  "SITEFLOW_GITHUB_WEBHOOK_SECRET",
+  "SITEFLOW_GITLAB_WEBHOOK_SECRET",
+  "SITEFLOW_GITEA_WEBHOOK_SECRET",
+  "SITEFLOW_GENERIC_WEBHOOK_SECRET"
 ];
 
 const requiredEnvGroups: RequiredEnvGroup[] = [
@@ -347,6 +557,13 @@ const requiredEnvGroups: RequiredEnvGroup[] = [
     predicate: (values) =>
       productionMetricsTokenStrengthStatus(values).status !== "fail",
     summary: "SITEFLOW_METRICS_TOKEN or SITEFLOW_METRICS_TOKEN_FILE is required so /metrics is not promoted without bearer-token protection evidence, unless SITEFLOW_ALLOW_UNAUTHENTICATED_METRICS=1 is explicitly accepted."
+  },
+  {
+    id: "runtime.releaseEvidenceSigningKey",
+    label: "Release evidence signing key",
+    keys: ["SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY", "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE"],
+    predicate: (values) => productionSecretStrengthStatus(values, "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY").status === "pass",
+    summary: "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY or SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE is required so production API gates can verify signed release evidence bundles."
   },
   {
     id: "runtime.browserTokenFallback",
@@ -417,11 +634,42 @@ const requiredEnvGroups: RequiredEnvGroup[] = [
     summary: "SITEFLOW_BUILD_NETWORK=none is required for production source builds."
   },
   {
+    id: "runtime.buildResourceLimits",
+    label: "Docker build resource limits",
+    keys: ["SITEFLOW_BUILD_MEMORY", "SITEFLOW_BUILD_CPUS", "SITEFLOW_BUILD_PIDS_LIMIT"],
+    predicate: (values) => {
+      const posture = resolveRuntimeControlPosture(values);
+
+      return posture.buildMemoryStatus === "pass" &&
+        posture.buildCpusStatus === "pass" &&
+        posture.buildPidsLimitStatus === "pass";
+    },
+    summary: "SITEFLOW_BUILD_MEMORY, SITEFLOW_BUILD_CPUS, and SITEFLOW_BUILD_PIDS_LIMIT must be explicit positive Docker resource limits."
+  },
+  {
+    id: "runtime.workerSocketPosture",
+    label: "Worker Docker socket posture",
+    keys: ["SITEFLOW_WORKER_USER", "SITEFLOW_DOCKER_SOCKET_GID"],
+    predicate: (values) => {
+      const posture = resolveRuntimeControlPosture(values);
+
+      return posture.workerUserStatus === "pass" && posture.dockerSocketGidStatus === "pass";
+    },
+    summary: "SITEFLOW_WORKER_USER must be non-root and SITEFLOW_DOCKER_SOCKET_GID must explicitly match the target host Docker socket group id."
+  },
+  {
     id: "runtime.appSecret",
     label: "App sealing secret",
     keys: ["SITEFLOW_APP_SECRET", "SITEFLOW_APP_SECRET_FILE", "SITEFLOW_SEALING_KEY", "SITEFLOW_SEALING_KEY_FILE"],
     predicate: (values) => productionAppSecretStrengthStatus(values).status === "pass",
     summary: "SITEFLOW_APP_SECRET or SITEFLOW_APP_SECRET_FILE is required, with SITEFLOW_SEALING_KEY accepted only for legacy installs."
+  },
+  {
+    id: "runtime.gitWebhookSecrets",
+    label: "Git webhook secrets",
+    keys: gitWebhookSecretKeys.flatMap((key) => [key, `${key}_FILE`]),
+    predicate: (values) => productionGitWebhookSecretsStrengthStatus(values).status !== "fail",
+    summary: "Configured git webhook secrets or *_FILE fallbacks must meet production strength requirements."
   }
 ];
 
@@ -562,6 +810,128 @@ async function checkReleasePreflightWorkflow(root: string): Promise<ReleaseGateC
     label: "Release preflight workflow",
     status: "pass",
     summary: `${releasePreflightWorkflowPath} defines promotion preflight evidence collection without static-sanity overrides.`
+  };
+}
+
+async function checkReleaseImageWorkflow(root: string): Promise<ReleaseGateCheck> {
+  const filePath = path.join(root, releaseImageWorkflowPath);
+
+  if (!await fileExists(filePath)) {
+    return {
+      id: "local.releaseImageWorkflow",
+      label: "Release image workflow",
+      status: "fail",
+      summary: `${releaseImageWorkflowPath} is missing.`,
+      remediation: "Add a release image workflow that runs source, commit, pack-contract, test, build, artifact, provenance/SBOM, and evidence upload gates before publishing runtime images."
+    };
+  }
+
+  const content = await readFile(filePath, "utf8");
+  const missingTerms = requiredReleaseImageTerms.filter((term) => !content.includes(term));
+
+  if (missingTerms.length > 0) {
+    return {
+      id: "local.releaseImageWorkflow",
+      label: "Release image workflow",
+      status: "fail",
+      summary: `${releaseImageWorkflowPath} is missing required release image gate term(s): ${missingTerms.join(", ")}.`,
+      remediation: "Keep release image publishing aligned with source, commit, pack-contract, test, build, artifact, provenance/SBOM, and evidence upload gates.",
+      details: {
+        missingTerms
+      }
+    };
+  }
+
+  return {
+    id: "local.releaseImageWorkflow",
+    label: "Release image workflow",
+    status: "pass",
+    summary: `${releaseImageWorkflowPath} defines gated release image publishing and evidence upload.`
+  };
+}
+
+async function checkPackageScripts(root: string): Promise<ReleaseGateCheck> {
+  const filePath = path.join(root, packageJsonPath);
+
+  if (!await fileExists(filePath)) {
+    return {
+      id: "local.packageScripts",
+      label: "Package release scripts",
+      status: "fail",
+      summary: `${packageJsonPath} is missing.`,
+      remediation: "Keep package.json scripts aligned with the production release workflows."
+    };
+  }
+
+  let packageJson: unknown;
+
+  try {
+    packageJson = JSON.parse(await readFile(filePath, "utf8"));
+  } catch (error) {
+    return {
+      id: "local.packageScripts",
+      label: "Package release scripts",
+      status: "fail",
+      summary: error instanceof Error ? `${packageJsonPath} is not valid JSON: ${error.message}` : `${packageJsonPath} is not valid JSON.`,
+      remediation: "Fix package.json so release-gate can verify production release script drift."
+    };
+  }
+
+  const scripts = isRecord(packageJson) && isRecord(packageJson.scripts) ? packageJson.scripts : undefined;
+
+  if (!scripts) {
+    return {
+      id: "local.packageScripts",
+      label: "Package release scripts",
+      status: "fail",
+      summary: `${packageJsonPath} does not define scripts.`,
+      remediation: "Define the package scripts used by the production release workflows.",
+      details: {
+        missingScripts: requiredPackageScripts.map((script) => script.name)
+      }
+    };
+  }
+
+  const missingScripts: string[] = [];
+  const driftedScripts: Array<{ script: string; missingTerms: string[] }> = [];
+
+  for (const requiredScript of requiredPackageScripts) {
+    const value = scripts[requiredScript.name];
+
+    if (typeof value !== "string" || value.trim() === "") {
+      missingScripts.push(requiredScript.name);
+      continue;
+    }
+
+    const missingTerms = requiredScript.terms.filter((term) => !value.includes(term));
+
+    if (missingTerms.length > 0) {
+      driftedScripts.push({
+        script: requiredScript.name,
+        missingTerms
+      });
+    }
+  }
+
+  if (missingScripts.length > 0 || driftedScripts.length > 0) {
+    return {
+      id: "local.packageScripts",
+      label: "Package release scripts",
+      status: "fail",
+      summary: `${packageJsonPath} release scripts are not aligned with production release workflows.`,
+      remediation: "Restore the package scripts expected by CI, release preflight, and release image workflows before promotion.",
+      details: {
+        missingScripts,
+        driftedScripts
+      }
+    };
+  }
+
+  return {
+    id: "local.packageScripts",
+    label: "Package release scripts",
+    status: "pass",
+    summary: `${packageJsonPath} defines the production release scripts used by release workflows.`
   };
 }
 
@@ -759,6 +1129,22 @@ function composeMappingIncludes(block: string | undefined, key: string) {
   return Boolean(block && new RegExp(`(^|\\n)\\s{2}${escapeRegExp(key)}:\\s*(?:\\n|$)`).test(block));
 }
 
+function composeServiceNames(content: string) {
+  const servicesBlock = topLevelComposeBlock(content, "services");
+
+  if (!servicesBlock) {
+    return [];
+  }
+
+  return servicesBlock
+    .split(/\r?\n/)
+    .flatMap((line) => {
+      const match = /^  ([A-Za-z0-9_-]+):\s*$/.exec(line);
+
+      return match ? [match[1]] : [];
+    });
+}
+
 function requireComposeServiceSecrets(
   missingComposeTerms: string[],
   serviceName: string,
@@ -805,17 +1191,33 @@ async function checkProductionCompose(root: string): Promise<ReleaseGateCheck> {
   const apiBlock = composeServiceBlock(composeContent, "api");
   const workerBlock = composeServiceBlock(composeContent, "worker");
   const missingComposeTerms: string[] = [];
+  const serviceNames = composeServiceNames(composeContent);
+  const extraServiceNames = serviceNames.filter((serviceName) => !["postgres", "api", "worker"].includes(serviceName));
+  const servicesBlock = topLevelComposeBlock(composeContent, "services");
   const requiredTopLevelSecrets = [
     "siteflow_app_secret",
     "siteflow_api_token",
     "siteflow_metrics_token",
-    "siteflow_postgres_password"
+    "siteflow_release_evidence_signing_key",
+    "siteflow_postgres_password",
+    "siteflow_github_webhook_secret",
+    "siteflow_gitlab_webhook_secret",
+    "siteflow_gitea_webhook_secret",
+    "siteflow_generic_webhook_secret"
   ];
 
   for (const secretName of requiredTopLevelSecrets) {
     if (!composeMappingIncludes(secretsBlock, secretName)) {
       missingComposeTerms.push(`top-level secret ${secretName}`);
     }
+  }
+
+  if (extraServiceNames.length > 0) {
+    missingComposeTerms.push(`unexpected service(s): ${extraServiceNames.join(", ")}`);
+  }
+
+  if (servicesBlock && /(^|\n)\s{4}build:\s*(\n|$)/.test(servicesBlock)) {
+    missingComposeTerms.push("services must not define local Docker build entries");
   }
 
   if (!postgresBlock) {
@@ -854,12 +1256,19 @@ async function checkProductionCompose(root: string): Promise<ReleaseGateCheck> {
       "condition: service_healthy",
       "SITEFLOW_PREBUILT_MAX_UPLOAD_BYTES:",
       "SITEFLOW_PREBUILT_MAX_FILES:",
+      "SITEFLOW_TRUST_PROXY:",
       "SITEFLOW_BACKUP_AUTOMATION_RUN_RECORD:",
       "DATABASE_URL:",
       "SITEFLOW_APP_SECRET_FILE:",
       "SITEFLOW_API_TOKEN_FILE:",
       "SITEFLOW_METRICS_TOKEN_FILE:",
+      "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY_FILE:",
       "SITEFLOW_POSTGRES_PASSWORD_FILE:",
+      "SITEFLOW_GITHUB_WEBHOOK_SECRET_FILE:",
+      "SITEFLOW_GITLAB_WEBHOOK_SECRET_FILE:",
+      "SITEFLOW_GITEA_WEBHOOK_SECRET_FILE:",
+      "SITEFLOW_GENERIC_WEBHOOK_SECRET_FILE:",
+      "${SITEFLOW_API_BIND:-127.0.0.1}:8787:8787",
       "healthcheck:",
       "/readyz"
     ]) {
@@ -872,11 +1281,36 @@ async function checkProductionCompose(root: string): Promise<ReleaseGateCheck> {
       "siteflow_app_secret",
       "siteflow_api_token",
       "siteflow_metrics_token",
-      "siteflow_postgres_password"
+      "siteflow_release_evidence_signing_key",
+      "siteflow_postgres_password",
+      "siteflow_github_webhook_secret",
+      "siteflow_gitlab_webhook_secret",
+      "siteflow_gitea_webhook_secret",
+      "siteflow_generic_webhook_secret"
     ]);
 
     if (apiBlock.includes("/var/run/docker.sock")) {
       missingComposeTerms.push("api must not mount /var/run/docker.sock");
+    }
+
+    if (/(^|\n)\s+privileged:\s*true\s*(\n|$)/i.test(apiBlock)) {
+      missingComposeTerms.push("api must not run privileged");
+    }
+
+    if (/(^|\n)\s+cap_add:\s*(\n|$)/i.test(apiBlock)) {
+      missingComposeTerms.push("api must not add Linux capabilities");
+    }
+
+    if (/seccomp=unconfined|apparmor=unconfined/i.test(apiBlock)) {
+      missingComposeTerms.push("api must not disable seccomp or AppArmor");
+    }
+
+    if (/(^|\n)\s+network_mode:\s*["']?host["']?\s*(\n|$)/i.test(apiBlock)) {
+      missingComposeTerms.push("api must not use host network mode");
+    }
+
+    if (apiBlock.includes("0.0.0.0:8787:8787") || /(^|\n)\s*-\s*["']?8787:8787["']?\s*(\n|$)/.test(apiBlock)) {
+      missingComposeTerms.push("api must default to loopback port binding and must not expose bare 8787:8787");
     }
 
     if (/(^|\n)\s+build:\s*(\n|$)/.test(apiBlock)) {
@@ -885,6 +1319,14 @@ async function checkProductionCompose(root: string): Promise<ReleaseGateCheck> {
 
     if (apiBlock.includes("siteflow-console:production")) {
       missingComposeTerms.push("api image must not use mutable siteflow-console:production default");
+    }
+
+    if (
+      apiBlock.includes("SITEFLOW_TRUST_PROXY: ${SITEFLOW_TRUST_PROXY:-loopback}") ||
+      apiBlock.includes('SITEFLOW_TRUST_PROXY: "${SITEFLOW_TRUST_PROXY:-loopback}"') ||
+      /(^|\n)\s+SITEFLOW_TRUST_PROXY:\s*["']?loopback["']?\s*(\n|$)/.test(apiBlock)
+    ) {
+      missingComposeTerms.push("api SITEFLOW_TRUST_PROXY must default to disabled/unset");
     }
 
     if (apiBlock.includes("export SITEFLOW_") || apiBlock.includes("$(cat /run/secrets/") || apiBlock.includes("$$(cat /run/secrets/")) {
@@ -910,10 +1352,23 @@ async function checkProductionCompose(root: string): Promise<ReleaseGateCheck> {
       "SITEFLOW_BUILD_MAX_ARTIFACT_BYTES:",
       "SITEFLOW_BUILD_MAX_ARTIFACT_FILES:",
       "SITEFLOW_BUILD_MIN_FREE_BYTES:",
+      "SITEFLOW_BUILD_STEP_TIMEOUT_MS:",
+      "SITEFLOW_GIT_TIMEOUT_MS:",
+      "SITEFLOW_BUILD_MEMORY:",
+      "SITEFLOW_BUILD_CPUS:",
+      "SITEFLOW_BUILD_PIDS_LIMIT:",
+      "SITEFLOW_GIT_SSH_KEY_PATH:",
+      "SITEFLOW_GIT_KNOWN_HOSTS_PATH:",
       "SITEFLOW_BUILD_NETWORK:",
       "DATABASE_URL:",
       "SITEFLOW_APP_SECRET_FILE:",
-      "SITEFLOW_POSTGRES_PASSWORD_FILE:"
+      "SITEFLOW_POSTGRES_PASSWORD_FILE:",
+      "command -v docker",
+      "docker info",
+      "exec node dist-worker/worker/index.js",
+      "healthcheck:",
+      "dist-worker/worker/index.js",
+      "--healthcheck"
     ]) {
       if (!workerBlock.includes(term)) {
         missingComposeTerms.push(`worker ${term}`);
@@ -929,8 +1384,40 @@ async function checkProductionCompose(root: string): Promise<ReleaseGateCheck> {
       missingComposeTerms.push("worker must not export Docker secret values");
     }
 
+    if (/(^|\n)\s+privileged:\s*true\s*(\n|$)/i.test(workerBlock)) {
+      missingComposeTerms.push("worker must not run privileged");
+    }
+
+    if (/(^|\n)\s+cap_add:\s*(\n|$)/i.test(workerBlock)) {
+      missingComposeTerms.push("worker must not add Linux capabilities");
+    }
+
+    if (/seccomp=unconfined|apparmor=unconfined/i.test(workerBlock)) {
+      missingComposeTerms.push("worker must not disable seccomp or AppArmor");
+    }
+
+    if (/(^|\n)\s+network_mode:\s*["']?host["']?\s*(\n|$)/i.test(workerBlock)) {
+      missingComposeTerms.push("worker must not use host network mode");
+    }
+
     if (workerBlock.includes("SITEFLOW_BUILD_IMAGE_ALLOWLIST: ${SITEFLOW_BUILD_IMAGE_ALLOWLIST:?")) {
       missingComposeTerms.push("worker build image allowlist must remain optional for digest-pinned build images");
+    }
+
+    if (
+      workerBlock.includes('user: "${SITEFLOW_WORKER_USER:-0:0}"') ||
+      workerBlock.includes("user: '${SITEFLOW_WORKER_USER:-0:0}'") ||
+      /(^|\n)\s+user:\s*["']?0(?::0)?["']?\s*(\n|$)/.test(workerBlock)
+    ) {
+      missingComposeTerms.push("worker SITEFLOW_WORKER_USER must default to a non-root user");
+    }
+
+    if (
+      workerBlock.includes("${SITEFLOW_DOCKER_SOCKET_GID:-0}") ||
+      workerBlock.includes("${SITEFLOW_DOCKER_SOCKET_GID-0}") ||
+      /(^|\n)\s*-\s*["']?0["']?\s*(\n|$)/.test(workerBlock)
+    ) {
+      missingComposeTerms.push("worker SITEFLOW_DOCKER_SOCKET_GID must be explicitly required instead of defaulting to 0");
     }
 
     if (/(^|\n)\s+build:\s*(\n|$)/.test(workerBlock)) {
@@ -1133,9 +1620,11 @@ async function resolveSecretFileEnvValues(values: Record<string, string | undefi
   const secretKeys = [
     "SITEFLOW_API_TOKEN",
     "SITEFLOW_METRICS_TOKEN",
+    "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY",
     "SITEFLOW_APP_SECRET",
     "SITEFLOW_SEALING_KEY",
-    "SITEFLOW_POSTGRES_PASSWORD"
+    "SITEFLOW_POSTGRES_PASSWORD",
+    ...gitWebhookSecretKeys
   ];
 
   for (const key of secretKeys) {
@@ -1257,6 +1746,34 @@ function productionAppSecretStrengthStatus(values: Record<string, string | undef
   };
 }
 
+function optionalProductionSecretStrengthStatus(values: Record<string, string | undefined>, key: string) {
+  if (!hasNonEmptyValue(values, key) && !hasNonEmptyValue(values, `${key}_FILE`) && !secretSource(values, key)) {
+    return {
+      status: "skipped" as ReleaseGateCheckStatus,
+      source: null,
+      summary: `${key} is not configured.`
+    };
+  }
+
+  return productionSecretStrengthStatus(values, key);
+}
+
+function productionGitWebhookSecretsStrengthStatus(values: Record<string, string | undefined>) {
+  const checks = gitWebhookSecretKeys.map((key) => optionalProductionSecretStrengthStatus(values, key));
+  const configured = checks.filter((check) => check.status !== "skipped");
+  const failures = checks.filter((check) => check.status === "fail");
+
+  return {
+    status: failures.length > 0
+      ? "fail" as ReleaseGateCheckStatus
+      : configured.length > 0
+        ? "pass" as ReleaseGateCheckStatus
+        : "skipped" as ReleaseGateCheckStatus,
+    sources: configured.map((check) => check.source).filter((source): source is string => typeof source === "string"),
+    violations: failures.map((check) => check.summary)
+  };
+}
+
 function databaseUrlHasPassword(value: string | undefined) {
   if (!value) {
     return false;
@@ -1298,19 +1815,30 @@ function productionDatabasePasswordStatus(values: Record<string, string | undefi
 function resolveProductionSecretPosture(values: Record<string, string | undefined>) {
   const apiToken = productionSecretStrengthStatus(values, "SITEFLOW_API_TOKEN");
   const metricsToken = productionMetricsTokenStrengthStatus(values);
+  const releaseEvidenceSigningKey = productionSecretStrengthStatus(values, "SITEFLOW_RELEASE_EVIDENCE_SIGNING_KEY");
   const appSecret = productionAppSecretStrengthStatus(values);
   const postgresPassword = productionDatabasePasswordStatus(values);
+  const gitWebhookSecrets = productionGitWebhookSecretsStrengthStatus(values);
   const secretStrengthViolations = [
     apiToken,
     metricsToken,
-    appSecret
+    releaseEvidenceSigningKey,
+    appSecret,
+    ...gitWebhookSecrets.violations.map((summary) => ({
+      status: "fail" as ReleaseGateCheckStatus,
+      summary
+    }))
   ].filter((result) => result.status === "fail").map((result) => result.summary);
 
   return {
     apiTokenStrengthStatus: apiToken.status,
     metricsTokenStrengthStatus: metricsToken.status,
+    releaseEvidenceSigningKeyStrengthStatus: releaseEvidenceSigningKey.status,
+    releaseEvidenceSigningKeySource: releaseEvidenceSigningKey.source,
     appSecretStrengthStatus: appSecret.status,
     appSecretSource: appSecret.source,
+    gitWebhookSecretStrengthStatus: gitWebhookSecrets.status,
+    gitWebhookSecretSources: gitWebhookSecrets.sources,
     postgresPasswordStatus: postgresPassword.status,
     postgresPasswordSource: postgresPassword.source,
     secretStrengthViolations
@@ -1453,6 +1981,60 @@ function positiveRuntimeIntegerStatus(values: Record<string, string | undefined>
   };
 }
 
+function positiveRuntimeNumberStatus(values: Record<string, string | undefined>, key: string) {
+  const rawValue = normalizedEnvValue(values, key);
+
+  if (!rawValue) {
+    return {
+      status: "fail" as ReleaseGateCheckStatus,
+      value: null,
+      summary: `${key} is required.`
+    };
+  }
+
+  const parsed = Number(rawValue);
+
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return {
+      status: "fail" as ReleaseGateCheckStatus,
+      value: null,
+      summary: `${key} must be a positive number.`
+    };
+  }
+
+  return {
+    status: "pass" as ReleaseGateCheckStatus,
+    value: parsed,
+    summary: `${key} is explicitly configured.`
+  };
+}
+
+function buildMemoryRuntimeStatus(values: Record<string, string | undefined>) {
+  const rawValue = normalizedEnvValue(values, "SITEFLOW_BUILD_MEMORY");
+
+  if (!rawValue) {
+    return {
+      status: "fail" as ReleaseGateCheckStatus,
+      value: null,
+      summary: "SITEFLOW_BUILD_MEMORY is required."
+    };
+  }
+
+  if (!/^[1-9]\d*(?:[bkmg])?$/i.test(rawValue)) {
+    return {
+      status: "fail" as ReleaseGateCheckStatus,
+      value: null,
+      summary: "SITEFLOW_BUILD_MEMORY must be a positive Docker memory value such as 512m or 1g."
+    };
+  }
+
+  return {
+    status: "pass" as ReleaseGateCheckStatus,
+    value: rawValue,
+    summary: "SITEFLOW_BUILD_MEMORY is explicitly configured."
+  };
+}
+
 function buildNetworkRuntimeStatus(values: Record<string, string | undefined>) {
   const buildNetwork = normalizedEnvValue(values, "SITEFLOW_BUILD_NETWORK")?.toLowerCase() ?? null;
 
@@ -1479,6 +2061,59 @@ function buildNetworkRuntimeStatus(values: Record<string, string | undefined>) {
   };
 }
 
+function workerUserRuntimeStatus(values: Record<string, string | undefined>) {
+  const workerUser = normalizedEnvValue(values, "SITEFLOW_WORKER_USER") ?? "1000:1000";
+  const uid = workerUser.split(":")[0]?.trim().toLowerCase();
+
+  if (!/^[0-9]+(?::[0-9]+)?$/.test(workerUser)) {
+    return {
+      status: "fail" as ReleaseGateCheckStatus,
+      workerUser,
+      summary: "SITEFLOW_WORKER_USER must be a numeric user or user:group value."
+    };
+  }
+
+  if (uid === "0") {
+    return {
+      status: "fail" as ReleaseGateCheckStatus,
+      workerUser,
+      summary: "SITEFLOW_WORKER_USER must not run the socket-mounted production worker as root."
+    };
+  }
+
+  return {
+    status: "pass" as ReleaseGateCheckStatus,
+    workerUser,
+    summary: "SITEFLOW_WORKER_USER uses a non-root worker user."
+  };
+}
+
+function dockerSocketGidRuntimeStatus(values: Record<string, string | undefined>) {
+  const rawValue = normalizedEnvValue(values, "SITEFLOW_DOCKER_SOCKET_GID");
+
+  if (!rawValue) {
+    return {
+      status: "fail" as ReleaseGateCheckStatus,
+      value: null,
+      summary: "SITEFLOW_DOCKER_SOCKET_GID is required and must match /var/run/docker.sock group id on the target host."
+    };
+  }
+
+  if (!/^\d+$/.test(rawValue)) {
+    return {
+      status: "fail" as ReleaseGateCheckStatus,
+      value: null,
+      summary: "SITEFLOW_DOCKER_SOCKET_GID must be a numeric group id."
+    };
+  }
+
+  return {
+    status: "pass" as ReleaseGateCheckStatus,
+    value: Number(rawValue),
+    summary: "SITEFLOW_DOCKER_SOCKET_GID is explicitly configured."
+  };
+}
+
 function resolveRuntimeControlPosture(values: Record<string, string | undefined>) {
   const buildMaxArtifactBytes = positiveRuntimeIntegerStatus(values, "SITEFLOW_BUILD_MAX_ARTIFACT_BYTES");
   const buildMaxArtifactFiles = positiveRuntimeIntegerStatus(values, "SITEFLOW_BUILD_MAX_ARTIFACT_FILES");
@@ -1487,7 +2122,12 @@ function resolveRuntimeControlPosture(values: Record<string, string | undefined>
   const prebuiltMaxFiles = positiveRuntimeIntegerStatus(values, "SITEFLOW_PREBUILT_MAX_FILES");
   const buildStepTimeout = positiveRuntimeIntegerStatus(values, "SITEFLOW_BUILD_STEP_TIMEOUT_MS");
   const gitTimeout = positiveRuntimeIntegerStatus(values, "SITEFLOW_GIT_TIMEOUT_MS");
+  const buildMemory = buildMemoryRuntimeStatus(values);
+  const buildCpus = positiveRuntimeNumberStatus(values, "SITEFLOW_BUILD_CPUS");
+  const buildPidsLimit = positiveRuntimeIntegerStatus(values, "SITEFLOW_BUILD_PIDS_LIMIT");
   const buildNetwork = buildNetworkRuntimeStatus(values);
+  const workerUser = workerUserRuntimeStatus(values);
+  const dockerSocketGid = dockerSocketGidRuntimeStatus(values);
   const checks = [
     buildMaxArtifactBytes,
     buildMaxArtifactFiles,
@@ -1496,7 +2136,12 @@ function resolveRuntimeControlPosture(values: Record<string, string | undefined>
     prebuiltMaxFiles,
     buildStepTimeout,
     gitTimeout,
-    buildNetwork
+    buildMemory,
+    buildCpus,
+    buildPidsLimit,
+    buildNetwork,
+    workerUser,
+    dockerSocketGid
   ];
 
   return {
@@ -1514,8 +2159,18 @@ function resolveRuntimeControlPosture(values: Record<string, string | undefined>
     buildStepTimeoutMs: buildStepTimeout.value,
     gitTimeoutStatus: gitTimeout.status,
     gitTimeoutMs: gitTimeout.value,
+    buildMemoryStatus: buildMemory.status,
+    buildMemory: buildMemory.value,
+    buildCpusStatus: buildCpus.status,
+    buildCpus: buildCpus.value,
+    buildPidsLimitStatus: buildPidsLimit.status,
+    buildPidsLimit: buildPidsLimit.value,
     buildNetworkStatus: buildNetwork.status,
     buildNetwork: buildNetwork.buildNetwork,
+    workerUserStatus: workerUser.status,
+    workerUser: workerUser.workerUser,
+    dockerSocketGidStatus: dockerSocketGid.status,
+    dockerSocketGid: dockerSocketGid.value,
     runtimeControlViolations: checks
       .filter((check) => check.status === "fail")
       .map((check) => check.summary)
@@ -1579,8 +2234,12 @@ async function checkRequiredEnvironment(
           unauthenticatedMetricsAllowed: enabledFlag(values.SITEFLOW_ALLOW_UNAUTHENTICATED_METRICS),
           apiTokenStrengthStatus: secretPosture.apiTokenStrengthStatus,
           metricsTokenStrengthStatus: secretPosture.metricsTokenStrengthStatus,
+          releaseEvidenceSigningKeyStrengthStatus: secretPosture.releaseEvidenceSigningKeyStrengthStatus,
+          releaseEvidenceSigningKeySource: secretPosture.releaseEvidenceSigningKeySource,
           appSecretStrengthStatus: secretPosture.appSecretStrengthStatus,
           appSecretSource: secretPosture.appSecretSource,
+          gitWebhookSecretStrengthStatus: secretPosture.gitWebhookSecretStrengthStatus,
+          gitWebhookSecretSources: secretPosture.gitWebhookSecretSources,
           postgresPasswordStatus: secretPosture.postgresPasswordStatus,
           postgresPasswordSource: secretPosture.postgresPasswordSource,
           browserTokenFallbackEnabled,
@@ -1611,8 +2270,18 @@ async function checkRequiredEnvironment(
           buildStepTimeoutMs: runtimeControls.buildStepTimeoutMs,
           gitTimeoutStatus: runtimeControls.gitTimeoutStatus,
           gitTimeoutMs: runtimeControls.gitTimeoutMs,
+          buildMemoryStatus: runtimeControls.buildMemoryStatus,
+          buildMemory: runtimeControls.buildMemory,
+          buildCpusStatus: runtimeControls.buildCpusStatus,
+          buildCpus: runtimeControls.buildCpus,
+          buildPidsLimitStatus: runtimeControls.buildPidsLimitStatus,
+          buildPidsLimit: runtimeControls.buildPidsLimit,
           buildNetworkStatus: runtimeControls.buildNetworkStatus,
           buildNetwork: runtimeControls.buildNetwork,
+          workerUserStatus: runtimeControls.workerUserStatus,
+          workerUser: runtimeControls.workerUser,
+          dockerSocketGidStatus: runtimeControls.dockerSocketGidStatus,
+          dockerSocketGid: runtimeControls.dockerSocketGid,
           runtimeControlViolations: runtimeControls.runtimeControlViolations,
           secretStrengthViolations: secretPosture.secretStrengthViolations,
           missing: missing.map((group) => ({
@@ -1633,8 +2302,12 @@ async function checkRequiredEnvironment(
         unauthenticatedMetricsAllowed: enabledFlag(values.SITEFLOW_ALLOW_UNAUTHENTICATED_METRICS),
         apiTokenStrengthStatus: secretPosture.apiTokenStrengthStatus,
         metricsTokenStrengthStatus: secretPosture.metricsTokenStrengthStatus,
+        releaseEvidenceSigningKeyStrengthStatus: secretPosture.releaseEvidenceSigningKeyStrengthStatus,
+        releaseEvidenceSigningKeySource: secretPosture.releaseEvidenceSigningKeySource,
         appSecretStrengthStatus: secretPosture.appSecretStrengthStatus,
         appSecretSource: secretPosture.appSecretSource,
+        gitWebhookSecretStrengthStatus: secretPosture.gitWebhookSecretStrengthStatus,
+        gitWebhookSecretSources: secretPosture.gitWebhookSecretSources,
         postgresPasswordStatus: secretPosture.postgresPasswordStatus,
         postgresPasswordSource: secretPosture.postgresPasswordSource,
         browserTokenFallbackEnabled,
@@ -1665,8 +2338,18 @@ async function checkRequiredEnvironment(
         buildStepTimeoutMs: runtimeControls.buildStepTimeoutMs,
         gitTimeoutStatus: runtimeControls.gitTimeoutStatus,
         gitTimeoutMs: runtimeControls.gitTimeoutMs,
+        buildMemoryStatus: runtimeControls.buildMemoryStatus,
+        buildMemory: runtimeControls.buildMemory,
+        buildCpusStatus: runtimeControls.buildCpusStatus,
+        buildCpus: runtimeControls.buildCpus,
+        buildPidsLimitStatus: runtimeControls.buildPidsLimitStatus,
+        buildPidsLimit: runtimeControls.buildPidsLimit,
         buildNetworkStatus: runtimeControls.buildNetworkStatus,
         buildNetwork: runtimeControls.buildNetwork,
+        workerUserStatus: runtimeControls.workerUserStatus,
+        workerUser: runtimeControls.workerUser,
+        dockerSocketGidStatus: runtimeControls.dockerSocketGidStatus,
+        dockerSocketGid: runtimeControls.dockerSocketGid,
         runtimeControlViolations: runtimeControls.runtimeControlViolations
       }
     };
@@ -1724,6 +2407,298 @@ function requiredStatusChecksFromResponse(body: unknown) {
     : [];
 
   return [...new Set([...contexts, ...checks])];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function booleanEnabledValue(value: unknown) {
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  return typeof value.enabled === "boolean" ? value.enabled : undefined;
+}
+
+function requiredPullRequestReviewsFromProtection(value: unknown) {
+  if (value === null) {
+    return false;
+  }
+
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  const requiredReviewCount = value.required_approving_review_count;
+
+  if (typeof requiredReviewCount === "number") {
+    return requiredReviewCount > 0;
+  }
+
+  return true;
+}
+
+function requiredStatusChecksFromProtectionResponse(body: unknown) {
+  if (!isRecord(body)) {
+    return [];
+  }
+
+  return requiredStatusChecksFromResponse(body.required_status_checks);
+}
+
+interface GitHubBranchProtectionHardeningEvidence {
+  requiredStatusChecks: string[];
+  pullRequestReviewsRequired?: boolean;
+  forcePushesBlocked?: boolean;
+  linearHistoryRequired?: boolean;
+  signedCommitsRequired?: boolean;
+  sources: string[];
+}
+
+function branchProtectionHardeningFromResponse(body: unknown): GitHubBranchProtectionHardeningEvidence {
+  const evidence: GitHubBranchProtectionHardeningEvidence = {
+    requiredStatusChecks: requiredStatusChecksFromProtectionResponse(body),
+    sources: []
+  };
+
+  if (!isRecord(body)) {
+    return evidence;
+  }
+
+  const pullRequestReviewsRequired = requiredPullRequestReviewsFromProtection(body.required_pull_request_reviews);
+  const allowForcePushes = booleanEnabledValue(body.allow_force_pushes);
+  const requiredLinearHistory = booleanEnabledValue(body.required_linear_history);
+  const requiredSignatures = booleanEnabledValue(body.required_signatures);
+
+  if (pullRequestReviewsRequired !== undefined) {
+    evidence.pullRequestReviewsRequired = pullRequestReviewsRequired;
+    evidence.sources.push("branch_protection.required_pull_request_reviews");
+  }
+
+  if (allowForcePushes !== undefined) {
+    evidence.forcePushesBlocked = !allowForcePushes;
+    evidence.sources.push("branch_protection.allow_force_pushes");
+  }
+
+  if (requiredLinearHistory !== undefined) {
+    evidence.linearHistoryRequired = requiredLinearHistory;
+    evidence.sources.push("branch_protection.required_linear_history");
+  }
+
+  if (requiredSignatures !== undefined) {
+    evidence.signedCommitsRequired = requiredSignatures;
+    evidence.sources.push("branch_protection.required_signatures");
+  }
+
+  return evidence;
+}
+
+function rulesetsFromResponse(body: unknown) {
+  if (Array.isArray(body)) {
+    return body.filter(isRecord);
+  }
+
+  if (isRecord(body) && Array.isArray(body.rulesets)) {
+    return body.rulesets.filter(isRecord);
+  }
+
+  return undefined;
+}
+
+function globPatternMatches(value: string, pattern: string) {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+
+  return new RegExp(`^${escaped}$`).test(value);
+}
+
+function refPatternMatchesBranch(pattern: unknown, branch: string) {
+  if (typeof pattern !== "string" || !pattern.trim()) {
+    return false;
+  }
+
+  const normalized = pattern.trim();
+  const branchRef = `refs/heads/${branch}`;
+
+  return normalized === "~DEFAULT_BRANCH"
+    || normalized === branch
+    || normalized === branchRef
+    || globPatternMatches(branch, normalized)
+    || globPatternMatches(branchRef, normalized);
+}
+
+function rulesetAppliesToBranch(ruleset: Record<string, unknown>, branch: string) {
+  const target = typeof ruleset.target === "string" ? ruleset.target : "branch";
+
+  if (target !== "branch") {
+    return false;
+  }
+
+  const enforcement = typeof ruleset.enforcement === "string" ? ruleset.enforcement : "active";
+
+  if (enforcement !== "active") {
+    return false;
+  }
+
+  const conditions = isRecord(ruleset.conditions) ? ruleset.conditions : undefined;
+  const refName = conditions && isRecord(conditions.ref_name) ? conditions.ref_name : undefined;
+
+  if (!refName) {
+    return true;
+  }
+
+  const includes = Array.isArray(refName.include) ? refName.include : [];
+  const excludes = Array.isArray(refName.exclude) ? refName.exclude : [];
+
+  if (excludes.some((pattern) => refPatternMatchesBranch(pattern, branch))) {
+    return false;
+  }
+
+  return includes.length === 0 || includes.some((pattern) => refPatternMatchesBranch(pattern, branch));
+}
+
+function requiredStatusChecksFromRulesetRule(rule: Record<string, unknown>) {
+  const parameters = isRecord(rule.parameters) ? rule.parameters : {};
+  const requiredStatusChecks = parameters.required_status_checks;
+
+  if (!Array.isArray(requiredStatusChecks)) {
+    return [];
+  }
+
+  return requiredStatusChecks
+    .map((check) => {
+      if (!isRecord(check)) {
+        return undefined;
+      }
+
+      const context = check.context ?? check.name;
+
+      return typeof context === "string" ? context : undefined;
+    })
+    .filter((context): context is string => typeof context === "string");
+}
+
+function rulesetHardeningFromResponse(body: unknown, branch: string): GitHubBranchProtectionHardeningEvidence | undefined {
+  const rulesets = rulesetsFromResponse(body);
+
+  if (!rulesets) {
+    return undefined;
+  }
+
+  const evidence: GitHubBranchProtectionHardeningEvidence = {
+    requiredStatusChecks: [],
+    sources: []
+  };
+
+  for (const ruleset of rulesets) {
+    if (!rulesetAppliesToBranch(ruleset, branch) || !Array.isArray(ruleset.rules)) {
+      continue;
+    }
+
+    const rulesetName = typeof ruleset.name === "string" ? ruleset.name : "unnamed";
+
+    for (const rule of ruleset.rules.filter(isRecord)) {
+      const type = typeof rule.type === "string" ? rule.type : undefined;
+
+      if (!type) {
+        continue;
+      }
+
+      const source = `ruleset.${rulesetName}.${type}`;
+
+      if (type === "required_status_checks") {
+        evidence.requiredStatusChecks.push(...requiredStatusChecksFromRulesetRule(rule));
+        evidence.sources.push(source);
+      } else if (type === "pull_request") {
+        evidence.pullRequestReviewsRequired = true;
+        evidence.sources.push(source);
+      } else if (type === "non_fast_forward") {
+        evidence.forcePushesBlocked = true;
+        evidence.sources.push(source);
+      } else if (type === "required_linear_history") {
+        evidence.linearHistoryRequired = true;
+        evidence.sources.push(source);
+      } else if (type === "required_signatures") {
+        evidence.signedCommitsRequired = true;
+        evidence.sources.push(source);
+      }
+    }
+  }
+
+  evidence.requiredStatusChecks = [...new Set(evidence.requiredStatusChecks)];
+  evidence.sources = [...new Set(evidence.sources)];
+
+  return evidence;
+}
+
+function mergeHardeningEvidence(
+  left: GitHubBranchProtectionHardeningEvidence,
+  right: GitHubBranchProtectionHardeningEvidence
+): GitHubBranchProtectionHardeningEvidence {
+  return {
+    requiredStatusChecks: [...new Set([...left.requiredStatusChecks, ...right.requiredStatusChecks])],
+    pullRequestReviewsRequired: left.pullRequestReviewsRequired === true || right.pullRequestReviewsRequired === true
+      ? true
+      : left.pullRequestReviewsRequired ?? right.pullRequestReviewsRequired,
+    forcePushesBlocked: left.forcePushesBlocked === true || right.forcePushesBlocked === true
+      ? true
+      : left.forcePushesBlocked ?? right.forcePushesBlocked,
+    linearHistoryRequired: left.linearHistoryRequired === true || right.linearHistoryRequired === true
+      ? true
+      : left.linearHistoryRequired ?? right.linearHistoryRequired,
+    signedCommitsRequired: left.signedCommitsRequired === true || right.signedCommitsRequired === true
+      ? true
+      : left.signedCommitsRequired ?? right.signedCommitsRequired,
+    sources: [...new Set([...left.sources, ...right.sources])]
+  };
+}
+
+function hardeningFailures(evidence: GitHubBranchProtectionHardeningEvidence, requiredStatusCheck: string) {
+  const failures: string[] = [];
+
+  if (!evidence.requiredStatusChecks.includes(requiredStatusCheck)) {
+    failures.push(`required status check ${requiredStatusCheck}`);
+  }
+
+  if (evidence.pullRequestReviewsRequired === false) {
+    failures.push("required pull request reviews");
+  }
+
+  if (evidence.forcePushesBlocked === false) {
+    failures.push("force-push prohibition");
+  }
+
+  if (evidence.linearHistoryRequired === false) {
+    failures.push("required linear history");
+  }
+
+  if (evidence.signedCommitsRequired === false) {
+    failures.push("signed commits");
+  }
+
+  return failures;
+}
+
+function hardeningUnknowns(evidence: GitHubBranchProtectionHardeningEvidence) {
+  const unknowns: string[] = [];
+
+  if (evidence.pullRequestReviewsRequired === undefined) {
+    unknowns.push("required pull request reviews");
+  }
+
+  if (evidence.forcePushesBlocked === undefined) {
+    unknowns.push("force-push prohibition");
+  }
+
+  if (evidence.linearHistoryRequired === undefined) {
+    unknowns.push("required linear history");
+  }
+
+  return unknowns;
 }
 
 interface GitHubCheckRunSummary {
@@ -1826,14 +2801,16 @@ async function checkGitHubBranchProtection(options: ReleaseGateOptions): Promise
 
   const fetchImpl = options.fetch ?? fetch;
   const url = `https://api.github.com/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}/branches/${encodeURIComponent(branch)}/protection/required_status_checks`;
+  const repositoryName = `${repository.owner}/${repository.name}`;
+  const requestHeaders = {
+    accept: "application/vnd.github+json",
+    authorization: `Bearer ${token}`,
+    "x-github-api-version": "2022-11-28"
+  };
 
   try {
     const response = await fetchImpl(url, {
-      headers: {
-        accept: "application/vnd.github+json",
-        authorization: `Bearer ${token}`,
-        "x-github-api-version": "2022-11-28"
-      }
+      headers: requestHeaders
     });
 
     if (!response.ok) {
@@ -1842,12 +2819,12 @@ async function checkGitHubBranchProtection(options: ReleaseGateOptions): Promise
       return {
         id: "external.githubBranchProtection",
         label: "GitHub branch protection",
-        status: "fail",
+        status: options.promotion ? "manual_required" : "fail",
         summary: body?.message ?? `GitHub branch protection check failed with HTTP ${response.status}.`,
         remediation: "Require CI status checks on the main branch before release promotion.",
         details: {
           branch,
-          repository: `${repository.owner}/${repository.name}`,
+          repository: repositoryName,
           requiredStatusCheck,
           httpStatus: response.status
         }
@@ -1855,6 +2832,10 @@ async function checkGitHubBranchProtection(options: ReleaseGateOptions): Promise
     }
 
     const requiredStatusChecks = requiredStatusChecksFromResponse(await response.json());
+    let hardeningEvidence: GitHubBranchProtectionHardeningEvidence = {
+      requiredStatusChecks,
+      sources: requiredStatusChecks.length > 0 ? ["branch_protection.required_status_checks"] : []
+    };
 
     if (requiredStatusChecks.length === 0) {
       return {
@@ -1865,7 +2846,7 @@ async function checkGitHubBranchProtection(options: ReleaseGateOptions): Promise
         remediation: "Require the CI workflow job before merging to main.",
         details: {
           branch,
-          repository: `${repository.owner}/${repository.name}`,
+          repository: repositoryName,
           requiredStatusCheck
         }
       };
@@ -1880,11 +2861,100 @@ async function checkGitHubBranchProtection(options: ReleaseGateOptions): Promise
         remediation: "Require the SiteFlow CI workflow job before merging to main, or pass --required-status-check with the actual protected check name.",
         details: {
           branch,
-          repository: `${repository.owner}/${repository.name}`,
+          repository: repositoryName,
           requiredStatusCheck,
           requiredStatusChecks
         }
       };
+    }
+
+    const explicitCommitRef = options.commitSha ?? env.GITHUB_SHA;
+    const skipPromotionHardening = Boolean(options.promotion && explicitCommitRef && !isFullGitSha(explicitCommitRef));
+
+    if (options.promotion && !skipPromotionHardening) {
+      const apiIssues: string[] = [];
+      const protectionUrl = `https://api.github.com/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}/branches/${encodeURIComponent(branch)}/protection`;
+      const protectionResponse = await fetchImpl(protectionUrl, {
+        headers: requestHeaders
+      });
+
+      if (protectionResponse.ok) {
+        hardeningEvidence = mergeHardeningEvidence(
+          hardeningEvidence,
+          branchProtectionHardeningFromResponse(await protectionResponse.json())
+        );
+      } else {
+        const body = (await protectionResponse.json().catch(() => undefined)) as { message?: string } | undefined;
+        apiIssues.push(body?.message ?? `GitHub branch protection hardening check failed with HTTP ${protectionResponse.status}.`);
+      }
+
+      let failures = hardeningFailures(hardeningEvidence, requiredStatusCheck);
+      let unknowns = hardeningUnknowns(hardeningEvidence);
+
+      if (failures.length > 0 || unknowns.length > 0) {
+        const rulesetsUrl = new URL(
+          `https://api.github.com/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}/rulesets`
+        );
+        rulesetsUrl.searchParams.set("targets", "branch");
+        rulesetsUrl.searchParams.set("includes_parents", "true");
+
+        const rulesetsResponse = await fetchImpl(rulesetsUrl, {
+          headers: requestHeaders
+        });
+
+        if (rulesetsResponse.ok) {
+          const rulesetEvidence = rulesetHardeningFromResponse(await rulesetsResponse.json(), branch);
+
+          if (rulesetEvidence) {
+            hardeningEvidence = mergeHardeningEvidence(hardeningEvidence, rulesetEvidence);
+          } else {
+            apiIssues.push("GitHub rulesets response did not include a parseable ruleset list.");
+          }
+        } else {
+          const body = (await rulesetsResponse.json().catch(() => undefined)) as { message?: string } | undefined;
+          apiIssues.push(body?.message ?? `GitHub rulesets check failed with HTTP ${rulesetsResponse.status}.`);
+        }
+
+        failures = hardeningFailures(hardeningEvidence, requiredStatusCheck);
+        unknowns = hardeningUnknowns(hardeningEvidence);
+      }
+
+      const details = {
+        branch,
+        repository: repositoryName,
+        requiredStatusCheck,
+        requiredStatusChecks: hardeningEvidence.requiredStatusChecks,
+        pullRequestReviewsRequired: hardeningEvidence.pullRequestReviewsRequired ?? null,
+        forcePushesBlocked: hardeningEvidence.forcePushesBlocked ?? null,
+        linearHistoryRequired: hardeningEvidence.linearHistoryRequired ?? null,
+        signedCommitsRequired: hardeningEvidence.signedCommitsRequired ?? null,
+        hardeningSources: hardeningEvidence.sources,
+        ...(unknowns.length > 0 ? { hardeningUnknowns: unknowns } : {}),
+        ...(failures.length > 0 ? { hardeningFailures: failures } : {}),
+        ...(apiIssues.length > 0 ? { apiIssues } : {})
+      };
+
+      if (failures.length > 0) {
+        return {
+          id: "external.githubBranchProtection",
+          label: "GitHub branch protection",
+          status: "fail",
+          summary: `GitHub branch protection or rulesets for ${branch} do not satisfy production promotion hardening: ${failures.join(", ")}.`,
+          remediation: "Require CI status checks, pull request reviews, non-fast-forward protection, and linear history before promotion.",
+          details
+        };
+      }
+
+      if (unknowns.length > 0) {
+        return {
+          id: "external.githubBranchProtection",
+          label: "GitHub branch protection",
+          status: "manual_required",
+          summary: `GitHub branch protection or rulesets for ${branch} could not prove production promotion hardening: ${[...unknowns, ...apiIssues].join(", ")}.`,
+          remediation: "Retry with a token that can read branch protection and rulesets, or block promotion until the repository policy is manually verified.",
+          details
+        };
+      }
     }
 
     return {
@@ -1894,21 +2964,34 @@ async function checkGitHubBranchProtection(options: ReleaseGateOptions): Promise
       summary: `GitHub branch protection for ${branch} requires expected CI check: ${requiredStatusCheck}.`,
       details: {
         branch,
-        repository: `${repository.owner}/${repository.name}`,
+        repository: repositoryName,
         requiredStatusCheck,
-        requiredStatusChecks
+        requiredStatusChecks: hardeningEvidence.requiredStatusChecks,
+        ...(hardeningEvidence.pullRequestReviewsRequired !== undefined
+          ? { pullRequestReviewsRequired: hardeningEvidence.pullRequestReviewsRequired }
+          : {}),
+        ...(hardeningEvidence.forcePushesBlocked !== undefined
+          ? { forcePushesBlocked: hardeningEvidence.forcePushesBlocked }
+          : {}),
+        ...(hardeningEvidence.linearHistoryRequired !== undefined
+          ? { linearHistoryRequired: hardeningEvidence.linearHistoryRequired }
+          : {}),
+        ...(hardeningEvidence.signedCommitsRequired !== undefined
+          ? { signedCommitsRequired: hardeningEvidence.signedCommitsRequired }
+          : {}),
+        ...(hardeningEvidence.sources.length > 0 ? { hardeningSources: hardeningEvidence.sources } : {})
       }
     };
   } catch (error) {
     return {
       id: "external.githubBranchProtection",
       label: "GitHub branch protection",
-      status: "fail",
+      status: options.promotion ? "manual_required" : "fail",
       summary: error instanceof Error ? error.message : "Unable to verify GitHub branch protection.",
       remediation: "Retry with network access or verify branch protection manually before release.",
       details: {
         branch,
-        repository: `${repository.owner}/${repository.name}`,
+        repository: repositoryName,
         requiredStatusCheck
       }
     };
@@ -2319,6 +3402,19 @@ function buildReleaseGatePromotionEvidence(
       requiredStatusCheck: detailString(branchProtection?.details, "requiredStatusCheck") ?? requiredStatusCheck,
       ...(detailStringArray(branchProtection?.details, "requiredStatusChecks")
         ? { requiredStatusChecks: detailStringArray(branchProtection?.details, "requiredStatusChecks") }
+        : {}),
+      pullRequestReviewsRequired: detailBoolean(branchProtection?.details, "pullRequestReviewsRequired") ?? null,
+      forcePushesBlocked: detailBoolean(branchProtection?.details, "forcePushesBlocked") ?? null,
+      linearHistoryRequired: detailBoolean(branchProtection?.details, "linearHistoryRequired") ?? null,
+      signedCommitsRequired: detailBoolean(branchProtection?.details, "signedCommitsRequired") ?? null,
+      ...(detailStringArray(branchProtection?.details, "hardeningSources")
+        ? { hardeningSources: detailStringArray(branchProtection?.details, "hardeningSources") }
+        : {}),
+      ...(detailStringArray(branchProtection?.details, "hardeningUnknowns")
+        ? { hardeningUnknowns: detailStringArray(branchProtection?.details, "hardeningUnknowns") }
+        : {}),
+      ...(detailStringArray(branchProtection?.details, "hardeningFailures")
+        ? { hardeningFailures: detailStringArray(branchProtection?.details, "hardeningFailures") }
         : {})
     },
     protectedBranchCommit: {
@@ -2351,8 +3447,12 @@ function buildReleaseGatePromotionEvidence(
       unauthenticatedMetricsAllowed: detailBoolean(runtimeEnv?.details, "unauthenticatedMetricsAllowed") ?? null,
       apiTokenStrengthStatus: runtimeEnv?.details?.apiTokenStrengthStatus as ReleaseGateCheckStatus | undefined ?? null,
       metricsTokenStrengthStatus: runtimeEnv?.details?.metricsTokenStrengthStatus as ReleaseGateCheckStatus | undefined ?? null,
+      releaseEvidenceSigningKeyStrengthStatus: runtimeEnv?.details?.releaseEvidenceSigningKeyStrengthStatus as ReleaseGateCheckStatus | undefined ?? null,
+      releaseEvidenceSigningKeySource: detailString(runtimeEnv?.details, "releaseEvidenceSigningKeySource") ?? null,
       appSecretStrengthStatus: runtimeEnv?.details?.appSecretStrengthStatus as ReleaseGateCheckStatus | undefined ?? null,
       appSecretSource: detailString(runtimeEnv?.details, "appSecretSource") ?? null,
+      gitWebhookSecretStrengthStatus: runtimeEnv?.details?.gitWebhookSecretStrengthStatus as ReleaseGateCheckStatus | undefined ?? null,
+      gitWebhookSecretSources: detailStringArray(runtimeEnv?.details, "gitWebhookSecretSources") ?? [],
       postgresPasswordStatus: runtimeEnv?.details?.postgresPasswordStatus as ReleaseGateCheckStatus | undefined ?? null,
       postgresPasswordSource: detailString(runtimeEnv?.details, "postgresPasswordSource") ?? null,
       browserTokenFallbackEnabled: detailBoolean(runtimeEnv?.details, "browserTokenFallbackEnabled") ?? null,
@@ -2383,8 +3483,18 @@ function buildReleaseGatePromotionEvidence(
       buildStepTimeoutMs: detailNumber(runtimeEnv?.details, "buildStepTimeoutMs") ?? null,
       gitTimeoutStatus: runtimeEnv?.details?.gitTimeoutStatus as ReleaseGateCheckStatus | undefined ?? null,
       gitTimeoutMs: detailNumber(runtimeEnv?.details, "gitTimeoutMs") ?? null,
+      buildMemoryStatus: runtimeEnv?.details?.buildMemoryStatus as ReleaseGateCheckStatus | undefined ?? null,
+      buildMemory: detailString(runtimeEnv?.details, "buildMemory") ?? null,
+      buildCpusStatus: runtimeEnv?.details?.buildCpusStatus as ReleaseGateCheckStatus | undefined ?? null,
+      buildCpus: detailNumber(runtimeEnv?.details, "buildCpus") ?? null,
+      buildPidsLimitStatus: runtimeEnv?.details?.buildPidsLimitStatus as ReleaseGateCheckStatus | undefined ?? null,
+      buildPidsLimit: detailNumber(runtimeEnv?.details, "buildPidsLimit") ?? null,
       buildNetworkStatus: runtimeEnv?.details?.buildNetworkStatus as ReleaseGateCheckStatus | undefined ?? null,
       buildNetwork: detailString(runtimeEnv?.details, "buildNetwork") ?? null,
+      workerUserStatus: runtimeEnv?.details?.workerUserStatus as ReleaseGateCheckStatus | undefined ?? null,
+      workerUser: detailString(runtimeEnv?.details, "workerUser") ?? null,
+      dockerSocketGidStatus: runtimeEnv?.details?.dockerSocketGidStatus as ReleaseGateCheckStatus | undefined ?? null,
+      dockerSocketGid: detailNumber(runtimeEnv?.details, "dockerSocketGid") ?? null,
       ...(runtimeEnv?.details?.runtimeControlViolations ? { runtimeControlViolations: runtimeEnv.details.runtimeControlViolations } : {}),
       ...(runtimeEnv?.details?.secretStrengthViolations ? { secretStrengthViolations: runtimeEnv.details.secretStrengthViolations } : {}),
       ...(runtimeEnv?.details?.missing ? { missing: runtimeEnv.details.missing } : {})
@@ -2410,6 +3520,8 @@ export async function runReleaseGate(options: ReleaseGateOptions = {}): Promise<
   const checks = await Promise.all([
     checkCiWorkflow(root),
     checkReleasePreflightWorkflow(root),
+    checkReleaseImageWorkflow(root),
+    checkPackageScripts(root),
     checkProductionDocs(root),
     checkProductionCompose(root),
     checkReleaseSourceTree(root, runner),

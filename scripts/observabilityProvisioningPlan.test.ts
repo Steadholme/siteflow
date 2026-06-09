@@ -65,7 +65,7 @@ describe("observabilityProvisioningPlan", () => {
     expect(scrape).not.toContain("super-secret");
   });
 
-  it("renders minimum alert rules for readiness, metrics, HTTP, queue, and runtime errors", () => {
+  it("renders minimum alert rules for readiness, metrics, HTTP, queue, runtime, storage, and backup errors", () => {
     const rules = assetContent(generateObservabilityProvisioningPlan({ now }), "prometheus-rules.yaml");
 
     expect(rules).toContain("SiteFlowReadinessDown");
@@ -84,6 +84,16 @@ describe("observabilityProvisioningPlan", () => {
     expect(rules).toContain("siteflow_build_job_oldest_running_heartbeat_age_seconds");
     expect(rules).toContain("SiteFlowRuntimeMetricsCollectionFailed");
     expect(rules).toContain("siteflow_runtime_metrics_collection_error");
+    expect(rules).toContain("SiteFlowStorageMetricsCollectionFailed");
+    expect(rules).toContain("siteflow_storage_metrics_collection_error");
+    expect(rules).toContain("SiteFlowStoragePathMissing");
+    expect(rules).toContain("siteflow_storage_missing_paths");
+    expect(rules).toContain("SiteFlowArtifactStorageLow");
+    expect(rules).toContain("siteflow_storage_artifact_free_bytes");
+    expect(rules).toContain("SiteFlowEvidenceStorageLow");
+    expect(rules).toContain("siteflow_storage_evidence_free_bytes");
+    expect(rules).toContain("SiteFlowTempStorageLow");
+    expect(rules).toContain("siteflow_storage_temp_free_bytes");
     expect(rules).toContain("SiteFlowBackupMetricsCollectionFailed");
     expect(rules).toContain("siteflow_backup_metrics_collection_error");
     expect(rules).toContain("SiteFlowBackupAutomationStale");
@@ -112,7 +122,7 @@ describe("observabilityProvisioningPlan", () => {
     expect(route).not.toContain("secret");
   });
 
-  it("renders a parseable Grafana dashboard that references HTTP and runtime metrics", () => {
+  it("renders a parseable Grafana dashboard that references HTTP, runtime, storage, and backup metrics", () => {
     const dashboardJson = assetContent(
       generateObservabilityProvisioningPlan({
         now,
@@ -129,6 +139,11 @@ describe("observabilityProvisioningPlan", () => {
     expect(dashboardJson).toContain("siteflow_http_requests_total");
     expect(dashboardJson).toContain("siteflow_build_jobs_queued");
     expect(dashboardJson).toContain("siteflow_runtime_metrics_collection_error");
+    expect(dashboardJson).toContain("siteflow_storage_artifact_free_bytes");
+    expect(dashboardJson).toContain("siteflow_storage_evidence_free_bytes");
+    expect(dashboardJson).toContain("siteflow_storage_temp_free_bytes");
+    expect(dashboardJson).toContain("siteflow_storage_missing_paths");
+    expect(dashboardJson).toContain("siteflow_storage_metrics_collection_error");
     expect(dashboardJson).toContain("siteflow_backup_automation_last_success_age_seconds");
     expect(dashboardJson).toContain("siteflow_backup_restore_drill_last_success_age_seconds");
     expect(dashboardJson).toContain("siteflow_backup_metrics_collection_error");

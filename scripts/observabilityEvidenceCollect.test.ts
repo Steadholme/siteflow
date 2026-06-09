@@ -38,6 +38,11 @@ function metricsText() {
     "siteflow_build_job_oldest_queued_age_seconds 1.5e2",
     "siteflow_build_job_oldest_running_heartbeat_age_seconds 0",
     "siteflow_runtime_metrics_collection_error 0",
+    "siteflow_storage_artifact_free_bytes 10737418240",
+    "siteflow_storage_evidence_free_bytes 5368709120",
+    "siteflow_storage_temp_free_bytes 268435456",
+    "siteflow_storage_missing_paths 0",
+    "siteflow_storage_metrics_collection_error 0",
     "siteflow_backup_automation_last_success_age_seconds 600",
     "siteflow_backup_restore_drill_last_success_age_seconds 900",
     "siteflow_backup_offload_last_success_age_seconds 800",
@@ -886,6 +891,101 @@ describe("observabilityEvidenceCollect", () => {
       observabilityTargetStackProof: {
         status: "blocked",
         observedStatusCode: 401
+      }
+    });
+  });
+
+  it("blocks production collection when target-stack proof API URL is missing", async () => {
+    const { fetchImpl } = makeFetch();
+
+    const result = await collectObservabilityEvidence({
+      baseUrl: "https://siteflow.example.com",
+      env: {
+        SITEFLOW_METRICS_TOKEN: metricsToken
+      },
+      fetchImpl,
+      targetEnvironment: "production",
+      now
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "target_stack_proof_configured",
+          status: "fail"
+        }),
+        expect.objectContaining({
+          name: "target_stack_proof_collected",
+          status: "fail"
+        })
+      ])
+    );
+  });
+
+  it("reads target-stack proof API token from _FILE without serializing it", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-observability-target-stack-token-file-"));
+    const tokenPath = path.join(root, "target-stack-token");
+    const { fetchImpl, calls } = makeFetch();
+
+    try {
+      await writeFile(tokenPath, `${targetStackToken}\n`, "utf8");
+
+      const result = await collectObservabilityEvidence({
+        baseUrl: "https://siteflow.example.com",
+        env: {
+          SITEFLOW_METRICS_TOKEN: metricsToken,
+          SITEFLOW_OBSERVABILITY_STACK_TOKEN_FILE: tokenPath
+        },
+        fetchImpl,
+        targetEnvironment: "production",
+        targetStackApiUrl: "https://observability.example.com/siteflow-proof",
+        now
+      });
+
+      expect(result.status).toBe("collected");
+      expect(calls.find((call) => call.input === "https://observability.example.com/siteflow-proof")?.init?.headers).toEqual({
+        authorization: `Bearer ${targetStackToken}`
+      });
+      expect(JSON.stringify(result)).not.toContain(targetStackToken);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks target-stack dry-run proof before treating collector output as collected", async () => {
+    const { fetchImpl } = makeFetch({
+      targetStackBody: {
+        ...targetStackProof(),
+        dryRun: true
+      }
+    });
+
+    const result = await collectObservabilityEvidence({
+      baseUrl: "https://siteflow.example.com",
+      env: {
+        SITEFLOW_METRICS_TOKEN: metricsToken,
+        SITEFLOW_OBSERVABILITY_STACK_TOKEN: targetStackToken
+      },
+      fetchImpl,
+      targetStackApiUrl: "https://observability.example.com/siteflow-proof",
+      now
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "target_stack_proof_collected",
+          status: "fail"
+        })
+      ])
+    );
+    expect(result.evidence).toMatchObject({
+      observabilityTargetStackProof: {
+        status: "blocked",
+        dryRun: true,
+        message: "Target-stack API proof must come from a real target stack query, not a template or dry-run."
       }
     });
   });

@@ -9,6 +9,7 @@ export interface EvidenceSecretScanOptions {
 }
 
 const defaultMaxFindings = 25;
+const maxJsonStringDepth = 4;
 
 const sensitiveValuePatterns: Array<{ reason: string; pattern: RegExp }> = [
   {
@@ -109,13 +110,28 @@ function addFinding(
   }
 }
 
+function parsedJsonValue(value: string) {
+  const trimmed = value.trim();
+
+  if (!trimmed || !["{", "[", "\""].includes(trimmed[0])) {
+    return undefined;
+  }
+
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
 function scanValue(
   value: unknown,
   path: string,
   key: string | undefined,
   findings: EvidenceSecretFinding[],
   maxFindings: number,
-  seen: WeakSet<object>
+  seen: WeakSet<object>,
+  jsonStringDepth = 0
 ) {
   if (findings.length >= maxFindings) {
     return;
@@ -134,6 +150,14 @@ function scanValue(
       addFinding(findings, { path, key, reason: keyReason }, maxFindings);
     }
 
+    if (findings.length < maxFindings && jsonStringDepth < maxJsonStringDepth) {
+      const parsed = parsedJsonValue(value);
+
+      if (parsed !== undefined) {
+        scanValue(parsed, pathKey(path, "__json"), key, findings, maxFindings, seen, jsonStringDepth + 1);
+      }
+    }
+
     return;
   }
 
@@ -148,12 +172,12 @@ function scanValue(
   seen.add(value);
 
   if (Array.isArray(value)) {
-    value.forEach((entry, index) => scanValue(entry, arrayPath(path, index), undefined, findings, maxFindings, seen));
+    value.forEach((entry, index) => scanValue(entry, arrayPath(path, index), undefined, findings, maxFindings, seen, jsonStringDepth));
     return;
   }
 
   for (const [entryKey, entryValue] of Object.entries(value)) {
-    scanValue(entryValue, pathKey(path, entryKey), entryKey, findings, maxFindings, seen);
+    scanValue(entryValue, pathKey(path, entryKey), entryKey, findings, maxFindings, seen, jsonStringDepth);
   }
 }
 
@@ -170,27 +194,12 @@ export function evidenceSecretFindingSummary(findings: EvidenceSecretFinding[]) 
   return findings.map((finding) => `${finding.path} (${finding.reason})`).join(", ");
 }
 
-function parsedJsonObjectOrArray(value: string) {
-  try {
-    const parsed = JSON.parse(value) as unknown;
-
-    return parsed !== null && typeof parsed === "object" ? parsed : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 export function sensitiveOutputReasons(value: string, options: EvidenceSecretScanOptions = {}) {
   if (!value.trim()) {
     return [];
   }
 
   const findings = scanEvidenceForRawSecrets(value, options);
-  const parsed = parsedJsonObjectOrArray(value);
-
-  if (parsed) {
-    findings.push(...scanEvidenceForRawSecrets(parsed, options));
-  }
 
   return [...new Set(findings.map((finding) => finding.reason))];
 }
