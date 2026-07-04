@@ -516,6 +516,16 @@ export function gitWebhookSecretsFromEnv(env: NodeJS.ProcessEnv = process.env) {
   };
 }
 
+/**
+ * Estate RBAC convention: the global admin groups (admins/infra-admins) always
+ * hold admin scope; the product-domain operations group is configurable via
+ * SITEFLOW_ADMIN_GROUP (HOLDFAST default: deploy-admins).
+ */
+export function defaultGatewayAdminGroups(env: NodeJS.ProcessEnv = process.env) {
+  const productGroup = env.SITEFLOW_ADMIN_GROUP?.trim() || "deploy-admins";
+  return [...new Set(["admins", "infra-admins", productGroup])];
+}
+
 export function resolveDatabaseUrl(env: NodeJS.ProcessEnv = process.env) {
   const databaseUrl = env.DATABASE_URL;
 
@@ -564,6 +574,13 @@ export async function main() {
   const baseDomain = process.env.SITEFLOW_BASE_DOMAIN;
   const gitWebhookSecrets = gitWebhookSecretsFromEnv();
   const prebuiltUploadBudget = defaultPrebuiltUploadBudget();
+  // HOLDFAST gateway integration (all optional; absent = stock SiteFlow).
+  const gatewayHmacKey = resolveSecretEnvValue("GATEWAY_HMAC_KEY");
+  const gatewayAdminGroups = defaultGatewayAdminGroups();
+  const consoleHost = process.env.SITEFLOW_CONSOLE_HOST?.trim() || undefined;
+  const consoleDistDir = process.env.SITEFLOW_CONSOLE_DIST?.trim()
+    || path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "dist");
+  const loomCloneBaseUrl = process.env.SITEFLOW_LOOM_CLONE_BASE_URL?.trim() || undefined;
 
   if (!databaseUrl) {
     throw new Error("DATABASE_URL is required to start the SiteFlow control-plane API.");
@@ -612,7 +629,12 @@ export async function main() {
     releaseEvidenceAttestationSigningKey,
     releaseEvidenceRequiredAttestationKeyId,
     productionRuntime: isProductionRuntime(),
-    allowSameProcessFunctionRuntime: defaultAllowSameProcessFunctionRuntime()
+    allowSameProcessFunctionRuntime: defaultAllowSameProcessFunctionRuntime(),
+    gatewayHmacKey,
+    gatewayAdminGroups,
+    consoleHost,
+    consoleDistDir,
+    loomCloneBaseUrl
   });
 
   server.listen(port, () => {

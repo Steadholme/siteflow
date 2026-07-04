@@ -15,6 +15,7 @@ import {
   type DockerBuildRunnerConfig
 } from "./buildSandbox.js";
 import { isProductionRuntime, requireProductionSecret, resolveSecretEnvValue } from "../src/lib/sealedSecrets.js";
+import { createKlaxonBuildNotifier } from "./klaxonNotifier.js";
 
 const defaultPollIntervalMs = 5000;
 const defaultBuildStepTimeoutMs = 900_000;
@@ -524,6 +525,13 @@ export async function startSiteFlowBuildWorker(env: NodeJS.ProcessEnv = process.
   const controller = new AbortController();
   const log = (message: string) => process.stdout.write(message);
   const removeShutdownHandlers = installShutdownHandlers(controller, log);
+  // HOLDFAST Klaxon build notifications: enabled only when KLAXON_NOTIFY_URL +
+  // KLAXON_INGEST_TOKEN are both set; fire-and-forget, never blocks the build.
+  const buildEventNotifier = createKlaxonBuildNotifier(env);
+
+  if (buildEventNotifier) {
+    log("SiteFlow build worker notifications: Klaxon enabled.\n");
+  }
 
   try {
     requireWorkerProductionSecret(env);
@@ -564,7 +572,8 @@ export async function startSiteFlowBuildWorker(env: NodeJS.ProcessEnv = process.
           buildStepTimeoutMs: config.buildStepTimeoutMs,
           maxArtifactBytes: config.maxArtifactBytes,
           maxArtifactFiles: config.maxArtifactFiles,
-          minBuildFreeBytes: config.minBuildFreeBytes
+          minBuildFreeBytes: config.minBuildFreeBytes,
+          buildEventNotifier
         })
     });
   } finally {

@@ -65,6 +65,17 @@ export interface BuildWorkerOptions {
   maxArtifactBytes?: number;
   maxArtifactFiles?: number;
   minBuildFreeBytes?: number;
+  /**
+   * Optional fire-and-forget build outcome notifier (HOLDFAST Klaxon). Invoked
+   * AFTER the job status is durably written; implementations must never throw
+   * and never block (see worker/klaxonNotifier.ts).
+   */
+  buildEventNotifier?: (event: {
+    status: "succeeded" | "failed";
+    job: QueuedBuildJob;
+    result?: BuildJobResult;
+    reason?: string;
+  }) => void;
 }
 
 export interface BuildExecutionOptions {
@@ -1200,6 +1211,7 @@ export async function runBuildWorkerOnce(options: BuildWorkerOptions): Promise<B
       appendLog: (line) => options.queue.appendLog(job.id, line)
     });
     await options.queue.completeJob(job, result);
+    options.buildEventNotifier?.({ status: "succeeded", job, result });
     return result;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Build worker failed.";
@@ -1209,6 +1221,7 @@ export async function runBuildWorkerOnce(options: BuildWorkerOptions): Promise<B
       return undefined;
     }
     await options.queue.failJob(job, message);
+    options.buildEventNotifier?.({ status: "failed", job, reason: message });
     throw error;
   } finally {
     if (heartbeatTimer) {

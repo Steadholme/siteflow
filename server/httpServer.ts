@@ -17,6 +17,9 @@ import {
   type PrebuiltUploadBudget
 } from "../src/lib/api/deployContracts.js";
 import { assertReleaseChannel, SiteFlowNotFoundError, type ArtifactRoute, type LogDrainDeliveryPlan, type SiteFlowAuthPrincipal, type SiteFlowReadRepository } from "./readRepository.js";
+import { gatewayIdentityEmail, gatewayIdentityGroups, gatewayIdentityOk, gatewayIdentitySubject } from "./gatewayIdentity.js";
+import { isLoomWebhookPayload, loomPayloadToGeneric } from "./loomWebhook.js";
+import { serveConsoleStatic } from "./consoleStatic.js";
 import {
   evaluateReleaseEvidenceBundle,
   releaseEvidenceBundleAttestationSignatureVerified,
@@ -56,6 +59,22 @@ export interface SiteFlowServerOptions {
   releaseEvidenceRequiredAttestationKeyId?: string;
   productionRuntime?: boolean;
   allowSameProcessFunctionRuntime?: boolean;
+  /**
+   * HOLDFAST gateway integration (all optional; absent = stock SiteFlow):
+   * - gatewayHmacKey: verifies Sluice-injected X-Auth-* identity headers via
+   *   X-Auth-Sig (HMAC-SHA256, minute window; see gatewayIdentity.ts).
+   * - gatewayAdminGroups: X-Auth-Groups values granted full admin scope
+   *   (estate convention: admins/infra-admins + SITEFLOW_ADMIN_GROUP).
+   * - consoleHost/consoleDistDir: serve the built console SPA (dist/) for
+   *   non-API requests whose Host equals consoleHost.
+   * - loomCloneBaseUrl: anonymous PUBLIC clone base for Loom webhook builds
+   *   (e.g. https://git.w33d.xyz/git).
+   */
+  gatewayHmacKey?: string;
+  gatewayAdminGroups?: string[];
+  consoleHost?: string;
+  consoleDistDir?: string;
+  loomCloneBaseUrl?: string;
 }
 
 export type SiteFlowTrustedProxyPolicy = boolean | "loopback" | "private" | string[];
@@ -1095,6 +1114,19 @@ function fallbackApiTokenPrincipal(scopes: PermissionScope[]): SiteFlowAuthPrinc
       role: "system"
     }
   };
+}
+
+// Estate convention: the global admin groups always carry admin scope; the
+// product-domain operations group is env-configurable (SITEFLOW_ADMIN_GROUP,
+// wired through options.gatewayAdminGroups). Everyone else the gateway lets
+// through is an authenticated estate user -> read-only.
+const defaultGatewayAdminGroups = ["admins", "infra-admins"];
+
+function gatewayIdentityScopes(request: IncomingMessage, options: SiteFlowServerOptions): PermissionScope[] {
+  const adminGroups = options.gatewayAdminGroups?.length ? options.gatewayAdminGroups : defaultGatewayAdminGroups;
+  const groups = gatewayIdentityGroups(request.headers);
+
+  return groups.some((group) => adminGroups.includes(group)) ? ["read", "write", "admin"] : ["read"];
 }
 
 function fallbackOperatorSessionPrincipal(scopes: PermissionScope[]): SiteFlowAuthPrincipal {
@@ -2177,7 +2209,9 @@ function gitWebhookDeliveryId(provider: SourceProvider, request: IncomingMessage
     return headerValue(request, "x-gitea-delivery") ?? headerValue(request, "x-gogs-delivery") ?? headerValue(request, "x-github-delivery");
   }
 
-  return headerValue(request, "x-siteflow-delivery");
+  // Generic provider: SiteFlow's own headers, with the Loom (HOLDFAST git)
+  // dialect as a fallback (X-Loom-Delivery / X-Loom-Event / X-Loom-Signature).
+  return headerValue(request, "x-siteflow-delivery") ?? headerValue(request, "x-loom-delivery");
 }
 
 function gitWebhookEventName(provider: SourceProvider, request: IncomingMessage) {
@@ -2193,7 +2227,7 @@ function gitWebhookEventName(provider: SourceProvider, request: IncomingMessage)
     return headerValue(request, "x-gitea-event") ?? headerValue(request, "x-gogs-event") ?? headerValue(request, "x-github-event");
   }
 
-  return headerValue(request, "x-siteflow-event");
+  return headerValue(request, "x-siteflow-event") ?? headerValue(request, "x-loom-event");
 }
 
 function gitWebhookSignatureValid(provider: SourceProvider, request: IncomingMessage, rawBody: Buffer, secret: string, deliveryId: string) {
@@ -2209,7 +2243,8 @@ function gitWebhookSignatureValid(provider: SourceProvider, request: IncomingMes
     return verifyGiteaSignature(rawBody, headerValue(request, "x-gitea-signature") ?? headerValue(request, "x-gogs-signature"), headerValue(request, "x-hub-signature-256"), secret);
   }
 
-  return verifySha256HexSignature(rawBody, headerValue(request, "x-siteflow-signature"), secret);
+  // Loom signs with the same sha256=<hex> HMAC format, only the header differs.
+  return verifySha256HexSignature(rawBody, headerValue(request, "x-siteflow-signature") ?? headerValue(request, "x-loom-signature"), secret);
 }
 
 function gitWebhookProviderLabel(provider: SourceProvider) {
@@ -2239,6 +2274,47 @@ async function authorizeRequest(
 
     sendJson(response, 403, { message: `SiteFlow API token does not include ${permission} permission.` }, options.allowedOrigin, request.method);
     return undefined;
+  }
+
+  // HOLDFAST gateway identity: when GATEWAY_HMAC_KEY is configured and the
+  // Sluice gateway injected a signed X-Auth-* identity, trust it and short-
+  // circuit the operator session (single source of truth for console auth).
+  // Root token / api_tokens / deploy-hook tokens above stay untouched.
+  const gatewaySubject = options.gatewayHmacKey ? gatewayIdentitySubject(request.headers) : undefined;
+
+  if (gatewaySubject) {
+    if (!gatewayIdentityOk(request.headers, options.gatewayHmacKey)) {
+      sendJson(response, 401, { message: "Gateway identity signature verification failed." }, options.allowedOrigin, request.method);
+      return undefined;
+    }
+
+    const scopes = gatewayIdentityScopes(request, options);
+
+    if (!hasPermission(scopes, permission)) {
+      sendJson(response, 403, { message: `Gateway identity does not include ${permission} permission.` }, options.allowedOrigin, request.method);
+      return undefined;
+    }
+
+    // Keep the same-origin CSRF header requirement for mutating requests: the
+    // estate SSO cookie rides on cross-site browser requests (the gateway will
+    // happily re-inject identity), so writes still demand the custom header the
+    // console XHR client always sends (x-siteflow-csrf: same-origin).
+    if (!authorizeOperatorSessionCsrf(request, response, options)) {
+      return undefined;
+    }
+
+    const email = gatewayIdentityEmail(request.headers);
+
+    return {
+      kind: "gateway_identity",
+      scopes,
+      actor: {
+        id: gatewaySubject,
+        name: email ?? gatewaySubject,
+        email,
+        role: "operator"
+      }
+    };
   }
 
   const sessionToken = operatorSessionToken(request);
@@ -2333,6 +2409,12 @@ async function authenticatedPermissions(request: IncomingMessage, options: SiteF
     const principal = await options.repository.resolveTokenPrincipal?.(token, projectId);
 
     return principal?.scopes ?? await options.repository.resolveTokenPermissions(token, projectId) ?? [];
+  }
+
+  if (options.gatewayHmacKey && gatewayIdentitySubject(request.headers)) {
+    return gatewayIdentityOk(request.headers, options.gatewayHmacKey)
+      ? gatewayIdentityScopes(request, options)
+      : [];
   }
 
   const sessionToken = operatorSessionToken(request);
@@ -4362,7 +4444,15 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
     let event: SourceEventInput | undefined;
 
     try {
-      const payload = parseGitWebhookPayload(provider, request, rawBody);
+      let payload = parseGitWebhookPayload(provider, request, rawBody);
+
+      // Loom dialect (signature already verified above): map the Loom push
+      // payload into the generic shape, resolving the branch tip SHA because
+      // Loom's payload carries none (see loomWebhook.ts).
+      if (provider === "generic" && isLoomWebhookPayload(payload)) {
+        payload = await loomPayloadToGeneric(payload, { cloneBaseUrl: options.loomCloneBaseUrl });
+      }
+
       event = normalizeGitWebhook(provider, eventName, payload, deliveryId);
     } catch (error) {
       sendJson(response, 400, {
@@ -5368,6 +5458,22 @@ export function createSiteFlowServer(options: SiteFlowServerOptions) {
       const url = new URL(request.url ?? "/", `http://${host}`);
       const segments = url.pathname.split("/").filter(Boolean);
       requestBodyLimitBytes.set(request, maxBodyBytes(options));
+
+      // Console SPA static serving: requests whose Host is the configured
+      // console host (e.g. siteflow.w33d.xyz behind the HOLDFAST gateway) get
+      // the built dist/ bundle, except API/health/metrics paths, which keep
+      // flowing into the control-plane routes below.
+      if (
+        options.consoleHost
+        && host.split(":")[0]?.toLowerCase() === options.consoleHost.toLowerCase()
+        && segments[0] !== "api"
+        && url.pathname !== "/healthz"
+        && url.pathname !== "/readyz"
+        && url.pathname !== "/metrics"
+        && await serveConsoleStatic(request, response, url.pathname, options.consoleDistDir ?? "dist")
+      ) {
+        return;
+      }
 
       if (await tryServeImageOptimizationRoute({ request, response, url, segments }, options)) {
         return;

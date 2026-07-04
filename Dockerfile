@@ -10,6 +10,11 @@ RUN node scripts/releaseDependencyPolicyCheck.mjs --json \
   && npm ci
 
 COPY . .
+# Console SPA production API base (absolute https URL, baked at build time by
+# vite). Same-origin deployments pass the console host URL here so the SPA's
+# XHR goes back through the fronting gateway (e.g. https://siteflow.w33d.xyz).
+ARG VITE_SITEFLOW_API_URL=
+ENV VITE_SITEFLOW_API_URL=${VITE_SITEFLOW_API_URL}
 RUN npm run build
 
 FROM node:20-bookworm-slim AS runtime
