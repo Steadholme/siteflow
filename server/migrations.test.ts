@@ -111,6 +111,14 @@ describe("runMigrations", () => {
     expect(migration?.sql).toContain("ALTER TABLE siteflow_route_revisions");
   });
 
+  it("adds preview password storage", () => {
+    const migration = migrations.find((entry) => entry.version === "024_preview_password");
+
+    expect(migration?.sql).toContain("ALTER TABLE siteflow_projects");
+    expect(migration?.sql).toContain("ADD COLUMN IF NOT EXISTS preview_password_hash bytea");
+    expect(migration?.sql).toContain("ADD COLUMN IF NOT EXISTS preview_password_salt bytea");
+  });
+
   it("takes an advisory transaction lock before checking migration state", async () => {
     const { client, pool, queries } = createMockPool((text, values) => {
       if (isAppliedMigrationQuery(text)) {

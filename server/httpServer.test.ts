@@ -1,4 +1,4 @@
-import { createHmac } from "node:crypto";
+import { createHmac, scryptSync } from "node:crypto";
 import http from "node:http";
 import { brotliCompressSync, gzipSync } from "node:zlib";
 import type { AddressInfo } from "node:net";
@@ -576,7 +576,8 @@ function fixtureRepository(): SiteFlowReadRepository {
           }
         ],
         auditEvents: project.recentEvents.auditEvents,
-        currentPermissions: ["read", "write", "admin"]
+        currentPermissions: ["read", "write", "admin"],
+        previewProtectionEnabled: false
       };
     },
     createProject: async (command: CreateProjectCommand): Promise<ProjectMutationReadModel> => ({
@@ -664,6 +665,30 @@ function fixtureRepository(): SiteFlowReadRepository {
           updatedAt: "2026-05-25T00:00:00.000Z"
         },
         message: "Project domain removed."
+      };
+    },
+    setPreviewProtection: async (projectId, _password, _actor): Promise<ProjectMutationReadModel> => {
+      const settings = await fixtureRepository().getProjectSettings(projectId);
+
+      return {
+        status: "updated",
+        project: {
+          ...settings.project,
+          updatedAt: "2026-05-25T00:00:00.000Z"
+        },
+        message: "Preview protection enabled."
+      };
+    },
+    clearPreviewProtection: async (projectId, _actor): Promise<ProjectMutationReadModel> => {
+      const settings = await fixtureRepository().getProjectSettings(projectId);
+
+      return {
+        status: "updated",
+        project: {
+          ...settings.project,
+          updatedAt: "2026-05-25T00:00:00.000Z"
+        },
+        message: "Preview protection disabled."
       };
     },
     archiveProject: async (projectId: SiteFlowId): Promise<ProjectMutationReadModel> => {
@@ -2472,6 +2497,70 @@ describe("SiteFlow control-plane HTTP server", () => {
         expect(removed).toEqual({
           projectId: "project-acme-dashboard",
           hostname: "docs.example.com"
+        });
+      },
+      { apiToken: "deploy-token" }
+    );
+  });
+
+  it("routes preview protection set and clear requests through the admin sub-api", async () => {
+    let set: { projectId: string; password: string; actorId: string } | undefined;
+    let cleared: { projectId: string; actorId: string } | undefined;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      setPreviewProtection: async (projectId, password, actor) => {
+        set = { projectId, password, actorId: actor.id };
+
+        return fixtureRepository().setPreviewProtection(projectId, password, actor);
+      },
+      clearPreviewProtection: async (projectId, actor) => {
+        cleared = { projectId, actorId: actor.id };
+
+        return fixtureRepository().clearPreviewProtection(projectId, actor);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const emptyResponse = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/preview-protection`, {
+          method: "PUT",
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer deploy-token"
+          },
+          body: JSON.stringify({ password: "   " })
+        });
+        const setResponse = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/preview-protection`, {
+          method: "PUT",
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer deploy-token"
+          },
+          body: JSON.stringify({ password: " open sesame " })
+        });
+        const setBody = await setResponse.json();
+        const clearResponse = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/preview-protection`, {
+          method: "DELETE",
+          headers: {
+            authorization: "Bearer deploy-token"
+          }
+        });
+        const clearBody = await clearResponse.json();
+
+        expect(emptyResponse.status).toBe(400);
+        expect(setResponse.status).toBe(200);
+        expect(clearResponse.status).toBe(200);
+        expect(setBody).toEqual({ enabled: true });
+        expect(clearBody).toEqual({ enabled: false });
+        expect(set).toEqual({
+          projectId: "project-acme-dashboard",
+          password: " open sesame ",
+          actorId: "siteflow:server"
+        });
+        expect(cleared).toEqual({
+          projectId: "project-acme-dashboard",
+          actorId: "siteflow:server"
         });
       },
       { apiToken: "deploy-token" }
@@ -7935,6 +8024,102 @@ describe("SiteFlow control-plane HTTP server", () => {
         expect(response.status).toBe(200);
         expect(response.headers.get("x-siteflow-deployment")).toBe("dep_prebuilt");
         expect(body).toContain("SiteFlow Preview");
+      });
+    } finally {
+      await rm(artifactRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("protects only ephemeral preview artifact hosts with Basic auth", async () => {
+    const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "siteflow-preview-auth-"));
+    const salt = Buffer.from("0123456789abcdef", "utf8");
+    const hash = scryptSync("open sesame", salt, 32);
+    const protection = { hash, salt };
+
+    try {
+      await writeFile(path.join(artifactRoot, "index.html"), "<h1>Private preview</h1>");
+      const repository = {
+        ...fixtureRepository(),
+        resolveArtifactRoute: async (host: string): Promise<ArtifactRoute | undefined> => {
+          if (host === "preview-abc.w33d.xyz") {
+            return {
+              host,
+              deploymentId: "dep_preview_auth",
+              artifactRoot,
+              entrypoint: "index.html",
+              isEphemeralPreview: true,
+              previewProtection: protection
+            };
+          }
+
+          if (host === "docs.siteflow.w33d.xyz") {
+            return {
+              host,
+              deploymentId: "dep_preview_auth",
+              artifactRoot,
+              entrypoint: "index.html",
+              isEphemeralPreview: false,
+              previewProtection: protection
+            };
+          }
+
+          if (host === "public-preview.w33d.xyz") {
+            return {
+              host,
+              deploymentId: "dep_public_preview",
+              artifactRoot,
+              entrypoint: "index.html",
+              isEphemeralPreview: true
+            };
+          }
+
+          return undefined;
+        }
+      };
+
+      await withServer(repository, async (baseUrl) => {
+        const stable = await rawHttpGet(baseUrl, "/", {
+          "x-forwarded-host": "docs.siteflow.w33d.xyz"
+        });
+        const noPasswordPreview = await rawHttpGet(baseUrl, "/", {
+          "x-forwarded-host": "public-preview.w33d.xyz"
+        });
+        const missing = await rawHttpGet(baseUrl, "/", {
+          "x-forwarded-host": "preview-abc.w33d.xyz"
+        });
+        const wrong = await rawHttpGet(baseUrl, "/", {
+          "x-forwarded-host": "preview-abc.w33d.xyz",
+          authorization: `Basic ${Buffer.from("user:wrong").toString("base64")}`
+        });
+        const malformed = await rawHttpGet(baseUrl, "/", {
+          "x-forwarded-host": "preview-abc.w33d.xyz",
+          authorization: "Basic not valid base64"
+        });
+        const imageMissing = await rawHttpGet(baseUrl, "/_siteflow/image?url=%2Fhero.png&w=320", {
+          "x-forwarded-host": "preview-abc.w33d.xyz"
+        });
+        const correct = await rawHttpGet(baseUrl, "/", {
+          "x-forwarded-host": "preview-abc.w33d.xyz",
+          authorization: `Basic ${Buffer.from("ignored:open sesame").toString("base64")}`
+        });
+
+        expect(stable.status).toBe(200);
+        expect(stable.body.toString("utf8")).toContain("Private preview");
+        expect(noPasswordPreview.status).toBe(200);
+        expect(noPasswordPreview.body.toString("utf8")).toContain("Private preview");
+
+        for (const response of [missing, wrong, malformed, imageMissing]) {
+          expect(response.status).toBe(401);
+          expect(response.headers["www-authenticate"]).toBe("Basic realm=\"SiteFlow Preview\", charset=\"UTF-8\"");
+          expect(response.headers["cache-control"]).toBe("no-store");
+          expect(JSON.parse(response.body.toString("utf8"))).toEqual({ message: "Preview authentication required." });
+        }
+        expect(wrong.body.equals(missing.body)).toBe(true);
+        expect(malformed.body.equals(missing.body)).toBe(true);
+        expect(imageMissing.body.equals(missing.body)).toBe(true);
+
+        expect(correct.status).toBe(200);
+        expect(correct.body.toString("utf8")).toContain("Private preview");
       });
     } finally {
       await rm(artifactRoot, { recursive: true, force: true });

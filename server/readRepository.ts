@@ -181,6 +181,8 @@ export interface SiteFlowReadRepository {
   updateProject(projectId: SiteFlowId, command: UpdateProjectCommand): Promise<ProjectMutationReadModel>;
   addProjectDomain(projectId: SiteFlowId, command: AddProjectDomainCommand): Promise<ProjectMutationReadModel>;
   removeProjectDomain(projectId: SiteFlowId, hostname: string, actor: Actor): Promise<ProjectMutationReadModel>;
+  setPreviewProtection(projectId: SiteFlowId, password: string, actor: Actor): Promise<ProjectMutationReadModel>;
+  clearPreviewProtection(projectId: SiteFlowId, actor: Actor): Promise<ProjectMutationReadModel>;
   archiveProject(projectId: SiteFlowId): Promise<ProjectMutationReadModel>;
   getProjectEnvironmentSettings(projectId: SiteFlowId): Promise<ProjectEnvironmentSettingsReadModel>;
   upsertEnvironmentVariable(command: UpsertEnvironmentVariableCommand): Promise<ProjectEnvironmentVariableUpsertReadModel>;
@@ -271,6 +273,8 @@ export interface ArtifactRoute {
   runtimeEnvironment?: Record<string, string>;
   rollingReleaseId?: SiteFlowId;
   trafficTarget?: "current" | "candidate";
+  isEphemeralPreview: boolean;
+  previewProtection?: { hash: Buffer; salt: Buffer };
 }
 
 export interface LogDrainDeliveryPlan {

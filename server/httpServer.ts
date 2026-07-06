@@ -1,6 +1,6 @@
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
-import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { BlockList, isIP } from "node:net";
 import path from "node:path";
@@ -624,6 +624,62 @@ function secretEquals(actual: string, expected: string) {
   const expectedBuffer = createHash("sha256").update(expected, "utf8").digest();
 
   return timingSafeEqual(actualBuffer, expectedBuffer);
+}
+
+function sendPreviewAuthRequired(request: IncomingMessage, response: ServerResponse, options: SiteFlowServerOptions) {
+  response.setHeader("WWW-Authenticate", "Basic realm=\"SiteFlow Preview\", charset=\"UTF-8\"");
+  response.setHeader("Cache-Control", "no-store");
+  sendJson(response, 401, { message: "Preview authentication required." }, options.allowedOrigin, request.method);
+}
+
+function previewBasicPassword(request: IncomingMessage) {
+  const header = request.headers.authorization;
+
+  if (!header) {
+    return undefined;
+  }
+
+  const match = /^Basic\s+([A-Za-z0-9+/]+={0,2})$/i.exec(header.trim());
+
+  if (!match) {
+    return undefined;
+  }
+
+  const decoded = Buffer.from(match[1], "base64").toString("utf8");
+  const separatorIndex = decoded.indexOf(":");
+
+  if (separatorIndex < 0) {
+    return undefined;
+  }
+
+  return decoded.slice(separatorIndex + 1);
+}
+
+function enforcePreviewAuth(
+  request: IncomingMessage,
+  response: ServerResponse,
+  route: ArtifactRoute,
+  options: SiteFlowServerOptions
+): boolean {
+  if (!route.isEphemeralPreview || !route.previewProtection) {
+    return false;
+  }
+
+  const password = previewBasicPassword(request);
+
+  if (password === undefined || route.previewProtection.hash.length <= 0) {
+    sendPreviewAuthRequired(request, response, options);
+    return true;
+  }
+
+  const computed = scryptSync(password, route.previewProtection.salt, route.previewProtection.hash.length);
+
+  if (computed.length !== route.previewProtection.hash.length || !timingSafeEqual(computed, route.previewProtection.hash)) {
+    sendPreviewAuthRequired(request, response, options);
+    return true;
+  }
+
+  return false;
 }
 
 function headerValue(request: IncomingMessage, name: string) {
@@ -4210,6 +4266,10 @@ async function tryServeArtifactRoute(context: RouteContext, options: SiteFlowSer
     return false;
   }
 
+  if (enforcePreviewAuth(request, response, route, options)) {
+    return true;
+  }
+
   if (route.projectId) {
     const firewall = await options.repository.evaluateFirewall({
       projectId: route.projectId,
@@ -4414,6 +4474,10 @@ async function tryServeImageOptimizationRoute(context: RouteContext, options: Si
 
   if (!route) {
     throw new SiteFlowNotFoundError("Image optimization route was not found.");
+  }
+
+  if (enforcePreviewAuth(request, response, route, options)) {
+    return true;
   }
 
   const source = assertSafeImageSource(url.searchParams.get("url"));
@@ -4781,6 +4845,35 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
       }
 
       sendJson(response, 200, await repository.removeProjectDomain(projectId, decodeURIComponent(segments[4]), auth.actor), options.allowedOrigin);
+      return;
+    }
+
+    if (request.method === "PUT" && segments.length === 4 && segments[3] === "preview-protection") {
+      const auth = await authorizeRequest(request, response, options, "admin", projectId);
+      if (!auth) {
+        return;
+      }
+
+      const body = await readJsonBody(request);
+      const password = stringField(isRecord(body) ? body : undefined, "password");
+
+      if (!password?.trim()) {
+        throw new SiteFlowInputError("Preview protection password is required.");
+      }
+
+      await repository.setPreviewProtection(projectId, password, auth.actor);
+      sendJson(response, 200, { enabled: true }, options.allowedOrigin);
+      return;
+    }
+
+    if (request.method === "DELETE" && segments.length === 4 && segments[3] === "preview-protection") {
+      const auth = await authorizeRequest(request, response, options, "admin", projectId);
+      if (!auth) {
+        return;
+      }
+
+      await repository.clearPreviewProtection(projectId, auth.actor);
+      sendJson(response, 200, { enabled: false }, options.allowedOrigin);
       return;
     }
 

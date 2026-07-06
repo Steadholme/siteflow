@@ -799,6 +799,76 @@ describe("PostgresSiteFlowReadRepository", () => {
     expect(deleteRoute?.values).toEqual(["docs.example.com", "project_docs"]);
   });
 
+  it("sets and clears preview protection with hashed bytea storage and audit events", async () => {
+    const queries: Array<{ text: string; values?: unknown[] }> = [];
+    const project = projectTableRow();
+    const client = {
+      query: async (text: string, values?: unknown[]) => {
+        queries.push({ text, values });
+
+        if (text === "BEGIN" || text === "COMMIT" || text === "ROLLBACK") {
+          return { rows: [], rowCount: null };
+        }
+
+        if (text.includes("UPDATE siteflow_projects") || text.includes("INSERT INTO siteflow_audit_events")) {
+          return { rows: [], rowCount: 1 };
+        }
+
+        throw new Error(`Unexpected client query: ${text}`);
+      },
+      release: () => undefined
+    };
+    const pool = {
+      connect: async () => client,
+      query: async (text: string, values?: unknown[]) => {
+        queries.push({ text, values });
+
+        if (text.includes("FROM siteflow_projects") && text.includes("WHERE id = $1")) {
+          return { rows: [project], rowCount: 1 };
+        }
+
+        if (text.includes("FROM siteflow_project_domains")) {
+          return { rows: [], rowCount: 0 };
+        }
+
+        throw new Error(`Unexpected pool query: ${text}`);
+      }
+    };
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow",
+      baseDomain: "siteflow.w33d.xyz"
+    });
+
+    const enabled = await repository.setPreviewProtection(
+      "project_docs",
+      "open sesame",
+      { id: "actor-1", name: "Ops", role: "operator" }
+    );
+    const disabled = await repository.clearPreviewProtection(
+      "project_docs",
+      { id: "actor-1", name: "Ops", role: "operator" }
+    );
+    const setUpdate = queries.find((query) => query.text.includes("preview_password_hash = $2"));
+    const clearUpdate = queries.find((query) => query.text.includes("preview_password_hash = NULL"));
+    const auditSummaries = queries
+      .filter((query) => query.text.includes("INSERT INTO siteflow_audit_events"))
+      .map((query) => query.values?.[6]);
+
+    expect(enabled.message).toBe("Preview protection enabled.");
+    expect(disabled.message).toBe("Preview protection disabled.");
+    expect(setUpdate?.values?.[0]).toBe("project_docs");
+    expect(Buffer.isBuffer(setUpdate?.values?.[1])).toBe(true);
+    expect(Buffer.isBuffer(setUpdate?.values?.[2])).toBe(true);
+    expect((setUpdate?.values?.[1] as Buffer).byteLength).toBe(32);
+    expect((setUpdate?.values?.[2] as Buffer).byteLength).toBe(16);
+    expect(clearUpdate?.values).toEqual(["project_docs"]);
+    expect(auditSummaries).toEqual([
+      "Project preview protection enabled.",
+      "Project preview protection disabled."
+    ]);
+    expect(JSON.stringify(queries)).not.toContain("open sesame");
+  });
+
   it("updates existing project repository metadata from signed git webhook events before queueing builds", async () => {
     const queries: Array<{ text: string; values?: unknown[] }> = [];
     let sourceEventReads = 0;
@@ -2617,6 +2687,68 @@ describe("PostgresSiteFlowReadRepository", () => {
       "project_docs",
       "preview"
     ]);
+  });
+
+  it("marks only deployment preview_host artifact routes as ephemeral preview routes", async () => {
+    const hash = Buffer.from("hashed-preview-password");
+    const salt = Buffer.from("preview-salt-1234");
+    const queries: Array<{ text: string; values?: unknown[] }> = [];
+    const routeRow = (host: string) => ({
+      host,
+      project_id: "project_docs",
+      deployment_id: "dep_preview",
+      artifact_root: "/tmp/siteflow/dep_preview",
+      entrypoint: "index.html",
+      source_branch: "feature/private-preview",
+      production_branch: "main",
+      route_channel: null,
+      preview_host: "preview-abc.w33d.xyz",
+      preview_password_hash: hash,
+      preview_password_salt: salt,
+      rolling_release_id: null,
+      percentage: null,
+      artifact_manifest: {
+        entrypoint: "index.html",
+        fileCount: 1,
+        totalBytes: 14,
+        checksum: "sha256:preview",
+        generatedAt: "2026-05-27T00:00:00.000Z"
+      },
+      candidate_deployment_id: null,
+      candidate_artifact_root: null,
+      candidate_entrypoint: null,
+      candidate_project_id: null,
+      candidate_source_branch: null,
+      candidate_artifact_manifest: null
+    });
+    const pool = {
+      query: async (text: string, values?: unknown[]) => {
+        queries.push({ text, values });
+
+        if (text.includes("FROM siteflow_artifact_routes")) {
+          return { rows: [routeRow(String(values?.[0]))] };
+        }
+
+        if (text.includes("FROM siteflow_environment_variables")) {
+          return { rows: [] };
+        }
+
+        throw new Error(`Unexpected query: ${text}`);
+      }
+    };
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow",
+      baseDomain: "w33d.xyz"
+    });
+
+    const preview = await repository.resolveArtifactRoute("preview-abc.w33d.xyz");
+    const canonical = await repository.resolveArtifactRoute("docs.siteflow.w33d.xyz");
+
+    expect(preview?.isEphemeralPreview).toBe(true);
+    expect(preview?.previewProtection).toEqual({ hash, salt });
+    expect(canonical?.isEphemeralPreview).toBe(false);
+    expect(canonical?.previewProtection).toEqual({ hash, salt });
+    expect(queries.filter((query) => query.text.includes("FROM siteflow_artifact_routes"))).toHaveLength(2);
   });
 
   it("enforces operator session idle timeout while resolving principals", async () => {

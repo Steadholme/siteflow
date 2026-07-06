@@ -782,6 +782,14 @@ export const migrations: Migration[] = [
       ALTER TABLE siteflow_route_revisions
         ADD COLUMN IF NOT EXISTS release_evidence jsonb;
     `
+  },
+  {
+    version: "024_preview_password",
+    sql: `
+      ALTER TABLE siteflow_projects
+        ADD COLUMN IF NOT EXISTS preview_password_hash bytea,
+        ADD COLUMN IF NOT EXISTS preview_password_salt bytea;
+    `
   }
 ];
 

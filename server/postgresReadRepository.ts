@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID, scryptSync } from "node:crypto";
 import { lstat, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Pool, PoolClient } from "pg";
@@ -257,6 +257,9 @@ interface ArtifactRouteRow {
   route_channel: ReleaseChannelName | null;
   source_branch: string | null;
   deployment_id: string;
+  preview_host: string;
+  preview_password_hash: Buffer | null;
+  preview_password_salt: Buffer | null;
   artifact_root: string;
   entrypoint: string;
   artifact_manifest: Partial<ArtifactManifest> | Record<string, never>;
@@ -1804,6 +1807,17 @@ function domainFromRow(row: DomainRow): DomainBinding {
     channel: row.channel,
     verified: row.verified,
     lastCheckedAt: row.last_checked_at.toISOString()
+  };
+}
+
+function previewProtectionFromRouteRow(row: ArtifactRouteRow): ArtifactRoute["previewProtection"] {
+  if (!row.preview_password_hash || !row.preview_password_salt) {
+    return undefined;
+  }
+
+  return {
+    hash: row.preview_password_hash,
+    salt: row.preview_password_salt
   };
 }
 
@@ -3914,16 +3928,27 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
 
   async getProjectSettings(projectId: SiteFlowId): Promise<ProjectSettingsReadModel> {
     const project = await this.readProject(projectId);
+    const previewProtection = await this.pool.query<{ enabled: boolean }>(
+      `
+        SELECT preview_password_hash IS NOT NULL AS enabled
+        FROM siteflow_projects
+        WHERE id = $1
+      `,
+      [project.id]
+    );
 
-    return {
+    const settings: ProjectSettingsReadModel & { previewProtectionEnabled: boolean } = {
       project,
       environments: await this.listProjectEnvironments(project.id),
       environmentVariables: await this.listEnvironmentVariables(project.id),
       teamMembers: await this.listTeamMembers(project.id),
       apiTokens: await this.listApiTokens(project.id),
       auditEvents: await this.listAuditEvents(project.id),
-      currentPermissions: ["read", "write", "admin"]
+      currentPermissions: ["read", "write", "admin"],
+      previewProtectionEnabled: previewProtection.rows[0]?.enabled ?? false
     };
+
+    return settings;
   }
 
   async createProject(command: CreateProjectCommand): Promise<ProjectMutationReadModel> {
@@ -4223,6 +4248,91 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
       status: "updated",
       project: await this.readProject(projectId),
       message: "Project domain removed."
+    };
+  }
+
+  async setPreviewProtection(projectId: SiteFlowId, password: string, actor: Actor): Promise<ProjectMutationReadModel> {
+    await this.readProject(projectId);
+
+    if (!password.trim()) {
+      throw new SiteFlowInputError("Preview protection password is required.");
+    }
+
+    const salt = randomBytes(16);
+    const hash = scryptSync(password, salt, 32);
+    const client = await this.pool.connect();
+
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `
+          UPDATE siteflow_projects
+          SET preview_password_hash = $2,
+              preview_password_salt = $3,
+              updated_at = now()
+          WHERE id = $1
+        `,
+        [projectId, hash, salt]
+      );
+      await insertAuditEvent(client, {
+        projectId,
+        action: "project.updated",
+        actor,
+        targetType: "project",
+        targetId: projectId,
+        summary: "Project preview protection enabled."
+      });
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    return {
+      status: "updated",
+      project: await this.readProject(projectId),
+      message: "Preview protection enabled."
+    };
+  }
+
+  async clearPreviewProtection(projectId: SiteFlowId, actor: Actor): Promise<ProjectMutationReadModel> {
+    await this.readProject(projectId);
+    const client = await this.pool.connect();
+
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `
+          UPDATE siteflow_projects
+          SET preview_password_hash = NULL,
+              preview_password_salt = NULL,
+              updated_at = now()
+          WHERE id = $1
+        `,
+        [projectId]
+      );
+      await insertAuditEvent(client, {
+        projectId,
+        action: "project.updated",
+        actor,
+        targetType: "project",
+        targetId: projectId,
+        summary: "Project preview protection disabled."
+      });
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    return {
+      status: "updated",
+      project: await this.readProject(projectId),
+      message: "Preview protection disabled."
     };
   }
 
@@ -7313,6 +7423,9 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
           domain.channel AS route_channel,
           deployment.source_branch,
           route.deployment_id,
+          deployment.preview_host,
+          project.preview_password_hash,
+          project.preview_password_salt,
           route.artifact_root,
           route.entrypoint,
           deployment.artifact_manifest,
@@ -7415,7 +7528,9 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
         functions: functionsFromArtifactManifest(row.candidate_artifact_manifest),
         runtimeEnvironment: await runtimeEnvironment(row.candidate_project_id, row.candidate_source_branch, row.candidate_artifact_manifest),
         rollingReleaseId: row.rolling_release_id,
-        trafficTarget: "candidate"
+        trafficTarget: "candidate",
+        isEphemeralPreview: row.host === row.preview_host,
+        previewProtection: previewProtectionFromRouteRow(row)
       };
     }
 
@@ -7440,7 +7555,9 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
       functions: functionsFromArtifactManifest(row.artifact_manifest),
       runtimeEnvironment: await runtimeEnvironment(row.project_id, row.source_branch, row.artifact_manifest),
       rollingReleaseId: row.rolling_release_id ?? undefined,
-      trafficTarget: row.rolling_release_id ? "current" : undefined
+      trafficTarget: row.rolling_release_id ? "current" : undefined,
+      isEphemeralPreview: row.host === row.preview_host,
+      previewProtection: previewProtectionFromRouteRow(row)
     };
   }
 
