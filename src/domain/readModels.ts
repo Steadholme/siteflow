@@ -190,6 +190,15 @@ export interface LogChunkReadModel {
   hasMore: boolean;
 }
 
+export interface BuildJobLogChunkReadModel {
+  buildJobId: SiteFlowId;
+  status: BuildJob["status"] | "none";
+  lines: string[];
+  nextCursor: string;
+  hasMore: boolean;
+  complete: boolean;
+}
+
 export interface LogQueryReadModel {
   projectId: SiteFlowId;
   filters: {

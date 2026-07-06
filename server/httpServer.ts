@@ -605,6 +605,16 @@ function logQueryFromUrl(projectId: string, url: URL) {
   };
 }
 
+function buildLogCursorFromUrl(url: URL) {
+  const cursor = url.searchParams.get("cursor") ?? "0";
+
+  if (!/^\d+$/.test(cursor)) {
+    throw new SiteFlowInputError("Build log cursor must be a non-negative integer.");
+  }
+
+  return cursor;
+}
+
 function notFound(response: ServerResponse, allowedOrigin?: string, method?: string) {
   sendJson(response, 404, { message: "SiteFlow API route not found." }, allowedOrigin, method);
 }
@@ -4944,6 +4954,15 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
       return;
     }
 
+    if ((request.method === "GET" || request.method === "HEAD") && segments.length === 4 && segments[3] === "build-logs") {
+      if (!await authorizeRequest(request, response, options, "read", projectId)) {
+        return;
+      }
+
+      sendJson(response, 200, await repository.getLatestBuildJobLogChunk(projectId, buildLogCursorFromUrl(url)), options.allowedOrigin, request.method);
+      return;
+    }
+
     if ((request.method === "GET" || request.method === "HEAD") && segments.length === 4 && segments[3] === "log-queries") {
       if (!await authorizeRequest(request, response, options, "read", projectId)) {
         return;
@@ -5719,6 +5738,19 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
 
     sendJson(response, 200, await repository.listDeployments(url.searchParams.get("projectId") ?? undefined), options.allowedOrigin, request.method);
     return;
+  }
+
+  if (segments[1] === "build-jobs" && segments[2]) {
+    const buildJobId = decodeURIComponent(segments[2]);
+
+    if ((request.method === "GET" || request.method === "HEAD") && segments.length === 4 && segments[3] === "logs") {
+      if (!await authorizeRequest(request, response, options, "read")) {
+        return;
+      }
+
+      sendJson(response, 200, await repository.getBuildJobLogChunk(buildJobId, buildLogCursorFromUrl(url)), options.allowedOrigin, request.method);
+      return;
+    }
   }
 
   if (segments[1] === "deployments" && segments[2]) {

@@ -13,6 +13,7 @@ import type {
   BlobListReadModel,
   BlobPutReadModel,
   BlobReadModel,
+  BuildJobLogChunkReadModel,
   CacheListReadModel,
   CachePurgeReadModel,
   CommandResultReadModel,
@@ -1725,6 +1726,38 @@ function fixtureRepository(): SiteFlowReadRepository {
     }),
     pollOperation: async (operationId: SiteFlowId): Promise<OperationSnapshotReadModel> => fixture.operations[operationId],
     getLogChunk: async (deploymentId: SiteFlowId): Promise<LogChunkReadModel> => fixture.logs[deploymentId][0],
+    getBuildJobLogChunk: async (buildJobId: SiteFlowId, cursor?: string): Promise<BuildJobLogChunkReadModel> => {
+      const log = fixture.logs["dep-healthy"][0];
+
+      if (buildJobId !== log.chunk.buildJobId) {
+        throw new SiteFlowNotFoundError(`Unknown SiteFlow build job: ${buildJobId}`);
+      }
+
+      return {
+        buildJobId,
+        status: "running",
+        lines: log.chunk.lines,
+        nextCursor: cursor ?? "0",
+        hasMore: false,
+        complete: false
+      };
+    },
+    getLatestBuildJobLogChunk: async (projectId: SiteFlowId, cursor?: string): Promise<BuildJobLogChunkReadModel> => {
+      if (!fixture.projects[projectId]) {
+        throw new SiteFlowNotFoundError(`Unknown project: ${projectId}`);
+      }
+
+      const log = fixture.logs["dep-healthy"][0];
+
+      return {
+        buildJobId: log.chunk.buildJobId ?? "build-healthy",
+        status: "running",
+        lines: log.chunk.lines,
+        nextCursor: cursor ?? "0",
+        hasMore: false,
+        complete: false
+      };
+    },
     deployPrebuilt: async (_command: PrebuiltDeployCommand): Promise<PrebuiltDeployResult> => ({
       deploymentId: "dep_prebuilt",
       projectId: "project_docs",
@@ -2113,6 +2146,188 @@ describe("SiteFlow control-plane HTTP server", () => {
       expect(logs.headers["content-length"]).toBeUndefined();
       expect(logs.body.byteLength).toBe(0);
     }, { apiToken: "deploy-token" });
+  });
+
+  it("serves build job log chunks by cursor", async () => {
+    let seen: { buildJobId: string; cursor?: string } | undefined;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      getBuildJobLogChunk: async (buildJobId, cursor): Promise<BuildJobLogChunkReadModel> => {
+        seen = { buildJobId, cursor };
+
+        return {
+          buildJobId,
+          status: "running",
+          lines: ["queued", "running npm build"],
+          nextCursor: "7",
+          hasMore: false,
+          complete: false
+        };
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/build-jobs/build%2Frunning/logs?cursor=5`, {
+        headers: {
+          authorization: "Bearer read-token"
+        }
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(body).toEqual({
+        buildJobId: "build/running",
+        status: "running",
+        lines: ["queued", "running npm build"],
+        nextCursor: "7",
+        hasMore: false,
+        complete: false
+      });
+      expect(seen).toEqual({ buildJobId: "build/running", cursor: "5" });
+    }, { apiToken: "deploy-token" });
+  });
+
+  it("returns 404 for unknown build job log chunks", async () => {
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      getBuildJobLogChunk: async () => {
+        throw new SiteFlowNotFoundError("Unknown SiteFlow build job: build-missing");
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/build-jobs/build-missing/logs`, {
+        headers: {
+          authorization: "Bearer read-token"
+        }
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(404);
+      expect(body).toEqual({ message: "Unknown SiteFlow build job: build-missing" });
+    }, { apiToken: "deploy-token" });
+  });
+
+  it("rejects invalid build job log cursors", async () => {
+    let calls = 0;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      getBuildJobLogChunk: async () => {
+        calls += 1;
+        throw new Error("build job log repository should not be called");
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/build-jobs/build-healthy/logs?cursor=abc`, {
+        headers: {
+          authorization: "Bearer read-token"
+        }
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(400);
+      expect(body).toEqual({ message: "Build log cursor must be a non-negative integer." });
+    }, { apiToken: "deploy-token" });
+    expect(calls).toBe(0);
+  });
+
+  it("rejects project-scoped tokens for build job log chunks", async () => {
+    await withServer(fixtureRepository(), async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/build-jobs/build-healthy/logs`, {
+        headers: {
+          authorization: "Bearer project-admin-token"
+        }
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(403);
+      expect(body).toEqual({ message: "SiteFlow API token does not include read permission." });
+    }, { apiToken: "deploy-token" });
+  });
+
+  it("serves latest project build log chunks by cursor", async () => {
+    let seen: { projectId: string; cursor?: string } | undefined;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      getLatestBuildJobLogChunk: async (projectId, cursor): Promise<BuildJobLogChunkReadModel> => {
+        seen = { projectId, cursor };
+
+        return {
+          buildJobId: "build/newest",
+          status: "running",
+          lines: ["queued", "running npm build"],
+          nextCursor: "7",
+          hasMore: false,
+          complete: false
+        };
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/build-logs?cursor=5`, {
+        headers: {
+          authorization: "Bearer read-token"
+        }
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(body).toEqual({
+        buildJobId: "build/newest",
+        status: "running",
+        lines: ["queued", "running npm build"],
+        nextCursor: "7",
+        hasMore: false,
+        complete: false
+      });
+      expect(seen).toEqual({ projectId: "project-acme-dashboard", cursor: "5" });
+    }, { apiToken: "deploy-token" });
+  });
+
+  it("returns 404 for unknown project build log chunks", async () => {
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      getLatestBuildJobLogChunk: async () => {
+        throw new SiteFlowNotFoundError("Unknown SiteFlow project: project-missing");
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/projects/project-missing/build-logs`, {
+        headers: {
+          authorization: "Bearer read-token"
+        }
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(404);
+      expect(body).toEqual({ message: "Unknown SiteFlow project: project-missing" });
+    }, { apiToken: "deploy-token" });
+  });
+
+  it("rejects invalid project build log cursors", async () => {
+    let calls = 0;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      getLatestBuildJobLogChunk: async () => {
+        calls += 1;
+        throw new Error("project build log repository should not be called");
+      }
+    };
+
+    await withServer(repository, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/build-logs?cursor=abc`, {
+        headers: {
+          authorization: "Bearer read-token"
+        }
+      });
+      const body = await response.json();
+
+      expect(response.status).toBe(400);
+      expect(body).toEqual({ message: "Build log cursor must be a non-negative integer." });
+    }, { apiToken: "deploy-token" });
+    expect(calls).toBe(0);
   });
 
   it("omits JSON bodies for HEAD project read endpoints", async () => {
@@ -6607,6 +6822,7 @@ describe("SiteFlow control-plane HTTP server", () => {
           "/api/deployments?projectId=project-acme-dashboard",
           "/api/deployments/dep-healthy",
           "/api/deployments/dep-healthy/logs",
+          "/api/build-jobs/build-healthy/logs",
           "/api/operations/op-healthy-promote"
         ];
 
@@ -6637,6 +6853,7 @@ describe("SiteFlow control-plane HTTP server", () => {
           "/api/deployments?projectId=project-acme-dashboard",
           "/api/deployments/dep-healthy",
           "/api/deployments/dep-healthy/logs",
+          "/api/build-jobs/build-healthy/logs",
           "/api/operations/op-healthy-promote"
         ];
 

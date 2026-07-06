@@ -68,6 +68,7 @@ import type {
   BlobListReadModel,
   BlobPutReadModel,
   BlobReadModel,
+  BuildJobLogChunkReadModel,
   CacheListReadModel,
   CachePurgeReadModel,
   CommandResultReadModel,
@@ -293,6 +294,15 @@ interface DeploymentRouteRow {
 
 interface DeploymentBuildRow {
   build_job_id: string | null;
+}
+
+interface BuildJobLogStatusRow {
+  status: BuildJob["status"];
+}
+
+interface LatestBuildJobLogStatusRow {
+  id: string;
+  status: BuildJob["status"];
 }
 
 interface DomainRow {
@@ -2772,6 +2782,13 @@ function isFinishedBuildStatus(status: BuildJob["status"]) {
     || status === "canceled"
     || status === "timed_out"
     || status === "skipped";
+}
+
+function isTerminalBuildLogStatus(status: BuildJob["status"]) {
+  return status === "succeeded"
+    || status === "failed"
+    || status === "canceled"
+    || status === "timed_out";
 }
 
 function evidenceStatusForBuild(status: BuildJob["status"]): EvidenceItemReadModel["status"] {
@@ -7152,6 +7169,68 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
     return this.readBuildLogChunk(deploymentId, cursor);
   }
 
+  async getBuildJobLogChunk(buildJobId: SiteFlowId, cursor?: string): Promise<BuildJobLogChunkReadModel> {
+    const buildJob = await this.pool.query<BuildJobLogStatusRow>(
+      "SELECT status FROM siteflow_build_jobs WHERE id = $1",
+      [buildJobId]
+    );
+    const status = buildJob.rows[0]?.status;
+
+    if (!status) {
+      throw new SiteFlowNotFoundError(`Unknown SiteFlow build job: ${buildJobId}`);
+    }
+
+    const tail = await this.readBuildLogTail(buildJobId, cursor);
+
+    return {
+      buildJobId,
+      status,
+      lines: tail.rows.map((row) => row.line),
+      nextCursor: tail.nextCursor,
+      hasMore: tail.hasMore,
+      complete: !tail.hasMore && isTerminalBuildLogStatus(status)
+    };
+  }
+
+  async getLatestBuildJobLogChunk(projectId: SiteFlowId, cursor?: string): Promise<BuildJobLogChunkReadModel> {
+    const project = await this.pool.query(
+      "SELECT 1 FROM siteflow_projects WHERE id = $1",
+      [projectId]
+    );
+
+    if (!project.rows[0]) {
+      throw new SiteFlowNotFoundError(`Unknown SiteFlow project: ${projectId}`);
+    }
+
+    const buildJob = await this.pool.query<LatestBuildJobLogStatusRow>(
+      "SELECT id, status FROM siteflow_build_jobs WHERE project_id = $1 ORDER BY queued_at DESC LIMIT 1",
+      [projectId]
+    );
+    const latest = buildJob.rows[0];
+
+    if (!latest) {
+      return {
+        buildJobId: "",
+        status: "none",
+        lines: [],
+        nextCursor: cursor ?? "0",
+        hasMore: false,
+        complete: true
+      };
+    }
+
+    const tail = await this.readBuildLogTail(latest.id, cursor);
+
+    return {
+      buildJobId: latest.id,
+      status: latest.status,
+      lines: tail.rows.map((row) => row.line),
+      nextCursor: tail.nextCursor,
+      hasMore: tail.hasMore,
+      complete: !tail.hasMore && isTerminalBuildLogStatus(latest.status)
+    };
+  }
+
   async deployPrebuilt(command: PrebuiltDeployCommand): Promise<PrebuiltDeployResult> {
     if (!Array.isArray(command.files)) {
       throw new Error("Prebuilt deploy requires a files array.");
@@ -8260,6 +8339,8 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
         WHERE repository->>'provider' = $1
           AND repository->>'owner' = $2
           AND repository->>'name' = $3
+          AND status = 'active'
+        ORDER BY created_at ASC
         LIMIT 1
       `,
       [repository.provider, repository.owner, repository.name]
@@ -8500,21 +8581,8 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
       throw new SiteFlowNotFoundError(`Deployment has no build log stream: ${deploymentId}`);
     }
 
-    const cursorId = cursor && /^\d+$/.test(cursor) ? Number.parseInt(cursor, 10) : 0;
-    const pageSize = 100;
-    const result = await this.pool.query<BuildLogRow>(
-      `
-        SELECT id::text, line
-        FROM siteflow_build_logs
-        WHERE build_job_id = $1 AND id > $2
-        ORDER BY id ASC
-        LIMIT $3
-      `,
-      [buildJobId, cursorId, pageSize + 1]
-    );
-    const rows = result.rows.slice(0, pageSize);
-    const hasMore = result.rows.length > pageSize;
-    const nextCursor = hasMore ? rows[rows.length - 1]?.id : undefined;
+    const tail = await this.readBuildLogTail(buildJobId, cursor);
+    const nextCursor = tail.hasMore ? tail.nextCursor : undefined;
 
     return {
       deploymentId,
@@ -8522,14 +8590,34 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
         deploymentId,
         buildJobId,
         cursor: cursor ?? "0",
-        lines: rows.map((row) => row.line),
+        lines: tail.rows.map((row) => row.line),
         nextCursor,
-        complete: !hasMore,
+        complete: !tail.hasMore,
         fetchedAt: new Date().toISOString()
       },
       nextCursor,
-      hasMore
+      hasMore: tail.hasMore
     };
+  }
+
+  private async readBuildLogTail(buildJobId: SiteFlowId, cursor?: string): Promise<{ rows: BuildLogRow[]; nextCursor: string; hasMore: boolean }> {
+    const cursorId = cursor && /^\d+$/.test(cursor) ? cursor : "0";
+    const pageSize = 100;
+    const result = await this.pool.query<BuildLogRow>(
+      `
+        SELECT id::text, line
+        FROM siteflow_build_logs
+        WHERE build_job_id = $1 AND id > $2::bigint
+        ORDER BY id ASC
+        LIMIT $3
+      `,
+      [buildJobId, cursorId, pageSize + 1]
+    );
+    const rows = result.rows.slice(0, pageSize);
+    const hasMore = result.rows.length > pageSize;
+    const nextCursor = rows[rows.length - 1]?.id ?? cursorId;
+
+    return { rows, nextCursor, hasMore };
   }
 
   private async ensureDefaultEnvironments(client: Queryable, projectId: SiteFlowId, productionBranch: string) {

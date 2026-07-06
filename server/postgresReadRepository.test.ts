@@ -5,7 +5,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { sealSecretValue } from "../src/lib/sealedSecrets";
 import { isVanityBaseSubdomain, PostgresSiteFlowReadRepository } from "./postgresReadRepository";
-import { SiteFlowConflictError } from "./readRepository";
+import { SiteFlowConflictError, SiteFlowNotFoundError } from "./readRepository";
 
 function prebuiltFile(filePath: string, content: string) {
   const bytes = Buffer.from(content);
@@ -63,6 +63,94 @@ function projectTableRow(overrides: Record<string, unknown> = {}) {
     updated_at: now,
     ...overrides
   };
+}
+
+type TestBuildJobStatus = "queued" | "running" | "succeeded" | "failed" | "canceled" | "timed_out";
+
+function buildJobLogPool(
+  status: TestBuildJobStatus | undefined,
+  lines: Array<{ id: string; line: string }>
+) {
+  const queries: Array<{ text: string; values?: unknown[] }> = [];
+  const pool = {
+    query: async (text: string, values?: unknown[]) => {
+      queries.push({ text, values });
+
+      if (text.includes("FROM siteflow_build_jobs")) {
+        return {
+          rows: status ? [{ status }] : [],
+          rowCount: status ? 1 : 0
+        };
+      }
+
+      if (text.includes("FROM siteflow_build_logs")) {
+        const cursor = BigInt(String(values?.[1] ?? "0"));
+        const limit = Number(values?.[2] ?? 101);
+
+        return {
+          rows: lines
+            .filter((row) => BigInt(row.id) > cursor)
+            .slice(0, limit),
+          rowCount: null
+        };
+      }
+
+      throw new Error(`Unexpected query: ${text}`);
+    }
+  };
+
+  return { pool, queries };
+}
+
+function latestBuildJobLogPool(options: {
+  projectExists?: boolean;
+  jobs: Array<{ id: string; status: TestBuildJobStatus; queuedAt: string }>;
+  linesByBuildJobId?: Record<string, Array<{ id: string; line: string }>>;
+}) {
+  const queries: Array<{ text: string; values?: unknown[] }> = [];
+  const pool = {
+    query: async (text: string, values?: unknown[]) => {
+      queries.push({ text, values });
+
+      if (text.includes("SELECT 1") && text.includes("FROM siteflow_projects") && text.includes("WHERE id = $1")) {
+        return {
+          rows: options.projectExists === false ? [] : [{ exists: 1 }],
+          rowCount: options.projectExists === false ? 0 : 1
+        };
+      }
+
+      if (text.includes("SELECT id, status FROM siteflow_build_jobs") && text.includes("WHERE project_id = $1")) {
+        if (!text.includes("ORDER BY queued_at DESC") || !text.includes("LIMIT 1")) {
+          throw new Error(`Latest build job query must order by queued_at desc: ${text}`);
+        }
+
+        const latest = [...options.jobs].sort((left, right) => right.queuedAt.localeCompare(left.queuedAt))[0];
+
+        return {
+          rows: latest ? [{ id: latest.id, status: latest.status }] : [],
+          rowCount: latest ? 1 : 0
+        };
+      }
+
+      if (text.includes("FROM siteflow_build_logs")) {
+        const buildJobId = String(values?.[0] ?? "");
+        const cursor = BigInt(String(values?.[1] ?? "0"));
+        const limit = Number(values?.[2] ?? 101);
+        const lines = options.linesByBuildJobId?.[buildJobId] ?? [];
+
+        return {
+          rows: lines
+            .filter((row) => BigInt(row.id) > cursor)
+            .slice(0, limit),
+          rowCount: null
+        };
+      }
+
+      throw new Error(`Unexpected query: ${text}`);
+    }
+  };
+
+  return { pool, queries };
 }
 
 function projectDomainMutationPool(options: {
@@ -649,6 +737,137 @@ describe("PostgresSiteFlowReadRepository", () => {
     expect(isVanityBaseSubdomain("a.b.siteflow.w33d.xyz", "siteflow.w33d.xyz")).toBe(false);
     expect(isVanityBaseSubdomain("docs.example.com", "siteflow.w33d.xyz")).toBe(false);
     expect(isVanityBaseSubdomain("-bad.siteflow.w33d.xyz", "siteflow.w33d.xyz")).toBe(false);
+  });
+
+  it("reads build job log chunks with cursor pagination for running jobs", async () => {
+    const lines = Array.from({ length: 101 }, (_, index) => ({
+      id: String(index + 1),
+      line: `line-${index + 1}`
+    }));
+    const { pool, queries } = buildJobLogPool("running", lines);
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow"
+    });
+
+    const first = await repository.getBuildJobLogChunk("build_running");
+    const second = await repository.getBuildJobLogChunk("build_running", first.nextCursor);
+    const logQueries = queries.filter((query) => query.text.includes("FROM siteflow_build_logs"));
+
+    expect(first).toEqual({
+      buildJobId: "build_running",
+      status: "running",
+      lines: lines.slice(0, 100).map((row) => row.line),
+      nextCursor: "100",
+      hasMore: true,
+      complete: false
+    });
+    expect(second).toEqual({
+      buildJobId: "build_running",
+      status: "running",
+      lines: ["line-101"],
+      nextCursor: "101",
+      hasMore: false,
+      complete: false
+    });
+    expect(logQueries[0]?.values).toEqual(["build_running", "0", 101]);
+    expect(logQueries[1]?.values).toEqual(["build_running", "100", 101]);
+  });
+
+  it("marks failed build job logs complete once drained", async () => {
+    const { pool } = buildJobLogPool("failed", [
+      { id: "42", line: "build failed" }
+    ]);
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow"
+    });
+
+    await expect(repository.getBuildJobLogChunk("build_failed", "42")).resolves.toEqual({
+      buildJobId: "build_failed",
+      status: "failed",
+      lines: [],
+      nextCursor: "42",
+      hasMore: false,
+      complete: true
+    });
+  });
+
+  it("rejects unknown build job log chunks", async () => {
+    const { pool, queries } = buildJobLogPool(undefined, []);
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow"
+    });
+
+    await expect(repository.getBuildJobLogChunk("build_missing")).rejects.toBeInstanceOf(SiteFlowNotFoundError);
+    expect(queries.some((query) => query.text.includes("FROM siteflow_build_logs"))).toBe(false);
+  });
+
+  it("reads the latest build job log chunk for a project", async () => {
+    const { pool, queries } = latestBuildJobLogPool({
+      jobs: [
+        { id: "build_old", status: "succeeded", queuedAt: "2026-06-08T12:00:00.000Z" },
+        { id: "build_new", status: "running", queuedAt: "2026-06-08T12:05:00.000Z" }
+      ],
+      linesByBuildJobId: {
+        build_old: [{ id: "2", line: "old build" }],
+        build_new: [
+          { id: "2", line: "npm ci" },
+          { id: "3", line: "npm run build" }
+        ]
+      }
+    });
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow"
+    });
+
+    const result = await repository.getLatestBuildJobLogChunk("project_docs", "1");
+    const latestQuery = queries.find((query) => query.text.includes("SELECT id, status FROM siteflow_build_jobs"));
+    const logQuery = queries.find((query) => query.text.includes("FROM siteflow_build_logs"));
+
+    expect(result).toEqual({
+      buildJobId: "build_new",
+      status: "running",
+      lines: ["npm ci", "npm run build"],
+      nextCursor: "3",
+      hasMore: false,
+      complete: false
+    });
+    expect(latestQuery?.values).toEqual(["project_docs"]);
+    expect(latestQuery?.text).toContain("ORDER BY queued_at DESC");
+    expect(latestQuery?.text).toContain("LIMIT 1");
+    expect(logQuery?.values).toEqual(["build_new", "1", 101]);
+  });
+
+  it("returns the none build log contract when a project has no build jobs", async () => {
+    const { pool, queries } = latestBuildJobLogPool({
+      jobs: []
+    });
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow"
+    });
+
+    await expect(repository.getLatestBuildJobLogChunk("project_docs", "17")).resolves.toEqual({
+      buildJobId: "",
+      status: "none",
+      lines: [],
+      nextCursor: "17",
+      hasMore: false,
+      complete: true
+    });
+    expect(queries.some((query) => query.text.includes("FROM siteflow_build_logs"))).toBe(false);
+  });
+
+  it("rejects latest build job log chunks for unknown projects", async () => {
+    const { pool, queries } = latestBuildJobLogPool({
+      projectExists: false,
+      jobs: []
+    });
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow"
+    });
+
+    await expect(repository.getLatestBuildJobLogChunk("project_missing")).rejects.toBeInstanceOf(SiteFlowNotFoundError);
+    expect(queries.some((query) => query.text.includes("FROM siteflow_build_jobs"))).toBe(false);
+    expect(queries.some((query) => query.text.includes("FROM siteflow_build_logs"))).toBe(false);
   });
 
   it("adds project domains as unverified by default", async () => {

@@ -13,6 +13,7 @@ import type {
   CronJobDisableReadModel,
   CronJobListReadModel,
   CronJobRunReadModel,
+  BuildJobLogChunkReadModel,
   DeployHookCreateReadModel,
   DeployHookListReadModel,
   DeployHookRevokeReadModel,
@@ -240,6 +241,8 @@ export interface SiteFlowReadRepository {
   abortRollingRelease(command: AbortRollingReleaseCommand): Promise<RollingReleaseCommandReadModel>;
   pollOperation(operationId: SiteFlowId): Promise<OperationSnapshotReadModel>;
   getLogChunk(deploymentId: SiteFlowId, cursor?: string): Promise<LogChunkReadModel>;
+  getBuildJobLogChunk(buildJobId: SiteFlowId, cursor?: string): Promise<BuildJobLogChunkReadModel>;
+  getLatestBuildJobLogChunk(projectId: SiteFlowId, cursor?: string): Promise<BuildJobLogChunkReadModel>;
   deployPrebuilt(command: PrebuiltDeployCommand): Promise<PrebuiltDeployResult>;
   resolveArtifactRoute(host: string, bucketKey?: string): Promise<ArtifactRoute | undefined>;
   recordFunctionInvocation(invocation: FunctionInvocation): Promise<void>;
