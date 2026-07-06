@@ -68,6 +68,8 @@ export interface DeploymentSummaryReadModel {
   version: string;
   commitSha: string;
   branch: string;
+  previewHost: string;
+  previewUrl: string;
   status: DeploymentStatus;
   artifactVerificationStatus: ArtifactVerificationStatus;
   routeRevisionStatus: RouteRevisionStatus;

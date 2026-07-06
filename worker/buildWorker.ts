@@ -1,7 +1,7 @@
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, statfs } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { ProjectBuildSettings, ReleaseChannelName, RepositoryBinding, RoutingHeader, SiteFlowId, SourceEvent } from "../src/domain/siteflow.js";
+import type { FunctionApiStyle, ProjectBuildSettings, ReleaseChannelName, RepositoryBinding, RoutingHeader, SiteFlowId, SourceEvent } from "../src/domain/siteflow.js";
 import { redactLogLine } from "../src/lib/redaction.js";
 import { sealSecretValue } from "../src/lib/sealedSecrets.js";
 import type { PrebuiltImageConfig } from "../src/lib/api/deployContracts.js";
@@ -26,6 +26,7 @@ export interface BuildJobResult {
   deploymentId: SiteFlowId;
   previewHost: string;
   previewUrl: string;
+  productionHost?: string;
   artifact: PublishedBuildArtifact;
   crons?: BuildCronJob[];
 }
@@ -143,6 +144,7 @@ interface SourceFunctionConfig {
   timeoutMs?: number;
   memoryMb?: number;
   concurrency?: number;
+  apiStyle?: FunctionApiStyle;
   includeFiles?: string[];
   excludeFiles?: string[];
   regions?: string[];
@@ -180,7 +182,7 @@ function isSensitiveBuildEnvKey(key: string) {
     return false;
   }
 
-  return /(?:^|_)(?:SECRET|TOKEN|PASSWORD|PASS|PRIVATE_KEY|API_KEY|AUTH)(?:_|$)/i.test(key);
+  return /(?:^|_)(?:SECRET|TOKEN|PASSWORD|PASS|PRIVATE_KEY|API_KEY|SERVICE_KEY|AUTH)(?:_|$)/i.test(key);
 }
 
 function blockedArtifactContentValues(values: Record<string, string> | undefined) {
@@ -193,6 +195,14 @@ function sensitiveBuildEnvKeys(values: Record<string, string> | undefined) {
   return Object.keys(values ?? {})
     .filter(isSensitiveBuildEnvKey)
     .sort();
+}
+
+function clientBuildEnvVariables(values: Record<string, string> | undefined) {
+  return Object.fromEntries(
+    Object.entries(values ?? {})
+      .filter(([key]) => !isSensitiveBuildEnvKey(key))
+      .sort(([left], [right]) => left.localeCompare(right))
+  );
 }
 
 function assertNetworkedDockerBuildEnvAllowed(
@@ -514,6 +524,8 @@ async function readSourceVercelConfig(projectRoot: string): Promise<SourceVercel
       const maxDuration = typeof config.maxDuration === "number" ? config.maxDuration : undefined;
       const memory = parsed.fluid === true ? undefined : typeof config.memory === "number" ? config.memory : undefined;
       const concurrency = typeof config.concurrency === "number" ? config.concurrency : undefined;
+      const rawApiStyle = config.api ?? config.apiStyle;
+      const apiStyle = rawApiStyle === "node" || rawApiStyle === "fetch" ? rawApiStyle : undefined;
       const includeFiles = stringList(config.includeFiles)?.map((value) => safeFilePattern(value, "includeFiles"));
       const excludeFiles = stringList(config.excludeFiles)?.map((value) => safeFilePattern(value, "excludeFiles"));
       const regions = vercelRegionList(config.regions);
@@ -525,6 +537,7 @@ async function readSourceVercelConfig(projectRoot: string): Promise<SourceVercel
           timeoutMs: maxDuration === undefined ? undefined : Math.max(1, Math.round(maxDuration * 1000)),
           memoryMb: memory === undefined ? undefined : Math.round(memory),
           concurrency: concurrency === undefined ? undefined : Math.round(concurrency),
+          apiStyle,
           includeFiles,
           excludeFiles,
           regions,
@@ -535,6 +548,7 @@ async function readSourceVercelConfig(projectRoot: string): Promise<SourceVercel
       entry.timeoutMs !== undefined
       || entry.memoryMb !== undefined
       || entry.concurrency !== undefined
+      || entry.apiStyle !== undefined
       || Boolean(entry.includeFiles?.length)
       || Boolean(entry.excludeFiles?.length)
       || Boolean(entry.regions?.length)
@@ -651,12 +665,23 @@ function functionArtifactSourcePath(entry: FunctionArtifactInput) {
   return entry.artifactPath.replace(/^\.siteflow\/functions\//, "");
 }
 
+function nodeApiStyleSniff(source: string): boolean {
+  // Detect the Vercel/Node handler ONLY by its default export's second parameter being named
+  // res/response. The earlier body-text `res.*(...)` heuristic was removed: it false-positived on
+  // fetch-style handlers that name an upstream fetch Response `res` (e.g. `const res = await fetch()`
+  // then `res.json()`), which would wrongly flip a working fetch function to node on rebuild. When
+  // the signature is ambiguous, apiStyle stays 'fetch' (safe default); users force node via vercel.json.
+  return /export\s+default\s+(?:async\s+)?function[^(]*\([^,)]*,\s*(?:res|response)\b/.test(source)
+    || /export\s+default\s+(?:async\s+)?\([^,)]*,\s*(?:res|response)\b/.test(source);
+}
+
 function applyFunctionConfig(entries: FunctionArtifactInput[], config: SourceVercelConfig) {
   const configs = config.functions;
 
   if (!configs?.length) {
     return entries.map((entry) => ({
       ...entry,
+      apiStyle: entry.apiStyle,
       regions: config.regions ?? entry.regions,
       failoverRegions: config.failoverRegions ?? entry.failoverRegions
     }));
@@ -670,6 +695,7 @@ function applyFunctionConfig(entries: FunctionArtifactInput[], config: SourceVer
       timeoutMs: matched?.timeoutMs ?? entry.timeoutMs,
       memoryMb: matched?.memoryMb ?? entry.memoryMb,
       concurrency: matched?.concurrency ?? entry.concurrency,
+      apiStyle: matched?.apiStyle ?? entry.apiStyle,
       regions: matched?.regions ?? config.regions ?? entry.regions,
       failoverRegions: matched?.failoverRegions ?? config.failoverRegions ?? entry.failoverRegions
     };
@@ -957,12 +983,15 @@ async function collectFunctionEntrypoints(
       throw new Error(`Function source entry escapes the project root: api/${relativePath}.`);
     }
 
+    const source = await readFile(fullPath, "utf8");
+
     entries.push({
       path: functionRoutePath(relativePath),
       sourcePath: fullPath,
       artifactPath: `.siteflow/functions/api/${relativePath}`,
       runtime: "nodejs20.x",
-      handler: "default"
+      handler: "default",
+      apiStyle: nodeApiStyleSniff(source) ? "node" : undefined
     });
   }
 }
@@ -1058,6 +1087,7 @@ export async function executeBuildJob(job: QueuedBuildJob, options: BuildExecuti
       ...(sourceConfig.buildEnv ?? {}),
       ...(job.environmentVariables ?? {})
     };
+    const releaseChannel = routeChannelFor(job.sourceEvent, job.productionBranch ?? job.repository.defaultBranch);
     assertNetworkedDockerBuildEnvAllowed(options, buildEnvironmentVariables);
     const appendLog = async (line: string) => {
       await options.appendLog?.(line);
@@ -1126,6 +1156,7 @@ export async function executeBuildJob(job: QueuedBuildJob, options: BuildExecuti
       entrypoint: options.entrypoint,
       functions,
       extraFiles,
+      clientEnvironmentVariables: clientBuildEnvVariables(buildEnvironmentVariables),
       maxArtifactBytes: options.maxArtifactBytes,
       maxArtifactFiles: options.maxArtifactFiles,
       blockedContentValues: blockedArtifactContentValues(buildEnvironmentVariables),
@@ -1134,7 +1165,7 @@ export async function executeBuildJob(job: QueuedBuildJob, options: BuildExecuti
         repository: `${job.repository.owner}/${job.repository.name}`,
         branch: job.sourceEvent.branch,
         commitSha: job.sourceEvent.commitSha,
-        environment: routeChannelFor(job.sourceEvent, job.productionBranch ?? job.repository.defaultBranch),
+        environment: releaseChannel,
         ...(sourceConfig.public !== undefined ? { public: sourceConfig.public } : {}),
         ...(sourceConfig.fluid !== undefined ? { fluid: sourceConfig.fluid } : {}),
         ...(sourceConfig.bunVersion !== undefined ? { bunVersion: sourceConfig.bunVersion } : {}),
@@ -1146,6 +1177,7 @@ export async function executeBuildJob(job: QueuedBuildJob, options: BuildExecuti
       }
     });
     const previewHost = previewHostFor(job, artifact.deploymentId, options.baseDomain);
+    const productionHost = releaseChannel === "production" && job.projectSlug ? `${job.projectSlug}.${options.baseDomain}` : undefined;
 
     await appendLog(`Artifact published as ${artifact.deploymentId}.`);
 
@@ -1154,6 +1186,7 @@ export async function executeBuildJob(job: QueuedBuildJob, options: BuildExecuti
       deploymentId: artifact.deploymentId,
       previewHost,
       previewUrl: `${options.publicScheme ?? "https"}://${previewHost}`,
+      productionHost,
       artifact,
       crons: sourceConfig.crons
     };

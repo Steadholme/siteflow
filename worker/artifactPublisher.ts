@@ -10,6 +10,7 @@ export interface FunctionArtifactInput {
   artifactPath: string;
   runtime: FunctionEntrypoint["runtime"];
   runtimeIsolation?: FunctionEntrypoint["runtimeIsolation"];
+  apiStyle?: FunctionEntrypoint["apiStyle"];
   handler?: FunctionEntrypoint["handler"];
   methods?: string[];
   timeoutMs?: number;
@@ -37,6 +38,7 @@ export interface ArtifactPublishOptions {
   entrypoint?: string;
   functions?: FunctionArtifactInput[];
   extraFiles?: ArtifactExtraFileInput[];
+  clientEnvironmentVariables?: Record<string, string>;
   metadata?: Record<string, unknown>;
   maxArtifactBytes?: number;
   maxArtifactFiles?: number;
@@ -186,6 +188,76 @@ async function assertNoBlockedContentValues(files: ArtifactFile[], values: Artif
         throw new Error(`Build artifact contains blocked secret value for ${needle.label} in ${file.relativePath}.`);
       }
     }
+  }
+}
+
+function clientEnvironmentVariableMap(values: Record<string, string> | undefined) {
+  return Object.fromEntries(
+    Object.entries(values ?? {})
+      .filter(([, value]) => typeof value === "string")
+      .sort(([left], [right]) => left.localeCompare(right))
+  ) as Record<string, string>;
+}
+
+function injectClientEnvironmentScript(html: string) {
+  const script = '<script src="/__siteflow/env.js"></script>';
+
+  if (html.includes("/__siteflow/env.js")) {
+    return html;
+  }
+
+  // Insert right after <head>/<html>/<!doctype> (in that preference) so window.env is defined
+  // before any app script, without ever placing content ahead of the doctype (which would force
+  // quirks mode). Only a document with none of these gets the bare prepend (no doctype to displace).
+  for (const pattern of [/<head\b[^>]*>/i, /<html\b[^>]*>/i, /<!doctype\b[^>]*>/i]) {
+    const match = html.match(pattern);
+
+    if (match?.index !== undefined) {
+      const insertAt = match.index + match[0].length;
+      return `${html.slice(0, insertAt)}${script}${html.slice(insertAt)}`;
+    }
+  }
+
+  return `${script}${html}`;
+}
+
+async function addClientEnvironmentShim(files: ArtifactFile[], artifactPaths: Set<string>, values: Record<string, string> | undefined) {
+  const environmentVariables = clientEnvironmentVariableMap(values);
+  const keys = Object.keys(environmentVariables);
+
+  if (keys.length === 0) {
+    return;
+  }
+
+  const shimPath = "__siteflow/env.js";
+
+  if (artifactPaths.has(shimPath)) {
+    throw new Error(`Client environment shim path conflicts with existing artifact: ${shimPath}`);
+  }
+
+  const shimBytes = Buffer.from(`window.env = Object.assign(window.env || {}, ${JSON.stringify(environmentVariables)});`, "utf8");
+  files.push({
+    relativePath: shimPath,
+    bytes: shimBytes,
+    size: shimBytes.byteLength
+  });
+  artifactPaths.add(shimPath);
+
+  for (const file of files) {
+    if (!file.relativePath.endsWith(".html")) {
+      continue;
+    }
+
+    const original = await artifactFileBytes(file);
+    const originalHtml = original.toString("utf8");
+    const injected = injectClientEnvironmentScript(originalHtml);
+
+    if (injected === originalHtml) {
+      continue;
+    }
+
+    file.bytes = Buffer.from(injected, "utf8");
+    file.size = file.bytes.byteLength;
   }
 }
 
@@ -396,7 +468,8 @@ async function publishBuildArtifactWithDependencies(
       sourcePath: safeArtifactPath(entry.artifactPath),
       runtime: entry.runtime,
       runtimeIsolation: entry.runtimeIsolation ?? "same_process",
-      handler: entry.handler ?? "default"
+      handler: entry.handler ?? "default",
+      apiStyle: entry.apiStyle ?? "fetch"
     };
 
     if (entry.methods && entry.methods.length > 0) {
@@ -463,6 +536,8 @@ async function publishBuildArtifactWithDependencies(
     });
     artifactPaths.add(artifactPath);
   }
+
+  await addClientEnvironmentShim(files, artifactPaths, options.clientEnvironmentVariables);
 
   assertArtifactBudget(files, options, "publish preflight");
   await assertNoBlockedContentValues(files, normalizedBlockedContentValues(options.blockedContentValues));

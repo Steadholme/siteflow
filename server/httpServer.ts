@@ -16,10 +16,11 @@ import {
   type PrebuiltImageConfig,
   type PrebuiltUploadBudget
 } from "../src/lib/api/deployContracts.js";
-import { assertReleaseChannel, SiteFlowNotFoundError, type ArtifactRoute, type LogDrainDeliveryPlan, type SiteFlowAuthPrincipal, type SiteFlowReadRepository } from "./readRepository.js";
+import { assertReleaseChannel, SiteFlowConflictError, SiteFlowInputError, SiteFlowNotFoundError, type ArtifactRoute, type LogDrainDeliveryPlan, type SiteFlowAuthPrincipal, type SiteFlowReadRepository } from "./readRepository.js";
 import { gatewayIdentityEmail, gatewayIdentityGroups, gatewayIdentityOk, gatewayIdentitySubject } from "./gatewayIdentity.js";
 import { isLoomWebhookPayload, loomPayloadToGeneric } from "./loomWebhook.js";
 import { serveConsoleStatic } from "./consoleStatic.js";
+import { createNodeCompat } from "./nodeCompat.js";
 import {
   evaluateReleaseEvidenceBundle,
   releaseEvidenceBundleAttestationSignatureVerified,
@@ -3299,6 +3300,242 @@ function runtimeResultToResponse(result) {
   return new Response(String(result));
 }
 
+async function sendRuntimeResponse(runtimeResponse) {
+  const body = responseStatusForbidsBody(runtimeResponse.status)
+    ? Buffer.alloc(0)
+    : Buffer.from(await runtimeResponse.arrayBuffer());
+  const setCookie = typeof runtimeResponse.headers.getSetCookie === "function"
+    ? runtimeResponse.headers.getSetCookie()
+    : [];
+  const headers = [];
+
+  runtimeResponse.headers.forEach((value, key) => {
+    if (key.toLowerCase() === "set-cookie" && setCookie.length > 0) {
+      return;
+    }
+
+    headers.push([key, value]);
+  });
+
+  send({
+    ok: true,
+    response: {
+      status: runtimeResponse.status,
+      headers,
+      setCookie,
+      bodyBase64: body.toString("base64")
+    }
+  });
+}
+
+function createNodeCompat(runtimeRequest, requestBody, runtimeContext) {
+  const requestUrl = new URL(runtimeRequest.url);
+  const headers = new Map();
+  const chunks = [];
+  let statusCode = 200;
+  let settled = false;
+  let resolveResponse;
+  const settledPromise = new Promise((resolve) => {
+    resolveResponse = resolve;
+  });
+  const appendMultiValue = (target, key, value) => {
+    const current = target[key];
+    target[key] = current === undefined ? value : Array.isArray(current) ? [...current, value] : [current, value];
+  };
+  const requestHeadersObject = (source) => {
+    const next = {};
+    source.forEach((value, key) => {
+      const lowerKey = key.toLowerCase();
+      next[lowerKey] = next[lowerKey] ? next[lowerKey] + ", " + value : value;
+    });
+    return next;
+  };
+  const requestQueryObject = (searchParams) => {
+    const next = {};
+    searchParams.forEach((value, key) => appendMultiValue(next, key, value));
+    return next;
+  };
+  const requestCookiesObject = (cookieHeader) => {
+    const cookies = {};
+    for (const entry of (cookieHeader || "").split(";")) {
+      const index = entry.indexOf("=");
+      if (index <= 0) {
+        continue;
+      }
+      const key = entry.slice(0, index).trim();
+      if (!key) {
+        continue;
+      }
+      try {
+        cookies[key] = decodeURIComponent(entry.slice(index + 1).trim());
+      } catch {
+        cookies[key] = entry.slice(index + 1).trim();
+      }
+    }
+    return cookies;
+  };
+  const parseRequestBody = () => {
+    if (!requestBody || requestBody.byteLength === 0) {
+      return undefined;
+    }
+    const contentType = (runtimeRequest.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+    if (contentType === "application/json") {
+      try {
+        return JSON.parse(requestBody.toString("utf8"));
+      } catch (_e) {
+        return requestBody;
+      }
+    }
+    if (contentType === "application/x-www-form-urlencoded") {
+      return requestQueryObject(new URLSearchParams(requestBody.toString("utf8")));
+    }
+    if (contentType.startsWith("text/")) {
+      return requestBody.toString("utf8");
+    }
+    return requestBody;
+  };
+  const bodyChunk = (value) => {
+    if (Buffer.isBuffer(value)) {
+      return value;
+    }
+    if (typeof value === "string") {
+      return Buffer.from(value, "utf8");
+    }
+    if (value instanceof ArrayBuffer) {
+      return Buffer.from(value);
+    }
+    if (ArrayBuffer.isView(value)) {
+      return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    }
+    return Buffer.from(String(value), "utf8");
+  };
+  const applyHeaders = (nextHeaders) => {
+    if (!nextHeaders) {
+      return;
+    }
+    if (nextHeaders instanceof Headers) {
+      nextHeaders.forEach((value, key) => headers.set(key.toLowerCase(), { key, value }));
+      return;
+    }
+    for (const [key, value] of Object.entries(nextHeaders)) {
+      if (value !== undefined) {
+        headers.set(key.toLowerCase(), { key, value });
+      }
+    }
+  };
+  const responseHeaders = () => {
+    const next = new Headers();
+    for (const { key, value } of headers.values()) {
+      if (Array.isArray(value)) {
+        for (const entry of value) {
+          next.append(key, entry);
+        }
+      } else {
+        next.set(key, String(value));
+      }
+    }
+    return next;
+  };
+  const finalize = () => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    res.headersSent = true;
+    resolveResponse(new Response(responseStatusForbidsBody(statusCode) ? null : Buffer.concat(chunks), {
+      status: statusCode,
+      headers: responseHeaders()
+    }));
+  };
+  const res = {
+    get statusCode() {
+      return statusCode;
+    },
+    set statusCode(value) {
+      statusCode = value;
+    },
+    headersSent: false,
+    status(code) {
+      statusCode = code;
+      return res;
+    },
+    setHeader(key, value) {
+      headers.set(key.toLowerCase(), { key, value });
+      return res;
+    },
+    getHeader(key) {
+      return headers.get(key.toLowerCase())?.value;
+    },
+    removeHeader(key) {
+      headers.delete(key.toLowerCase());
+      return res;
+    },
+    writeHead(code, nextHeaders) {
+      statusCode = code;
+      applyHeaders(nextHeaders);
+      return res;
+    },
+    write(chunk) {
+      res.headersSent = true;
+      chunks.push(bodyChunk(chunk));
+      return true;
+    },
+    end(chunk) {
+      if (chunk !== undefined) {
+        res.write(chunk);
+      }
+      finalize();
+      return res;
+    },
+    json(value) {
+      res.setHeader("content-type", "application/json; charset=utf-8");
+      return res.end(JSON.stringify(value));
+    },
+    send(value) {
+      if (value === undefined || value === null) {
+        return res.end();
+      }
+      if (Buffer.isBuffer(value) || value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+        if (!res.getHeader("content-type")) {
+          res.setHeader("content-type", "application/octet-stream");
+        }
+        return res.end(value);
+      }
+      if (typeof value === "object") {
+        return res.json(value);
+      }
+      if (!res.getHeader("content-type")) {
+        res.setHeader("content-type", "text/plain; charset=utf-8");
+      }
+      return res.end(String(value));
+    },
+    redirect(statusOrLocation, location) {
+      const code = typeof statusOrLocation === "number" ? statusOrLocation : 302;
+      const target = typeof statusOrLocation === "number" ? location : statusOrLocation;
+      statusCode = code;
+      if (target) {
+        res.setHeader("location", target);
+      }
+      return res.end();
+    },
+    settled() {
+      return settledPromise;
+    }
+  };
+  return {
+    req: {
+      method: runtimeRequest.method,
+      url: requestUrl.pathname + requestUrl.search,
+      headers: requestHeadersObject(runtimeRequest.headers),
+      query: requestQueryObject(requestUrl.searchParams),
+      cookies: requestCookiesObject(runtimeRequest.headers.get("cookie")),
+      body: parseRequestBody(),
+      params: runtimeContext.params
+    },
+    res
+  };
+}
+
 (async () => {
   try {
     const payload = JSON.parse(await readStdin());
@@ -3318,32 +3555,14 @@ function runtimeResultToResponse(result) {
       throw new Error("Function " + payload.functionPath + " does not export a callable handler.");
     }
 
-    const runtimeResponse = await runtimeResultToResponse(await handler(request, payload.context));
-    const body = responseStatusForbidsBody(runtimeResponse.status)
-      ? Buffer.alloc(0)
-      : Buffer.from(await runtimeResponse.arrayBuffer());
-    const setCookie = typeof runtimeResponse.headers.getSetCookie === "function"
-      ? runtimeResponse.headers.getSetCookie()
-      : [];
-    const headers = [];
-
-    runtimeResponse.headers.forEach((value, key) => {
-      if (key.toLowerCase() === "set-cookie" && setCookie.length > 0) {
-        return;
-      }
-
-      headers.push([key, value]);
-    });
-
-    send({
-      ok: true,
-      response: {
-        status: runtimeResponse.status,
-        headers,
-        setCookie,
-        bodyBase64: body.toString("base64")
-      }
-    });
+    if (payload.apiStyle === "node") {
+      const { req, res } = createNodeCompat(request, requestBody, payload.context);
+      const returned = await handler(req, res);
+      await sendRuntimeResponse((returned !== null && returned !== undefined && returned !== res) ? runtimeResultToResponse(returned) : await res.settled());
+    } else {
+      const runtimeResponse = await runtimeResultToResponse(await handler(request, payload.context));
+      await sendRuntimeResponse(runtimeResponse);
+    }
   } catch (error) {
     send({
       ok: false,
@@ -3476,6 +3695,7 @@ async function invokeIsolatedFunction(
   child.stdin.end(JSON.stringify({
     modulePath: functionPath,
     handler: entry.handler,
+    apiStyle: entry.apiStyle ?? "fetch",
     functionPath: entry.path,
     requestId: context.requestId,
     request: {
@@ -3822,7 +4042,10 @@ async function invokeFunctionRoute(context: RouteContext, route: ArtifactRoute, 
   const secretPatterns = redactionPatternsFor(runtimeEnvironment);
   const timeoutMs = entry.timeoutMs ?? 10000;
   const concurrencyLimit = entry.concurrency ?? 50;
-  const runtimeIsolation = entry.runtimeIsolation ?? "same_process";
+    // Keeping same_process as the default avoids per-request isolate spawn and module re-import
+    // latency until a warm isolated_process pool exists.
+    const runtimeIsolation = entry.runtimeIsolation ?? "same_process";
+    const apiStyle = entry.apiStyle ?? "fetch";
   let releaseConcurrency: (() => void) | undefined;
 
   try {
@@ -3895,6 +4118,15 @@ async function invokeFunctionRoute(context: RouteContext, route: ArtifactRoute, 
         () => withTimeout(
           withRuntimeEnvironment(
             runtimeEnvironment,
+            apiStyle === "node"
+              ? async () => {
+                const { req, res } = createNodeCompat(runtimeRequest, requestBody, runtimeContext);
+                const returned = await handler(req, res);
+                // `res.status().json()` etc. return `res`; the idiomatic `return res.status(x).json(...)`
+                // must resolve via res.settled(), NOT be treated as a returned Response.
+                return (returned !== null && returned !== undefined && returned !== res) ? runtimeResultToResponse(returned) : await res.settled();
+              }
+              :
             async () => runtimeResultToResponse(await handler(runtimeRequest, runtimeContext))
           ),
           timeoutMs
@@ -4529,6 +4761,26 @@ async function handleApiRoute(context: RouteContext, options: SiteFlowServerOpti
       }
 
       sendJson(response, 200, await repository.updateProject(projectId, bodyWithActor(await readJsonBody(request), auth.actor) as never), options.allowedOrigin);
+      return;
+    }
+
+    if (request.method === "POST" && segments.length === 4 && segments[3] === "domains") {
+      const auth = await authorizeRequest(request, response, options, "admin", projectId);
+      if (!auth) {
+        return;
+      }
+
+      sendJson(response, 201, await repository.addProjectDomain(projectId, bodyWithActor(await readJsonBody(request), auth.actor) as never), options.allowedOrigin);
+      return;
+    }
+
+    if (request.method === "DELETE" && segments.length === 5 && segments[3] === "domains") {
+      const auth = await authorizeRequest(request, response, options, "admin", projectId);
+      if (!auth) {
+        return;
+      }
+
+      sendJson(response, 200, await repository.removeProjectDomain(projectId, decodeURIComponent(segments[4]), auth.actor), options.allowedOrigin);
       return;
     }
 
@@ -5488,6 +5740,18 @@ export function createSiteFlowServer(options: SiteFlowServerOptions) {
       if (error instanceof SiteFlowNotFoundError) {
         requestLogEntry.errorClass = error.name;
         sendJson(response, 404, { message: error.message }, options.allowedOrigin, request.method);
+        return;
+      }
+
+      if (error instanceof SiteFlowConflictError) {
+        requestLogEntry.errorClass = error.name;
+        sendJson(response, 409, { message: error.message }, options.allowedOrigin, request.method);
+        return;
+      }
+
+      if (error instanceof SiteFlowInputError) {
+        requestLogEntry.errorClass = error.name;
+        sendJson(response, 400, { message: error.message }, options.allowedOrigin, request.method);
         return;
       }
 

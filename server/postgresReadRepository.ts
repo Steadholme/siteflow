@@ -185,7 +185,10 @@ import { redactLogLine, redactSecrets } from "../src/lib/redaction.js";
 import {
   logChunkKey,
   releaseConsoleKey,
+  SiteFlowConflictError,
+  SiteFlowInputError,
   SiteFlowNotFoundError,
+  type AddProjectDomainCommand,
   type ArtifactRoute,
   type FirewallEvaluationCommand,
   type LogDrainDeliveryPlan,
@@ -681,6 +684,7 @@ interface DeploymentSummaryRow {
   project_name: string;
   source_branch: string | null;
   source_commit_sha: string | null;
+  preview_host: string;
   status: DeploymentStatus;
   checksum: string;
   file_count: number;
@@ -1620,6 +1624,78 @@ function normalizeProjectDomains(domains: DomainBinding[], defaultChannel: Relea
       lastCheckedAt: domain.lastCheckedAt ?? new Date().toISOString()
     };
   });
+}
+
+function normalizeProjectDomainHostname(value: string) {
+  try {
+    return normalizeHostname(value);
+  } catch (error) {
+    if (error instanceof Error) {
+      throw new SiteFlowInputError(error.message);
+    }
+
+    throw error;
+  }
+}
+
+function isUniqueViolation(error: unknown) {
+  return Boolean(error && typeof error === "object" && "code" in error && error.code === "23505");
+}
+
+function projectDomainAutoVerifyEnabled(env: NodeJS.ProcessEnv = process.env) {
+  const value = env.SITEFLOW_DOMAIN_AUTOVERIFY?.trim().toLowerCase();
+
+  // SITEFLOW_DOMAIN_AUTOVERIFY is a single-tenant escape hatch; default off keeps public API domain adds unverified.
+  return value === "1" || value === "true" || value === "yes";
+}
+
+const dnsLabelPattern = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+
+function canonicalProjectHost(project: Pick<Project, "slug">, baseDomain: string | undefined) {
+  return baseDomain ? `${project.slug}.${normalizeBaseDomain(baseDomain)}` : undefined;
+}
+
+function vanityBaseSubdomainLabel(hostname: string, baseDomain: string | undefined) {
+  if (!baseDomain) {
+    return undefined;
+  }
+
+  const normalizedBaseDomain = normalizeBaseDomain(baseDomain);
+  const suffix = `.${normalizedBaseDomain}`;
+
+  if (hostname === normalizedBaseDomain || !hostname.endsWith(suffix)) {
+    return undefined;
+  }
+
+  const label = hostname.slice(0, -suffix.length);
+
+  if (!label || label.includes(".") || !dnsLabelPattern.test(label)) {
+    return undefined;
+  }
+
+  return label;
+}
+
+export function isVanityBaseSubdomain(hostname: string, baseDomain: string | undefined): boolean {
+  return vanityBaseSubdomainLabel(hostname, baseDomain) !== undefined;
+}
+
+function assertProjectDomainHostAllowed(hostname: string, project: Pick<Project, "slug">, baseDomain: string | undefined) {
+  const canonicalHost = canonicalProjectHost(project, baseDomain);
+
+  if (!canonicalHost) {
+    return;
+  }
+
+  const normalizedBaseDomain = normalizeBaseDomain(baseDomain ?? "");
+
+  if (hostname === canonicalHost || isVanityBaseSubdomain(hostname, normalizedBaseDomain)) {
+    return;
+  }
+
+  if (hostname === normalizedBaseDomain || hostname.endsWith(`.${normalizedBaseDomain}`)) {
+    throw new SiteFlowInputError(`Domain hostname must not use the SiteFlow base domain; use ${canonicalHost} for this project.`);
+  }
 }
 
 function projectIdForSlug(slug: string) {
@@ -2615,6 +2691,7 @@ function functionEntrypointsFromManifest(manifest: Record<string, unknown>): Fun
     const runtimeIsolation = entry.runtimeIsolation === "same_process" || entry.runtimeIsolation === "isolated_process"
       ? entry.runtimeIsolation
       : undefined;
+    const apiStyle = entry.apiStyle === "node" || entry.apiStyle === "fetch" ? entry.apiStyle : undefined;
     const handler = entry.handler === "handler" ? "handler" : entry.handler === "default" ? "default" : undefined;
     const methods = Array.isArray(entry.methods)
       ? entry.methods.filter((method): method is string => typeof method === "string")
@@ -2640,6 +2717,7 @@ function functionEntrypointsFromManifest(manifest: Record<string, unknown>): Fun
         runtime,
         runtimeIsolation,
         handler,
+        apiStyle: apiStyle ?? "fetch",
         methods: methods && methods.length > 0 ? methods : undefined,
         timeoutMs,
         memoryMb,
@@ -2843,7 +2921,7 @@ function unsealEnvironmentVariables(values: Record<string, string> | null | unde
   );
 }
 
-function deploymentSummaryFromRow(row: DeploymentSummaryRow): DeploymentSummaryReadModel {
+function deploymentSummaryFromRow(row: DeploymentSummaryRow, publicScheme: "http" | "https"): DeploymentSummaryReadModel {
   const manifest = artifactManifestFromRow(row, row.created_at);
   const verificationStatus = verificationStatusForDeployment(row.status);
 
@@ -2854,6 +2932,8 @@ function deploymentSummaryFromRow(row: DeploymentSummaryRow): DeploymentSummaryR
     version: deploymentVersion(row.created_at),
     commitSha: row.source_commit_sha ?? "prebuilt",
     branch: row.source_branch ?? "manual",
+    previewHost: row.preview_host,
+    previewUrl: row.preview_host ? `${publicScheme}://${row.preview_host}` : "",
     status: row.status,
     artifactVerificationStatus: verificationStatus,
     routeRevisionStatus: row.route_revision_status ?? "planned",
@@ -3989,6 +4069,160 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
       status: "updated",
       project: await this.readProject(projectId),
       message: "Project updated."
+    };
+  }
+
+  async addProjectDomain(projectId: SiteFlowId, command: AddProjectDomainCommand): Promise<ProjectMutationReadModel> {
+    const project = await this.readProject(projectId);
+    const hostname = normalizeProjectDomainHostname(command.hostname);
+    const vanityLabel = vanityBaseSubdomainLabel(hostname, this.baseDomain);
+    const vanity = vanityLabel !== undefined;
+    const verified = vanity ? true : projectDomainAutoVerifyEnabled();
+    const canonicalHost = canonicalProjectHost(project, this.baseDomain);
+
+    assertProjectDomainHostAllowed(hostname, project, this.baseDomain);
+
+    const client = await this.pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      if (vanity && vanityLabel !== project.slug) {
+        const slugConflict = await client.query(
+          `
+            SELECT 1
+            FROM siteflow_projects
+            WHERE slug = $1
+            LIMIT 1
+          `,
+          [vanityLabel]
+        );
+
+        if (slugConflict.rows.length > 0) {
+          throw new SiteFlowInputError(`Vanity subdomain ${hostname} conflicts with the canonical host for project slug ${vanityLabel}.`);
+        }
+      }
+
+      await client.query(
+        `
+          INSERT INTO siteflow_project_domains (
+            project_id,
+            hostname,
+            channel,
+            verified,
+            last_checked_at
+          )
+          VALUES ($1, $2, 'production', $3, now())
+        `,
+        [projectId, hostname, verified]
+      );
+
+      if (verified && canonicalHost) {
+        const currentRoute = await client.query<{ deployment_id: string; artifact_root: string; entrypoint: string }>(
+          `
+            SELECT deployment_id, artifact_root, entrypoint
+            FROM siteflow_artifact_routes
+            WHERE host = $1
+          `,
+          [canonicalHost]
+        );
+        const route = currentRoute.rows[0];
+
+        if (route) {
+          await client.query(
+            `
+              INSERT INTO siteflow_artifact_routes (host, deployment_id, artifact_root, entrypoint)
+              VALUES ($1, $2, $3, $4)
+              ON CONFLICT (host) DO UPDATE
+              SET deployment_id = EXCLUDED.deployment_id,
+                  artifact_root = EXCLUDED.artifact_root,
+                  entrypoint = EXCLUDED.entrypoint
+            `,
+            [hostname, route.deployment_id, route.artifact_root, route.entrypoint]
+          );
+        }
+      }
+
+      await insertAuditEvent(client, {
+        projectId,
+        action: "project.updated",
+        actor: command.actor,
+        targetType: "project",
+        targetId: hostname,
+        summary: `Project domain ${hostname} added.`
+      });
+
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+
+      if (isUniqueViolation(error)) {
+        throw new SiteFlowConflictError(`Domain hostname is already bound: ${hostname}.`);
+      }
+
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    return {
+      status: "updated",
+      project: await this.readProject(projectId),
+      message: "Project domain added."
+    };
+  }
+
+  async removeProjectDomain(projectId: SiteFlowId, hostname: string, actor: Actor): Promise<ProjectMutationReadModel> {
+    await this.readProject(projectId);
+    const normalizedHostname = normalizeProjectDomainHostname(hostname);
+    const client = await this.pool.connect();
+
+    try {
+      await client.query("BEGIN");
+      const domainDelete = await client.query(
+        `
+          DELETE FROM siteflow_project_domains
+          WHERE project_id = $1
+            AND hostname = $2
+        `,
+        [projectId, normalizedHostname]
+      );
+      // Only tear down the artifact route when the host WAS a registered custom domain of THIS
+      // project (rowCount>0). Scope the delete to this project's own deployments as a second guard.
+      // This prevents cross-tenant route deletion and protects the auto-managed canonical host
+      // ({slug}.{baseDomain}) — which has no siteflow_project_domains row, so this is skipped for it.
+      if ((domainDelete.rowCount ?? 0) > 0) {
+        await client.query(
+          `
+            DELETE FROM siteflow_artifact_routes
+            WHERE host = $1
+              AND deployment_id IN (
+                SELECT id FROM siteflow_deployments WHERE project_id = $2
+              )
+          `,
+          [normalizedHostname, projectId]
+        );
+      }
+      await insertAuditEvent(client, {
+        projectId,
+        action: "project.updated",
+        actor,
+        targetType: "project",
+        targetId: normalizedHostname,
+        summary: `Project domain ${normalizedHostname} removed.`
+      });
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    return {
+      status: "updated",
+      project: await this.readProject(projectId),
+      message: "Project domain removed."
     };
   }
 
@@ -6513,6 +6747,7 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
           project.name AS project_name,
           deployment.source_branch,
           deployment.source_commit_sha,
+          deployment.preview_host,
           deployment.status,
           deployment.checksum,
           deployment.file_count,
@@ -6537,7 +6772,7 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
     );
 
     return {
-      deployments: result.rows.map(deploymentSummaryFromRow),
+      deployments: result.rows.map((row) => deploymentSummaryFromRow(row, this.publicScheme)),
       total: result.rows.length,
       projectId,
       updatedAt: new Date().toISOString()
@@ -8364,6 +8599,7 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
           project.name AS project_name,
           deployment.source_branch,
           deployment.source_commit_sha,
+          deployment.preview_host,
           deployment.status,
           deployment.checksum,
           deployment.file_count,
@@ -8391,7 +8627,7 @@ export class PostgresSiteFlowReadRepository implements SiteFlowReadRepository {
       throw new SiteFlowNotFoundError(`Unknown SiteFlow deployment: ${deploymentId}`);
     }
 
-    return deploymentSummaryFromRow(row);
+    return deploymentSummaryFromRow(row, this.publicScheme);
   }
 
   private async insertRollingRouteRevision(

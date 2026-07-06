@@ -365,6 +365,48 @@ describe("SiteFlow build worker", () => {
     }
   });
 
+  it("returns a stable production host and publishes only non-sensitive client build env", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-production-client-env-"));
+    const sourceDirectory = path.join(root, "source");
+    const workspaceRoot = path.join(root, "workspace");
+    const artifactRoot = path.join(root, "artifacts");
+
+    try {
+      await createTinySourceProject(sourceDirectory);
+      const baseJob = queuedJob(sourceDirectory);
+      const job: QueuedBuildJob = {
+        ...baseJob,
+        sourceEvent: {
+          ...baseJob.sourceEvent,
+          branch: "main"
+        },
+        environmentVariables: {
+          CISTERN_REST_URL: "https://cistern.example.test",
+          CISTERN_SERVICE_KEY: "service-secret-value-20260706"
+        }
+      };
+
+      const result = await executeBuildJob(job, {
+        sourceResolver: new LocalSourceResolver(),
+        workspaceRoot,
+        artifactRoot,
+        baseDomain: "w33d.xyz",
+        allowUnsandboxedSourceBuilds: true
+      });
+      const envJs = await readFile(path.join(result.artifact.artifactRoot, "__siteflow", "env.js"), "utf8");
+
+      expect(result.productionHost).toBe("docs.w33d.xyz");
+      expect(result.artifact.manifest.metadata).toMatchObject({
+        environment: "production"
+      });
+      expect(envJs).toContain('"CISTERN_REST_URL":"https://cistern.example.test"');
+      expect(envJs).not.toContain("CISTERN_SERVICE_KEY");
+      expect(envJs).not.toContain("service-secret-value-20260706");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a symlinked output root that resolves outside the project root", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-output-realpath-"));
     const sourceDirectory = path.join(root, "source");
@@ -787,7 +829,8 @@ describe("SiteFlow build worker", () => {
           sourcePath: ".siteflow/functions/api/revalidate.js",
           runtime: "nodejs20.x",
           runtimeIsolation: "same_process",
-          handler: "default"
+          handler: "default",
+          apiStyle: "fetch"
         }
       ]);
       expect(queue.logs.join("\n")).toContain("Detected 1 Node.js function.");
@@ -795,6 +838,84 @@ describe("SiteFlow build worker", () => {
         .toContain("export default async function handler");
       expect(await readFile(path.join(result?.artifact.artifactRoot ?? "", ".siteflow", "functions", "package.json"), "utf8"))
         .toContain('"type":"module"');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("detects Vercel req/res API functions and lets vercel.json force fetch style", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-worker-function-api-style-"));
+    const sourceDirectory = path.join(root, "source");
+    const workspaceRoot = path.join(root, "workspace");
+    const artifactRoot = path.join(root, "artifacts");
+
+    try {
+      await createTinySourceProject(sourceDirectory);
+      await mkdir(path.join(sourceDirectory, "api"), { recursive: true });
+      await writeFile(
+        path.join(sourceDirectory, "api", "auto.js"),
+        [
+          "export default function handler(req, res) {",
+          "  res.status(200).json({ ok: true });",
+          "}"
+        ].join("\n")
+      );
+      await writeFile(
+        path.join(sourceDirectory, "api", "forced.js"),
+        [
+          "export default function handler(req, res) {",
+          "  res.status(200).json({ ok: true });",
+          "}"
+        ].join("\n")
+      );
+      await writeFile(
+        path.join(sourceDirectory, "api", "proxy.js"),
+        [
+          // Fetch-style handler (2nd param is context) that names an upstream fetch Response `res`.
+          // The sniff must NOT flip this to node on the raw `res.json(` text or the handler breaks.
+          "export default async function handler(request, context) {",
+          "  const res = await fetch('https://upstream.example');",
+          "  return Response.json(await res.json());",
+          "}"
+        ].join("\n")
+      );
+      await writeFile(
+        path.join(sourceDirectory, "vercel.json"),
+        JSON.stringify({
+          functions: {
+            "api/forced.js": {
+              api: "fetch"
+            }
+          }
+        })
+      );
+
+      const queue = new MemoryBuildQueue(queuedJob(sourceDirectory));
+      const result = await runBuildWorkerOnce({
+        workerId: "worker-test",
+        queue,
+        sourceResolver: new LocalSourceResolver(),
+        workspaceRoot,
+        artifactRoot,
+        baseDomain: "w33d.xyz",
+        publicScheme: "https"
+      });
+
+      expect(result?.artifact.manifest.functions).toHaveLength(3);
+      expect(result?.artifact.manifest.functions).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          path: "/api/auto",
+          apiStyle: "node"
+        }),
+        expect.objectContaining({
+          path: "/api/forced",
+          apiStyle: "fetch"
+        }),
+        expect.objectContaining({
+          path: "/api/proxy",
+          apiStyle: "fetch"
+        })
+      ]));
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -891,6 +1012,7 @@ describe("SiteFlow build worker", () => {
           runtime: "nodejs20.x",
           runtimeIsolation: "same_process",
           handler: "default",
+          apiStyle: "fetch",
           timeoutMs: 3000,
           concurrency: 7
         }
@@ -960,6 +1082,7 @@ describe("SiteFlow build worker", () => {
           runtime: "nodejs20.x",
           runtimeIsolation: "same_process",
           handler: "default",
+          apiStyle: "fetch",
           regions: ["iad1"],
           failoverRegions: ["dub1"]
         },
@@ -969,6 +1092,7 @@ describe("SiteFlow build worker", () => {
           runtime: "nodejs20.x",
           runtimeIsolation: "same_process",
           handler: "default",
+          apiStyle: "fetch",
           regions: ["sfo1"],
           failoverRegions: ["iad1"]
         }

@@ -270,6 +270,8 @@ function createSummary(
   artifact: Artifact,
   routeRevision: RouteRevision
 ): DeploymentSummaryReadModel {
+  const previewHost = `${deployment.id}.preview.acme.test`;
+
   return {
     id: deployment.id,
     projectId: project.id,
@@ -277,6 +279,8 @@ function createSummary(
     version: deployment.version,
     commitSha: sourceEvent.commitSha,
     branch: sourceEvent.branch,
+    previewHost,
+    previewUrl: `https://${previewHost}`,
     status: deployment.status,
     artifactVerificationStatus: artifact.verificationStatus,
     routeRevisionStatus: routeRevision.status,

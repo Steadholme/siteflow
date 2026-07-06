@@ -452,6 +452,63 @@ export class PostgresBuildQueue implements BuildQueue {
         [result.previewHost, result.deploymentId, result.artifact.artifactRoot, result.artifact.entrypoint]
       );
 
+      if (result.productionHost) {
+        const verifiedDomains = await client.query<{ hostname: string }>(
+          `
+            SELECT hostname
+            FROM siteflow_project_domains
+            WHERE project_id = $1
+              AND channel = 'production'
+              AND verified = true
+            ORDER BY hostname
+          `,
+          [job.projectId]
+        );
+
+        for (const host of [result.productionHost, ...verifiedDomains.rows.map((row) => row.hostname)]) {
+          await client.query(
+            `
+              INSERT INTO siteflow_artifact_routes (host, deployment_id, artifact_root, entrypoint)
+              VALUES ($1, $2, $3, $4)
+              ON CONFLICT (host) DO UPDATE
+              SET deployment_id = EXCLUDED.deployment_id,
+                  artifact_root = EXCLUDED.artifact_root,
+                  entrypoint = EXCLUDED.entrypoint
+            `,
+            [host, result.deploymentId, result.artifact.artifactRoot, result.artifact.entrypoint]
+          );
+        }
+
+        await client.query(
+          `
+            INSERT INTO siteflow_release_channels (
+              project_id,
+              name,
+              current_deployment_id,
+              pending_deployment_id,
+              route_revision_id,
+              updated_by
+            )
+            VALUES ($1, 'production', $2, NULL, NULL, $3::jsonb)
+            ON CONFLICT (project_id, name) DO UPDATE
+            SET current_deployment_id = EXCLUDED.current_deployment_id,
+                pending_deployment_id = NULL,
+                route_revision_id = siteflow_release_channels.route_revision_id,
+                updated_by = EXCLUDED.updated_by,
+                updated_at = now()
+          `,
+          [
+            job.projectId,
+            result.deploymentId,
+            JSON.stringify({
+              id: "siteflow:worker",
+              name: "Build worker",
+              role: "system"
+            })
+          ]
+        );
+      }
+
       for (const cron of result.crons ?? []) {
         await upsertBuildCronJob(client, job.projectId, cron);
       }

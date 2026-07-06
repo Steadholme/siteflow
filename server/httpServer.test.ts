@@ -109,7 +109,7 @@ import { SITEFLOW_SECRET_CANARY } from "../src/lib/redaction";
 import { bundleWithReleaseEvidenceAttestation, releaseEvidenceBundleAttestationKeyId } from "../scripts/releaseEvidenceBundleCheck";
 import { createSiteFlowServer, type DrainFetch, type FunctionModuleLoader, type ReleaseEvidenceEvaluator, type SiteFlowReadinessCheck, type SiteFlowRequestLogEntry, type SiteFlowRuntimeMetricsCollector, type SiteFlowTrustedProxyPolicy } from "./httpServer";
 import { createDefaultRequestLogger, createProductionMetricsCollector, createStdoutRequestLogger, defaultAllowSameProcessFunctionRuntime, defaultOperatorSessionIdleTimeoutSeconds, defaultSecureCookies, defaultTrustProxy, gitWebhookSecretsFromEnv, requireProductionApiToken, requireProductionGitWebhookSecrets, requireProductionMetricsToken, resolveDatabaseUrl } from "./index";
-import { SiteFlowNotFoundError, type ArtifactRoute, type OperatorSessionCreateResult, type OperatorSessionRotateResult, type RecordLogDrainDeliveryCommand, type SiteFlowAuthPrincipal, type SiteFlowReadRepository } from "./readRepository";
+import { SiteFlowConflictError, SiteFlowNotFoundError, type ArtifactRoute, type OperatorSessionCreateResult, type OperatorSessionRotateResult, type RecordLogDrainDeliveryCommand, type SiteFlowAuthPrincipal, type SiteFlowReadRepository } from "./readRepository";
 
 async function rawHttpGet(
   baseUrl: string,
@@ -628,6 +628,42 @@ function fixtureRepository(): SiteFlowReadRepository {
           updatedAt: "2026-05-25T00:00:00.000Z"
         },
         message: "Project updated."
+      };
+    },
+    addProjectDomain: async (projectId, command): Promise<ProjectMutationReadModel> => {
+      const settings = await fixtureRepository().getProjectSettings(projectId);
+      const hostname = command.hostname.trim().toLowerCase();
+
+      return {
+        status: "updated",
+        project: {
+          ...settings.project,
+          domains: [
+            ...settings.project.domains,
+            {
+              hostname,
+              channel: "production",
+              verified: false,
+              lastCheckedAt: "2026-05-25T00:00:00.000Z"
+            }
+          ],
+          updatedAt: "2026-05-25T00:00:00.000Z"
+        },
+        message: "Project domain added."
+      };
+    },
+    removeProjectDomain: async (projectId, hostname): Promise<ProjectMutationReadModel> => {
+      const settings = await fixtureRepository().getProjectSettings(projectId);
+      const normalizedHostname = hostname.trim().toLowerCase();
+
+      return {
+        status: "updated",
+        project: {
+          ...settings.project,
+          domains: settings.project.domains.filter((domain) => domain.hostname !== normalizedHostname),
+          updatedAt: "2026-05-25T00:00:00.000Z"
+        },
+        message: "Project domain removed."
       };
     },
     archiveProject: async (projectId: SiteFlowId): Promise<ProjectMutationReadModel> => {
@@ -2384,6 +2420,90 @@ describe("SiteFlow control-plane HTTP server", () => {
               }
             ]
           }
+        });
+      },
+      { apiToken: "deploy-token" }
+    );
+  });
+
+  it("routes project domain add and remove requests through the admin sub-api", async () => {
+    let added: { projectId: string; hostname: string } | undefined;
+    let removed: { projectId: string; hostname: string } | undefined;
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      addProjectDomain: async (projectId, command) => {
+        added = { projectId, hostname: command.hostname };
+
+        return fixtureRepository().addProjectDomain(projectId, command);
+      },
+      removeProjectDomain: async (projectId, hostname, actor) => {
+        removed = { projectId, hostname };
+
+        return fixtureRepository().removeProjectDomain(projectId, hostname, actor);
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const addResponse = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/domains`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer deploy-token"
+          },
+          body: JSON.stringify({
+            hostname: "Docs.Example.com"
+          })
+        });
+        const removeResponse = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/domains/${encodeURIComponent("docs.example.com")}`, {
+          method: "DELETE",
+          headers: {
+            authorization: "Bearer deploy-token"
+          }
+        });
+
+        expect(addResponse.status).toBe(201);
+        expect(removeResponse.status).toBe(200);
+        expect(added).toEqual({
+          projectId: "project-acme-dashboard",
+          hostname: "Docs.Example.com"
+        });
+        expect(removed).toEqual({
+          projectId: "project-acme-dashboard",
+          hostname: "docs.example.com"
+        });
+      },
+      { apiToken: "deploy-token" }
+    );
+  });
+
+  it("returns conflict responses for duplicate project domain hostnames", async () => {
+    const repository: SiteFlowReadRepository = {
+      ...fixtureRepository(),
+      addProjectDomain: async () => {
+        throw new SiteFlowConflictError("Domain hostname is already bound: docs.example.com.");
+      }
+    };
+
+    await withServer(
+      repository,
+      async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/api/projects/project-acme-dashboard/domains`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer deploy-token"
+          },
+          body: JSON.stringify({
+            hostname: "docs.example.com"
+          })
+        });
+        const body = await response.json();
+
+        expect(response.status).toBe(409);
+        expect(body).toEqual({
+          message: "Domain hostname is already bound: docs.example.com."
         });
       },
       { apiToken: "deploy-token" }
@@ -9693,6 +9813,264 @@ describe("SiteFlow control-plane HTTP server", () => {
       status: "succeeded",
       responseStatus: 200
     });
+  });
+
+  it("runs Vercel req/res API functions in same-process runtime", async () => {
+    const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "siteflow-function-node-api-same-"));
+    const invocations: FunctionInvocation[] = [];
+
+    try {
+      await writeFile(path.join(artifactRoot, "index.html"), "<h1>Static shell</h1>");
+      const repository: SiteFlowReadRepository = {
+        ...fixtureRepository(),
+        resolveArtifactRoute: async (host: string): Promise<ArtifactRoute | undefined> =>
+          host === "abc123.w33d.xyz"
+            ? {
+                host,
+                projectId: "project_docs",
+                deploymentId: "dep_function_node_same",
+                artifactRoot,
+                entrypoint: "index.html",
+                functions: [
+                  {
+                    path: "/api/node",
+                    sourcePath: ".siteflow/functions/api/node.js",
+                    runtime: "nodejs20.x",
+                    handler: "default",
+                    apiStyle: "node"
+                  }
+                ]
+              }
+            : undefined,
+        recordFunctionInvocation: async (invocation: FunctionInvocation): Promise<void> => {
+          invocations.push(invocation);
+        }
+      };
+
+      await withServer(
+        repository,
+        async (baseUrl) => {
+          const response = await fetch(`${baseUrl}/api/node?tag=home&tag=docs&draft=1`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              cookie: "session=abc; theme=dark",
+              "x-forwarded-host": "abc123.w33d.xyz"
+            },
+            body: JSON.stringify({ name: "home" })
+          });
+          const body = await response.json();
+
+          expect(response.status).toBe(200);
+          expect(response.headers.get("x-node-compat")).toBe("same");
+          expect(body).toEqual({
+            method: "POST",
+            url: "/api/node?tag=home&tag=docs&draft=1",
+            query: {
+              tag: ["home", "docs"],
+              draft: "1"
+            },
+            cookies: {
+              session: "abc",
+              theme: "dark"
+            },
+            body: { name: "home" },
+            params: {}
+          });
+        },
+        {
+          functionModuleLoader: async () => ({
+            default: async (
+              req: {
+                method: string;
+                url: string;
+                query: Record<string, string | string[]>;
+                cookies: Record<string, string>;
+                body: unknown;
+                params: Record<string, string>;
+              },
+              res: {
+                setHeader(key: string, value: string): unknown;
+                status(code: number): { json(value: unknown): unknown };
+              }
+            ) => {
+              res.setHeader("x-node-compat", "same");
+              res.status(200).json({
+                method: req.method,
+                url: req.url,
+                query: req.query,
+                cookies: req.cookies,
+                body: req.body,
+                params: req.params
+              });
+            }
+          })
+        }
+      );
+    } finally {
+      await rm(artifactRoot, { recursive: true, force: true });
+    }
+
+    expect(invocations).toHaveLength(1);
+    expect(invocations[0]).toMatchObject({
+      deploymentId: "dep_function_node_same",
+      path: "/api/node",
+      status: "succeeded",
+      responseStatus: 200
+    });
+  });
+
+  it("resolves the return-form Vercel idiom `return res.status(x).json(...)` (not 200 empty)", async () => {
+    const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "siteflow-function-node-return-"));
+    const invocations: FunctionInvocation[] = [];
+
+    try {
+      await writeFile(path.join(artifactRoot, "index.html"), "<h1>Static shell</h1>");
+      const repository: SiteFlowReadRepository = {
+        ...fixtureRepository(),
+        resolveArtifactRoute: async (host: string): Promise<ArtifactRoute | undefined> =>
+          host === "abc123.w33d.xyz"
+            ? {
+                host,
+                projectId: "project_docs",
+                deploymentId: "dep_function_node_return",
+                artifactRoot,
+                entrypoint: "index.html",
+                functions: [
+                  {
+                    path: "/api/guard",
+                    sourcePath: ".siteflow/functions/api/guard.js",
+                    runtime: "nodejs20.x",
+                    handler: "default",
+                    apiStyle: "node"
+                  }
+                ]
+              }
+            : undefined,
+        recordFunctionInvocation: async (invocation: FunctionInvocation): Promise<void> => {
+          invocations.push(invocation);
+        }
+      };
+
+      await withServer(
+        repository,
+        async (baseUrl) => {
+          const response = await fetch(`${baseUrl}/api/guard`, {
+            method: "GET",
+            headers: { "x-forwarded-host": "abc123.w33d.xyz" }
+          });
+          const body = await response.json();
+
+          // Before the fix this returned 200 with an empty body because `res.status().json()`
+          // returns `res` and the returned value was treated as a Response.
+          expect(response.status).toBe(401);
+          expect(response.headers.get("content-type")).toContain("application/json");
+          expect(body).toEqual({ error: "unauthorized" });
+        },
+        {
+          functionModuleLoader: async () => ({
+            default: async (
+              _req: unknown,
+              res: { status(code: number): { json(value: unknown): unknown } }
+            ) => res.status(401).json({ error: "unauthorized" })
+          })
+        }
+      );
+    } finally {
+      await rm(artifactRoot, { recursive: true, force: true });
+    }
+
+    expect(invocations[0]).toMatchObject({
+      path: "/api/guard",
+      status: "succeeded",
+      responseStatus: 401
+    });
+  });
+
+  it("runs Vercel req/res API functions in isolated-process runtime", async () => {
+    const artifactRoot = await mkdtemp(path.join(os.tmpdir(), "siteflow-function-node-api-isolated-"));
+
+    try {
+      await writeFile(path.join(artifactRoot, "index.html"), "<h1>Static shell</h1>");
+      await mkdir(path.join(artifactRoot, ".siteflow", "functions", "api"), { recursive: true });
+      await writeFile(path.join(artifactRoot, ".siteflow", "functions", "package.json"), JSON.stringify({ type: "module" }));
+      await writeFile(
+        path.join(artifactRoot, ".siteflow", "functions", "api", "node.js"),
+        [
+          "export default function handler(req, res) {",
+          "  res.status(200).json({",
+          "    method: req.method,",
+          "    url: req.url,",
+          "    query: req.query,",
+          "    cookies: req.cookies,",
+          "    body: req.body",
+          "  });",
+          "}"
+        ].join("\n"),
+        "utf8"
+      );
+      const repository: SiteFlowReadRepository = {
+        ...fixtureRepository(),
+        resolveArtifactRoute: async (host: string): Promise<ArtifactRoute | undefined> =>
+          host === "abc123.w33d.xyz"
+            ? {
+                host,
+                projectId: "project_docs",
+                deploymentId: "dep_function_node_isolated",
+                artifactRoot,
+                entrypoint: "index.html",
+                functions: [
+                  {
+                    path: "/api/node",
+                    sourcePath: ".siteflow/functions/api/node.js",
+                    runtime: "nodejs20.x",
+                    runtimeIsolation: "isolated_process",
+                    handler: "default",
+                    apiStyle: "node"
+                  }
+                ]
+              }
+            : undefined
+      };
+
+      await withServer(
+        repository,
+        async (baseUrl) => {
+          const response = await fetch(`${baseUrl}/api/node?tag=home&tag=docs`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              cookie: "session=abc",
+              "x-forwarded-host": "abc123.w33d.xyz"
+            },
+            body: JSON.stringify({ name: "home" })
+          });
+          const body = await response.json();
+
+          expect(response.status).toBe(200);
+          expect(response.headers.get("x-siteflow-function-runtime")).toBe("isolated_process");
+          expect(body).toEqual({
+            method: "POST",
+            url: "/api/node?tag=home&tag=docs",
+            query: {
+              tag: ["home", "docs"]
+            },
+            cookies: {
+              session: "abc"
+            },
+            body: { name: "home" }
+          });
+        },
+        {
+          productionRuntime: true,
+          functionModuleLoader: async () => {
+            throw new Error("Isolated node functions should not use the same-process module loader.");
+          }
+        }
+      );
+    } finally {
+      await rm(artifactRoot, { recursive: true, force: true });
+    }
   });
 
   it("routes deployed API functions and records invocation logs", async () => {

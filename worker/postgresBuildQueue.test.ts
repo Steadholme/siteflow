@@ -304,6 +304,129 @@ describe("PostgresBuildQueue", () => {
     expect(cronUpsert?.text).toContain("status = 'active'");
   });
 
+  it("upserts the canonical production host and release channel when completing a production build", async () => {
+    const queries: RecordedQuery[] = [];
+    const expectedJob = queuedJob();
+    const pool = connectPool(queries, (text) => {
+      if (text.includes("FROM siteflow_build_jobs build")) {
+        return { rows: [claimRow(expectedJob)], rowCount: 1 };
+      }
+
+      return { rows: [], rowCount: 1 };
+    });
+    const queue = new PostgresBuildQueue(pool as never);
+    const job = await queue.claimNextJob("worker-production") as QueuedBuildJob;
+    const result: BuildJobResult = {
+      job,
+      deploymentId: "dep_prod_1",
+      previewHost: "docs-preview.w33d.xyz",
+      previewUrl: "https://docs-preview.w33d.xyz",
+      productionHost: "docs.w33d.xyz",
+      artifact: {
+        deploymentId: "dep_prod_1",
+        artifactRoot: "/tmp/siteflow/dep_prod_1",
+        entrypoint: "index.html",
+        fileCount: 1,
+        totalBytes: 14,
+        checksum: "sha256",
+        manifest: {
+          entrypoint: "index.html",
+          fileCount: 1,
+          totalBytes: 14,
+          checksum: "sha256:sha256",
+          generatedAt: "2026-05-27T00:00:00.000Z",
+          metadata: {}
+        }
+      }
+    };
+
+    await queue.completeJob(job, result);
+    const previewInsert = queries.find((query) =>
+      query.text.includes("INSERT INTO siteflow_artifact_routes") && !query.text.includes("ON CONFLICT")
+    );
+    const productionRouteUpsert = queries.find((query) =>
+      query.text.includes("INSERT INTO siteflow_artifact_routes")
+      && query.text.includes("ON CONFLICT (host) DO UPDATE")
+      && query.values?.[0] === "docs.w33d.xyz"
+    );
+    const releaseChannelUpsert = queries.find((query) => query.text.includes("INSERT INTO siteflow_release_channels"));
+
+    expect(previewInsert?.values).toEqual(["docs-preview.w33d.xyz", "dep_prod_1", "/tmp/siteflow/dep_prod_1", "index.html"]);
+    expect(productionRouteUpsert?.values).toEqual(["docs.w33d.xyz", "dep_prod_1", "/tmp/siteflow/dep_prod_1", "index.html"]);
+    expect(productionRouteUpsert?.text).toContain("deployment_id = EXCLUDED.deployment_id");
+    expect(releaseChannelUpsert?.values).toEqual([
+      "project_docs",
+      "dep_prod_1",
+      JSON.stringify({
+        id: "siteflow:worker",
+        name: "Build worker",
+        role: "system"
+      })
+    ]);
+    expect(releaseChannelUpsert?.text).toContain("current_deployment_id = EXCLUDED.current_deployment_id");
+    expect(releaseChannelUpsert?.text).toContain("route_revision_id = siteflow_release_channels.route_revision_id");
+  });
+
+  it("repoints verified production custom domains with the canonical host when completing a production build", async () => {
+    const queries: RecordedQuery[] = [];
+    const expectedJob = queuedJob();
+    const pool = connectPool(queries, (text) => {
+      if (text.includes("FROM siteflow_build_jobs build")) {
+        return { rows: [claimRow(expectedJob)], rowCount: 1 };
+      }
+
+      if (text.includes("FROM siteflow_project_domains")) {
+        return {
+          rows: [
+            { hostname: "docs.example.com" },
+            { hostname: "www.docs.example.com" }
+          ],
+          rowCount: 2
+        };
+      }
+
+      return { rows: [], rowCount: 1 };
+    });
+    const queue = new PostgresBuildQueue(pool as never);
+    const job = await queue.claimNextJob("worker-production-domains") as QueuedBuildJob;
+    const result: BuildJobResult = {
+      job,
+      deploymentId: "dep_prod_domains",
+      previewHost: "docs-preview.w33d.xyz",
+      previewUrl: "https://docs-preview.w33d.xyz",
+      productionHost: "docs.w33d.xyz",
+      artifact: {
+        deploymentId: "dep_prod_domains",
+        artifactRoot: "/tmp/siteflow/dep_prod_domains",
+        entrypoint: "index.html",
+        fileCount: 1,
+        totalBytes: 14,
+        checksum: "sha256",
+        manifest: {
+          entrypoint: "index.html",
+          fileCount: 1,
+          totalBytes: 14,
+          checksum: "sha256:sha256",
+          generatedAt: "2026-05-27T00:00:00.000Z",
+          metadata: {}
+        }
+      }
+    };
+
+    await queue.completeJob(job, result);
+    const routeUpserts = queries.filter((query) =>
+      query.text.includes("INSERT INTO siteflow_artifact_routes")
+      && query.text.includes("ON CONFLICT (host) DO UPDATE")
+    );
+
+    expect(routeUpserts.map((query) => query.values?.[0])).toEqual([
+      "docs.w33d.xyz",
+      "docs.example.com",
+      "www.docs.example.com"
+    ]);
+    expect(routeUpserts.every((query) => query.values?.[1] === "dep_prod_domains")).toBe(true);
+  });
+
   it("requeues failed builds when attempts remain", async () => {
     const queries: RecordedQuery[] = [];
     const expectedJob = queuedJob();

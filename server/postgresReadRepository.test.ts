@@ -4,7 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { sealSecretValue } from "../src/lib/sealedSecrets";
-import { PostgresSiteFlowReadRepository } from "./postgresReadRepository";
+import { isVanityBaseSubdomain, PostgresSiteFlowReadRepository } from "./postgresReadRepository";
+import { SiteFlowConflictError } from "./readRepository";
 
 function prebuiltFile(filePath: string, content: string) {
   const bytes = Buffer.from(content);
@@ -38,6 +39,100 @@ function releaseEvidenceQueryValue(query: { values?: unknown[] }) {
 
 function releaseCommandInsertByState(queries: Array<{ text: string; values?: unknown[] }>, state: "succeeded" | "failed") {
   return queries.find((query) => query.text.includes("INSERT INTO siteflow_release_commands") && query.values?.[9] === state);
+}
+
+function projectTableRow(overrides: Record<string, unknown> = {}) {
+  const now = new Date("2026-06-08T12:00:00.000Z");
+
+  return {
+    id: "project_docs",
+    slug: "docs",
+    name: "Docs",
+    status: "active",
+    framework: "static",
+    default_branch: "main",
+    production_branch: "main",
+    repository: {
+      provider: "github",
+      owner: "acme",
+      name: "docs",
+      defaultBranch: "main"
+    },
+    build_settings: {},
+    created_at: now,
+    updated_at: now,
+    ...overrides
+  };
+}
+
+function projectDomainMutationPool(options: {
+  insertError?: unknown;
+  slugCollisions?: string[];
+  canonicalRoute?: { deployment_id: string; artifact_root: string; entrypoint: string } | null;
+} = {}) {
+  const queries: Array<{ text: string; values?: unknown[] }> = [];
+  const project = projectTableRow();
+  const client = {
+    query: async (text: string, values?: unknown[]) => {
+      queries.push({ text, values });
+
+      if (text === "BEGIN" || text === "COMMIT" || text === "ROLLBACK") {
+        return { rows: [], rowCount: null };
+      }
+
+      if (text.includes("INSERT INTO siteflow_project_domains")) {
+        if (options.insertError) {
+          throw options.insertError;
+        }
+
+        return { rows: [], rowCount: 1 };
+      }
+
+      if (text.includes("SELECT 1") && text.includes("FROM siteflow_projects") && text.includes("WHERE slug = $1")) {
+        const slug = String(values?.[0] ?? "");
+        const collision = options.slugCollisions?.includes(slug);
+
+        return { rows: collision ? [{ "?column?": 1 }] : [], rowCount: collision ? 1 : 0 };
+      }
+
+      if (text.includes("FROM siteflow_artifact_routes") && text.includes("WHERE host = $1")) {
+        return { rows: options.canonicalRoute ? [options.canonicalRoute] : [], rowCount: options.canonicalRoute ? 1 : 0 };
+      }
+
+      if (text.includes("INSERT INTO siteflow_artifact_routes")) {
+        return { rows: [], rowCount: 1 };
+      }
+
+      if (text.includes("INSERT INTO siteflow_audit_events")) {
+        return { rows: [], rowCount: 1 };
+      }
+
+      if (text.includes("DELETE FROM siteflow_project_domains") || text.includes("DELETE FROM siteflow_artifact_routes")) {
+        return { rows: [], rowCount: 1 };
+      }
+
+      throw new Error(`Unexpected client query: ${text}`);
+    },
+    release: () => undefined
+  };
+  const pool = {
+    connect: async () => client,
+    query: async (text: string, values?: unknown[]) => {
+      queries.push({ text, values });
+
+      if (text.includes("FROM siteflow_projects") && text.includes("WHERE id = $1")) {
+        return { rows: [project], rowCount: 1 };
+      }
+
+      if (text.includes("FROM siteflow_project_domains")) {
+        return { rows: [], rowCount: 0 };
+      }
+
+      throw new Error(`Unexpected pool query: ${text}`);
+    }
+  };
+
+  return { pool, queries };
 }
 
 function releaseRouteRows(overrides: {
@@ -383,6 +478,7 @@ function consoleFallbackPool() {
       project_name: "Docs",
       source_branch: "main",
       source_commit_sha: "abc123def4567890",
+      preview_host: "preview.w33d.xyz",
       status: "ready",
       checksum: "sha256:candidate",
       file_count: 3,
@@ -398,6 +494,7 @@ function consoleFallbackPool() {
       project_name: "Docs",
       source_branch: "main",
       source_commit_sha: "current1234567890",
+      preview_host: "current.w33d.xyz",
       status: "ready",
       checksum: "sha256:current",
       file_count: 2,
@@ -545,6 +642,163 @@ function consoleFallbackPool() {
 }
 
 describe("PostgresSiteFlowReadRepository", () => {
+  it("identifies direct single-label vanity subdomains of the SiteFlow base domain", () => {
+    expect(isVanityBaseSubdomain("x.siteflow.w33d.xyz", "siteflow.w33d.xyz")).toBe(true);
+    expect(isVanityBaseSubdomain("saguadoodle.siteflow.w33d.xyz", "*.siteflow.w33d.xyz")).toBe(true);
+    expect(isVanityBaseSubdomain("siteflow.w33d.xyz", "siteflow.w33d.xyz")).toBe(false);
+    expect(isVanityBaseSubdomain("a.b.siteflow.w33d.xyz", "siteflow.w33d.xyz")).toBe(false);
+    expect(isVanityBaseSubdomain("docs.example.com", "siteflow.w33d.xyz")).toBe(false);
+    expect(isVanityBaseSubdomain("-bad.siteflow.w33d.xyz", "siteflow.w33d.xyz")).toBe(false);
+  });
+
+  it("adds project domains as unverified by default", async () => {
+    const previousAutoVerify = process.env.SITEFLOW_DOMAIN_AUTOVERIFY;
+    const { pool, queries } = projectDomainMutationPool();
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow",
+      baseDomain: "siteflow.w33d.xyz"
+    });
+
+    try {
+      delete process.env.SITEFLOW_DOMAIN_AUTOVERIFY;
+
+      const result = await repository.addProjectDomain("project_docs", {
+        hostname: "Docs.Example.COM.",
+        actor: { id: "actor-1", name: "Ops", role: "operator" }
+      });
+      const insertDomain = queries.find((query) => query.text.includes("INSERT INTO siteflow_project_domains"));
+
+      expect(result.status).toBe("updated");
+      expect(insertDomain?.values).toEqual(["project_docs", "docs.example.com", false]);
+      expect(queries.some((query) => query.text.includes("FROM siteflow_artifact_routes"))).toBe(false);
+    } finally {
+      if (previousAutoVerify === undefined) {
+        delete process.env.SITEFLOW_DOMAIN_AUTOVERIFY;
+      } else {
+        process.env.SITEFLOW_DOMAIN_AUTOVERIFY = previousAutoVerify;
+      }
+    }
+  });
+
+  it("auto-verifies vanity subdomains and routes them to the current canonical deployment", async () => {
+    const previousAutoVerify = process.env.SITEFLOW_DOMAIN_AUTOVERIFY;
+    const { pool, queries } = projectDomainMutationPool({
+      canonicalRoute: {
+        deployment_id: "dep_current",
+        artifact_root: "/tmp/siteflow/dep_current",
+        entrypoint: "index.html"
+      }
+    });
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow",
+      baseDomain: "siteflow.w33d.xyz"
+    });
+
+    try {
+      delete process.env.SITEFLOW_DOMAIN_AUTOVERIFY;
+
+      const result = await repository.addProjectDomain("project_docs", {
+        hostname: "saguadoodle.siteflow.w33d.xyz",
+        actor: { id: "actor-1", name: "Ops", role: "operator" }
+      });
+      const insertDomain = queries.find((query) => query.text.includes("INSERT INTO siteflow_project_domains"));
+      const routeRead = queries.find((query) => query.text.includes("FROM siteflow_artifact_routes"));
+      const routeWrite = queries.find((query) => query.text.includes("INSERT INTO siteflow_artifact_routes"));
+
+      expect(result.status).toBe("updated");
+      expect(insertDomain?.values).toEqual(["project_docs", "saguadoodle.siteflow.w33d.xyz", true]);
+      expect(routeRead?.values).toEqual(["docs.siteflow.w33d.xyz"]);
+      expect(routeWrite?.values).toEqual(["saguadoodle.siteflow.w33d.xyz", "dep_current", "/tmp/siteflow/dep_current", "index.html"]);
+    } finally {
+      if (previousAutoVerify === undefined) {
+        delete process.env.SITEFLOW_DOMAIN_AUTOVERIFY;
+      } else {
+        process.env.SITEFLOW_DOMAIN_AUTOVERIFY = previousAutoVerify;
+      }
+    }
+  });
+
+  it("rejects vanity subdomains that collide with an existing project slug", async () => {
+    const { pool, queries } = projectDomainMutationPool({ slugCollisions: ["marketing"] });
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow",
+      baseDomain: "siteflow.w33d.xyz"
+    });
+
+    await expect(repository.addProjectDomain("project_docs", {
+      hostname: "marketing.siteflow.w33d.xyz",
+      actor: { id: "actor-1", name: "Ops", role: "operator" }
+    })).rejects.toThrow("conflicts with the canonical host for project slug marketing");
+    expect(queries.find((query) => query.text.includes("WHERE slug = $1"))?.values).toEqual(["marketing"]);
+    expect(queries.some((query) => query.text.includes("INSERT INTO siteflow_project_domains"))).toBe(false);
+  });
+
+  it("rejects the bare SiteFlow base domain and multi-label base subdomains", async () => {
+    const { pool, queries } = projectDomainMutationPool();
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow",
+      baseDomain: "siteflow.w33d.xyz"
+    });
+
+    await expect(repository.addProjectDomain("project_docs", {
+      hostname: "siteflow.w33d.xyz",
+      actor: { id: "actor-1", name: "Ops", role: "operator" }
+    })).rejects.toThrow("Domain hostname must not use the SiteFlow base domain");
+    await expect(repository.addProjectDomain("project_docs", {
+      hostname: "a.b.siteflow.w33d.xyz",
+      actor: { id: "actor-1", name: "Ops", role: "operator" }
+    })).rejects.toThrow("Domain hostname must not use the SiteFlow base domain");
+    expect(queries.some((query) => query.text.includes("INSERT INTO siteflow_project_domains"))).toBe(false);
+  });
+
+  it("translates duplicate project domain hostnames into conflict errors", async () => {
+    const previousAutoVerify = process.env.SITEFLOW_DOMAIN_AUTOVERIFY;
+    const uniqueViolation = new Error("duplicate hostname") as Error & { code: string };
+    uniqueViolation.code = "23505";
+    const { pool } = projectDomainMutationPool({ insertError: uniqueViolation });
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow",
+      baseDomain: "siteflow.w33d.xyz"
+    });
+
+    try {
+      delete process.env.SITEFLOW_DOMAIN_AUTOVERIFY;
+
+      await expect(repository.addProjectDomain("project_docs", {
+        hostname: "docs.example.com",
+        actor: { id: "actor-1", name: "Ops", role: "operator" }
+      })).rejects.toBeInstanceOf(SiteFlowConflictError);
+    } finally {
+      if (previousAutoVerify === undefined) {
+        delete process.env.SITEFLOW_DOMAIN_AUTOVERIFY;
+      } else {
+        process.env.SITEFLOW_DOMAIN_AUTOVERIFY = previousAutoVerify;
+      }
+    }
+  });
+
+  it("removes project domain and artifact route rows together", async () => {
+    const { pool, queries } = projectDomainMutationPool();
+    const repository = new PostgresSiteFlowReadRepository(pool as never, {
+      artifactRoot: "/tmp/siteflow",
+      baseDomain: "siteflow.w33d.xyz"
+    });
+
+    const result = await repository.removeProjectDomain(
+      "project_docs",
+      "Docs.Example.COM.",
+      { id: "actor-1", name: "Ops", role: "operator" }
+    );
+    const deleteDomain = queries.find((query) => query.text.includes("DELETE FROM siteflow_project_domains"));
+    const deleteRoute = queries.find((query) => query.text.includes("DELETE FROM siteflow_artifact_routes"));
+
+    expect(result.status).toBe("updated");
+    expect(deleteDomain?.values).toEqual(["project_docs", "docs.example.com"]);
+    // Route delete is now project-scoped (host + projectId) and only runs when the domain row existed,
+    // so it can never remove another project's route or the auto-managed canonical host.
+    expect(deleteRoute?.values).toEqual(["docs.example.com", "project_docs"]);
+  });
+
   it("updates existing project repository metadata from signed git webhook events before queueing builds", async () => {
     const queries: Array<{ text: string; values?: unknown[] }> = [];
     let sourceEventReads = 0;
@@ -1260,7 +1514,11 @@ describe("PostgresSiteFlowReadRepository", () => {
     expect(result.project.id).toBe("project_docs");
     expect(result.channel).toBe("production");
     expect(result.currentDeployment?.id).toBe("dep_current");
+    expect(result.currentDeployment?.previewHost).toBe("current.w33d.xyz");
+    expect(result.currentDeployment?.previewUrl).toBe("https://current.w33d.xyz");
     expect(result.candidateDeployment?.id).toBe("dep_prebuilt");
+    expect(result.candidateDeployment?.previewHost).toBe("preview.w33d.xyz");
+    expect(result.candidateDeployment?.previewUrl).toBe("https://preview.w33d.xyz");
     expect(result.routePreview?.routeRevision).toMatchObject({
       channel: "production",
       deploymentId: "dep_prebuilt",
@@ -1353,6 +1611,10 @@ describe("PostgresSiteFlowReadRepository", () => {
 
     expect(result.project.id).toBe("project_docs");
     expect(result.deployments.map((deployment) => deployment.id)).toEqual(["dep_prebuilt", "dep_current"]);
+    expect(result.deployments[0]).toMatchObject({
+      previewHost: "preview.w33d.xyz",
+      previewUrl: "https://preview.w33d.xyz"
+    });
     expect(result.channels[0]).toMatchObject({
       channel: {
         projectId: "project_docs",
@@ -2347,7 +2609,8 @@ describe("PostgresSiteFlowReadRepository", () => {
         sourcePath: ".siteflow/functions/api/env.js",
         runtime: "nodejs20.x",
         runtimeIsolation: "same_process",
-        handler: "default"
+        handler: "default",
+        apiStyle: "fetch"
       }
     ]);
     expect(queries.find((query) => query.text.includes("FROM siteflow_environment_variables"))?.values).toEqual([

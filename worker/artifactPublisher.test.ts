@@ -245,10 +245,75 @@ describe("publishBuildArtifact", () => {
           sourcePath: ".siteflow/functions/api/handler.js",
           runtime: "nodejs20.x",
           runtimeIsolation: "same_process",
-          handler: "default"
+          handler: "default",
+          apiStyle: "fetch"
         }
       ]);
       await expect(readdir(artifactRoot)).resolves.toEqual([artifact.deploymentId]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("emits a client environment shim and injects it as the first head child", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-artifact-client-env-"));
+    const outputDirectory = path.join(root, "dist");
+    const artifactRoot = path.join(root, "artifacts");
+
+    try {
+      await writeStaticOutput(outputDirectory, "<!doctype html><html><head><title>App</title></head><body>ok</body></html>");
+      await mkdir(artifactRoot, { recursive: true });
+
+      const artifact = await publishBuildArtifact({
+        buildJobId: "build_client_env",
+        sourceEventId: "src_client_env",
+        outputDirectory,
+        artifactRoot,
+        clientEnvironmentVariables: {
+          PUBLIC_FLAG: "enabled",
+          CISTERN_REST_URL: "https://cistern.example.test"
+        }
+      });
+      const html = await readFile(path.join(artifact.artifactRoot, "index.html"), "utf8");
+      const env = await readFile(path.join(artifact.artifactRoot, "__siteflow", "env.js"), "utf8");
+
+      expect(html).toContain('<head><script src="/__siteflow/env.js"></script><title>App</title>');
+      expect(env).toBe('window.env = Object.assign(window.env || {}, {"CISTERN_REST_URL":"https://cistern.example.test","PUBLIC_FLAG":"enabled"});');
+      expect(artifact.manifest.metadata?.precompressed).toEqual({
+        br: 2,
+        gzip: 2
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not inject duplicate client environment script tags", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "siteflow-artifact-client-env-idempotent-"));
+    const outputDirectory = path.join(root, "dist");
+    const artifactRoot = path.join(root, "artifacts");
+
+    try {
+      await writeStaticOutput(
+        outputDirectory,
+        '<html><head><script src="/__siteflow/env.js"></script><title>App</title></head><body>ok</body></html>'
+      );
+      await mkdir(artifactRoot, { recursive: true });
+
+      const artifact = await publishBuildArtifact({
+        buildJobId: "build_client_env_idempotent",
+        sourceEventId: "src_client_env_idempotent",
+        outputDirectory,
+        artifactRoot,
+        clientEnvironmentVariables: {
+          PUBLIC_FLAG: "enabled"
+        }
+      });
+      const html = await readFile(path.join(artifact.artifactRoot, "index.html"), "utf8");
+
+      expect(html.match(/\/__siteflow\/env\.js/g)).toHaveLength(1);
+      await expect(readFile(path.join(artifact.artifactRoot, "__siteflow", "env.js"), "utf8"))
+        .resolves.toBe('window.env = Object.assign(window.env || {}, {"PUBLIC_FLAG":"enabled"});');
     } finally {
       await rm(root, { recursive: true, force: true });
     }

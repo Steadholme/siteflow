@@ -110,6 +110,25 @@ export class SiteFlowNotFoundError extends Error {
   }
 }
 
+export class SiteFlowInputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SiteFlowInputError";
+  }
+}
+
+export class SiteFlowConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SiteFlowConflictError";
+  }
+}
+
+export interface AddProjectDomainCommand {
+  hostname: string;
+  actor: Actor;
+}
+
 export type SiteFlowAuthPrincipal =
   | {
     kind: "root_api_token";
@@ -160,6 +179,8 @@ export interface SiteFlowReadRepository {
   getProjectSettings(projectId: SiteFlowId): Promise<ProjectSettingsReadModel>;
   createProject(command: CreateProjectCommand): Promise<ProjectMutationReadModel>;
   updateProject(projectId: SiteFlowId, command: UpdateProjectCommand): Promise<ProjectMutationReadModel>;
+  addProjectDomain(projectId: SiteFlowId, command: AddProjectDomainCommand): Promise<ProjectMutationReadModel>;
+  removeProjectDomain(projectId: SiteFlowId, hostname: string, actor: Actor): Promise<ProjectMutationReadModel>;
   archiveProject(projectId: SiteFlowId): Promise<ProjectMutationReadModel>;
   getProjectEnvironmentSettings(projectId: SiteFlowId): Promise<ProjectEnvironmentSettingsReadModel>;
   upsertEnvironmentVariable(command: UpsertEnvironmentVariableCommand): Promise<ProjectEnvironmentVariableUpsertReadModel>;

@@ -23,6 +23,7 @@ export type CronJobStatus = "active" | "disabled";
 export type CronDispatchStatus = "queued" | "succeeded" | "failed";
 export type FunctionRuntime = "nodejs20.x";
 export type FunctionRuntimeIsolation = "same_process" | "isolated_process";
+export type FunctionApiStyle = "fetch" | "node";
 export type FunctionInvocationStatus = "succeeded" | "failed";
 export type AnalyticsEventKind = "pageview" | "custom" | "web_vital";
 export type WebVitalName = "CLS" | "FCP" | "FID" | "INP" | "LCP" | "TTFB";
@@ -396,6 +397,7 @@ export interface FunctionEntrypoint {
   runtime: FunctionRuntime;
   runtimeIsolation?: FunctionRuntimeIsolation;
   handler: "default" | "handler";
+  apiStyle?: FunctionApiStyle;
   methods?: string[];
   timeoutMs?: number;
   memoryMb?: number;
