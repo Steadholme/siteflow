@@ -1,26 +1,47 @@
 :root {
-  --color-brand-primary: oklch(41% 0.16 254);
-  --color-brand-primary-hover: oklch(34% 0.15 254);
-  --color-brand-secondary: oklch(43% 0.08 178);
-  --color-brand-accent: oklch(55% 0.14 36);
+  /* Odyssey 1.1 semantic adapter: SiteFlow keeps its component API and maps its
+     existing tokens onto the estate-wide mineral paper / basalt / oxide material. */
+  --odyssey-paper-0: #faf9f4;
+  --odyssey-paper-25: #f5f3ec;
+  --odyssey-paper-50: #f2f0e8;
+  --odyssey-paper-75: #ece9df;
+  --odyssey-paper-100: #e9e6dc;
+  --odyssey-paper-200: #cfcabd;
+  --odyssey-paper-300: #8d887c;
+  --odyssey-basalt-900: #191c18;
+  --odyssey-basalt-700: #454b43;
+  --odyssey-basalt-500: #5f665b;
+  --odyssey-basalt-400: #6d7469;
+  --odyssey-oxide-700: #8f2f1e;
+  --odyssey-oxide-600: #b6422c;
+  --odyssey-oxide-500: #d85d3f;
+  --odyssey-oxide-100: #eac9be;
+  --odyssey-oxide-50: #f4e4de;
 
-  --color-surface-background: oklch(98.5% 0.003 250);
-  --color-surface-subtle: oklch(96% 0.004 250);
-  --color-surface-elevated: oklch(100% 0 0);
-  --color-surface-card: oklch(100% 0 0);
+  --color-brand-primary: var(--odyssey-oxide-600);
+  --color-brand-primary-hover: var(--odyssey-oxide-700);
+  --color-brand-secondary: #0e7490;
+  --color-brand-accent: var(--odyssey-oxide-500);
+  --color-brand-soft: var(--odyssey-oxide-50);
+
+  --color-surface-background: var(--odyssey-paper-50);
+  --color-surface-subtle: var(--odyssey-paper-75);
+  --color-surface-elevated: var(--odyssey-paper-0);
+  --color-surface-card: var(--odyssey-paper-0);
   --color-surface-overlay: oklch(19% 0.015 250 / 0.72);
-  --color-surface-inset: oklch(97.5% 0.003 250);
-  --color-surface-rail: oklch(99.2% 0.002 250);
+  --color-surface-inset: var(--odyssey-paper-25);
+  --color-surface-rail: var(--odyssey-paper-25);
 
-  --color-text-primary: oklch(19% 0.015 250);
-  --color-text-secondary: oklch(38% 0.014 250);
-  --color-text-tertiary: oklch(55% 0.012 250);
-  --color-text-inverse: oklch(98% 0.004 250);
+  --color-text-primary: var(--odyssey-basalt-900);
+  --color-text-secondary: var(--odyssey-basalt-700);
+  --color-text-tertiary: var(--odyssey-basalt-500);
+  --color-text-inverse: var(--odyssey-paper-0);
 
-  --color-border-default: oklch(88% 0.006 250);
-  --color-border-strong: oklch(76% 0.01 250);
-  --color-border-subtle: oklch(92% 0.005 250);
-  --color-border-focus: oklch(51% 0.16 254);
+  --color-border-default: var(--odyssey-paper-200);
+  --color-border-strong: var(--odyssey-paper-300);
+  --color-border-subtle: color-mix(in srgb, var(--odyssey-paper-200) 56%, var(--odyssey-paper-0));
+  --color-border-focus: var(--odyssey-oxide-600);
+  --color-grid-line: color-mix(in srgb, var(--odyssey-basalt-900) 6%, transparent);
 
   --color-success: oklch(42% 0.13 150);
   --color-success-bg: oklch(94% 0.035 150);
@@ -65,15 +86,15 @@
   --space-12: 2.75rem;
 
   --radius-none: 0;
-  --radius-sm: 4px;
-  --radius-md: 6px;
-  --radius-lg: 8px;
-  --radius-xl: 8px;
+  --radius-sm: 2px;
+  --radius-md: 3px;
+  --radius-lg: 4px;
+  --radius-xl: 7px;
   --radius-full: 9999px;
 
-  --shadow-sm: 0 1px 2px oklch(19% 0.015 250 / 0.06);
-  --shadow-md: 0 10px 24px oklch(19% 0.015 250 / 0.08);
-  --shadow-focus: 0 0 0 3px oklch(51% 0.16 254 / 0.18);
+  --shadow-sm: 2px 2px 0 rgb(25 28 24 / 0.08);
+  --shadow-md: 4px 4px 0 rgb(25 28 24 / 0.11);
+  --shadow-focus: 0 0 0 3px rgb(182 66 44 / 0.22);
 
   --duration-instant: 0ms;
   --duration-fast: 90ms;

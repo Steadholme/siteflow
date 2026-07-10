@@ -22,7 +22,11 @@ export function SidebarNav() {
     <aside className="sidebar" aria-label="SiteFlow">
       <div className="sidebar__brand" aria-label="SiteFlow home">
         <span className="sidebar__brand-mark" aria-hidden="true">
-          SF
+          <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M24 4 8 9.5V22c0 11 7 17.4 16 21.5C33 39.4 40 33 40 22V9.5L24 4Z" stroke="currentColor" strokeWidth="2.5" strokeLinejoin="miter" />
+            <rect x="20" y="19" width="8" height="13" rx="1" fill="currentColor" />
+            <path d="M20 19v-2.5a4 4 0 0 1 8 0V19" stroke="currentColor" strokeWidth="2.5" />
+          </svg>
         </span>
         <span className="sidebar__brand-copy">
           <span>SiteFlow</span>

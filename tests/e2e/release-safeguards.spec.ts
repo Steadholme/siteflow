@@ -1,9 +1,20 @@
 import { expect, test } from "@playwright/test";
 
+const releaseEvidenceIdentity = {
+  commitRef: "abc123def456",
+  repository: "acme/siteflow",
+  branch: "main",
+  targetEnvironment: "production",
+  channel: "production",
+  deploymentId: "dep-healthy"
+};
 const releaseEvidenceBundle = {
   schemaVersion: "siteflow.releaseEvidence.v1",
   name: "siteflow-release-evidence-bundle",
-  targetEnvironment: "production"
+  targetEnvironment: releaseEvidenceIdentity.targetEnvironment,
+  channel: releaseEvidenceIdentity.channel,
+  deploymentId: releaseEvidenceIdentity.deploymentId,
+  release: releaseEvidenceIdentity
 };
 const releaseEvidenceCheck = {
   name: "siteflow-release-evidence-bundle-check",
@@ -12,9 +23,12 @@ const releaseEvidenceCheck = {
   evidencePath: "evidence/release-evidence.json",
   exitCode: 0,
   selectedEvidence: {
-    releaseCommitRef: "abc123def456",
-    repository: "acme/siteflow",
-    branch: "main",
+    releaseCommitRef: releaseEvidenceIdentity.commitRef,
+    repository: releaseEvidenceIdentity.repository,
+    branch: releaseEvidenceIdentity.branch,
+    targetEnvironment: releaseEvidenceIdentity.targetEnvironment,
+    channel: releaseEvidenceIdentity.channel,
+    deploymentId: releaseEvidenceIdentity.deploymentId,
     releaseGateStatus: "pass",
     dockerBuildRehearsalStatus: "passed",
     postgresRehearsalStatus: "passed",

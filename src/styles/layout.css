@@ -2,9 +2,11 @@
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   min-height: 100vh;
-  background:
-    linear-gradient(180deg, oklch(100% 0 0) 0, var(--color-surface-background) 280px),
-    var(--color-surface-background);
+  background-color: var(--color-surface-background);
+  background-image:
+    linear-gradient(var(--color-grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--color-grid-line) 1px, transparent 1px);
+  background-size: 48px 48px;
 }
 
 .app-shell__workspace {
@@ -37,13 +39,15 @@
   width: 30px;
   height: 30px;
   place-items: center;
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-lg);
-  background: oklch(19% 0.015 250);
-  color: var(--color-text-inverse);
+  border: 1px solid var(--color-brand-primary);
+  border-radius: var(--radius-sm);
+  background: var(--color-brand-soft);
+  color: var(--color-brand-primary);
+  box-shadow: var(--shadow-sm);
   font-size: var(--font-size-xs);
   font-weight: var(--font-weight-bold);
 }
+.sidebar__brand-mark svg { width: 24px; height: 24px; }
 
 .sidebar__brand-copy {
   display: grid;
@@ -119,7 +123,7 @@
   gap: var(--space-3);
   padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--color-border-default);
-  background: oklch(100% 0 0 / 0.92);
+  background: color-mix(in srgb, var(--color-surface-elevated) 94%, transparent);
   backdrop-filter: blur(14px);
 }
 
@@ -236,7 +240,7 @@
   border: 1px solid var(--color-border-default);
   border-radius: var(--radius-lg);
   background: var(--color-surface-card);
-  box-shadow: none;
+  box-shadow: var(--shadow-sm);
 }
 
 .panel__header {

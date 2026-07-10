@@ -94,7 +94,7 @@ button:disabled {
 }
 
 ::selection {
-  background: oklch(51% 0.16 254 / 0.2);
+  background: var(--color-brand-soft);
 }
 
 .eyebrow {
@@ -103,5 +103,6 @@ button:disabled {
   font-size: var(--font-size-xs);
   font-weight: var(--font-weight-semibold);
   line-height: var(--line-height-tight);
+  letter-spacing: 0.12em;
   text-transform: uppercase;
 }
