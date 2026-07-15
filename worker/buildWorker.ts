@@ -67,7 +67,7 @@ export interface BuildWorkerOptions {
   maxArtifactFiles?: number;
   minBuildFreeBytes?: number;
   /**
-   * Optional fire-and-forget build outcome notifier (HOLDFAST Klaxon). Invoked
+   * Optional fire-and-forget build outcome notifier (Steadholme Klaxon). Invoked
    * AFTER the job status is durably written; implementations must never throw
    * and never block (see worker/klaxonNotifier.ts).
    */

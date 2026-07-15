@@ -2,7 +2,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import type { IncomingHttpHeaders } from "node:http";
 
 /**
- * HOLDFAST gateway identity verification.
+ * Steadholme gateway identity verification.
  *
  * The Sluice gateway (auth=sso routes) strips every inbound X-Auth-* header and
  * injects the verified identity as X-Auth-Subject / X-Auth-Email / X-Auth-Scope /

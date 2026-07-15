@@ -519,7 +519,7 @@ export function gitWebhookSecretsFromEnv(env: NodeJS.ProcessEnv = process.env) {
 /**
  * Estate RBAC convention: the global admin groups (admins/infra-admins) always
  * hold admin scope; the product-domain operations group is configurable via
- * SITEFLOW_ADMIN_GROUP (HOLDFAST default: deploy-admins).
+ * SITEFLOW_ADMIN_GROUP (Steadholme default: deploy-admins).
  */
 export function defaultGatewayAdminGroups(env: NodeJS.ProcessEnv = process.env) {
   const productGroup = env.SITEFLOW_ADMIN_GROUP?.trim() || "deploy-admins";
@@ -574,7 +574,7 @@ export async function main() {
   const baseDomain = process.env.SITEFLOW_BASE_DOMAIN;
   const gitWebhookSecrets = gitWebhookSecretsFromEnv();
   const prebuiltUploadBudget = defaultPrebuiltUploadBudget();
-  // HOLDFAST gateway integration (all optional; absent = stock SiteFlow).
+  // Steadholme gateway integration (all optional; absent = stock SiteFlow).
   const gatewayHmacKey = resolveSecretEnvValue("GATEWAY_HMAC_KEY");
   const gatewayAdminGroups = defaultGatewayAdminGroups();
   const consoleHost = process.env.SITEFLOW_CONSOLE_HOST?.trim() || undefined;

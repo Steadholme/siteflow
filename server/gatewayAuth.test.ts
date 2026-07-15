@@ -6,7 +6,7 @@ import { gatewayIdentitySignature } from "./gatewayIdentity.js";
 import type { SiteFlowReadRepository } from "./readRepository.js";
 
 /**
- * Behavior tests for the HOLDFAST gateway identity branch in authorizeRequest:
+ * Behavior tests for the Steadholme gateway identity branch in authorizeRequest:
  * signed X-Auth-* headers from the Sluice gateway replace the operator session
  * as the console's authentication, while bearer tokens stay untouched.
  */

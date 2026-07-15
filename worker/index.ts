@@ -525,7 +525,7 @@ export async function startSiteFlowBuildWorker(env: NodeJS.ProcessEnv = process.
   const controller = new AbortController();
   const log = (message: string) => process.stdout.write(message);
   const removeShutdownHandlers = installShutdownHandlers(controller, log);
-  // HOLDFAST Klaxon build notifications: enabled only when KLAXON_NOTIFY_URL +
+  // Steadholme Klaxon build notifications: enabled only when KLAXON_NOTIFY_URL +
   // KLAXON_INGEST_TOKEN are both set; fire-and-forget, never blocks the build.
   const buildEventNotifier = createKlaxonBuildNotifier(env);
 

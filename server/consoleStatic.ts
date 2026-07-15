@@ -6,7 +6,7 @@ import path from "node:path";
 /**
  * Minimal static file serving for the SiteFlow console SPA (vite build output in
  * dist/). Only engaged when the request Host matches the configured console host
- * (SITEFLOW_CONSOLE_HOST, e.g. siteflow.w33d.xyz behind the HOLDFAST gateway).
+ * (SITEFLOW_CONSOLE_HOST, e.g. siteflow.w33d.xyz behind the Steadholme gateway).
  * Non-file paths fall back to index.html (SPA router). API and health paths are
  * never routed here — the caller excludes them.
  */

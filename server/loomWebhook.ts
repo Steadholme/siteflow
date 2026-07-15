@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 
 /**
- * Loom (HOLDFAST git hosting) webhook dialect for the generic provider.
+ * Loom (Steadholme git hosting) webhook dialect for the generic provider.
  *
  * Loom delivers webhooks with:
  *   X-Loom-Event:     push | issues | pull_request

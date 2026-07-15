@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { gatewayIdentityGroups, gatewayIdentityOk, gatewayIdentitySignature, gatewayIdentitySubject } from "./gatewayIdentity.js";
 
-// Cross-language HOLDFAST gateway HMAC vectors. These MUST match byte-for-byte:
+// Cross-language Steadholme gateway HMAC vectors. These MUST match byte-for-byte:
 // - sluice/internal/auth/sig_test.go (Go, the signing side)
 // - forge/crates/loom/src/auth.rs L333-343 (Rust, a verifying side)
 const vectorKey = "test-key";

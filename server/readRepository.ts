@@ -149,7 +149,7 @@ export type SiteFlowAuthPrincipal =
     actor: Actor;
   }
   | {
-    // HOLDFAST gateway-injected identity (X-Auth-* verified via X-Auth-Sig);
+    // Steadholme gateway-injected identity (X-Auth-* verified via X-Auth-Sig);
     // actor.id is the estate subject (X-Auth-Subject).
     kind: "gateway_identity";
     scopes: PermissionScope[];

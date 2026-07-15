@@ -61,7 +61,7 @@ export interface SiteFlowServerOptions {
   productionRuntime?: boolean;
   allowSameProcessFunctionRuntime?: boolean;
   /**
-   * HOLDFAST gateway integration (all optional; absent = stock SiteFlow):
+   * Steadholme gateway integration (all optional; absent = stock SiteFlow):
    * - gatewayHmacKey: verifies Sluice-injected X-Auth-* identity headers via
    *   X-Auth-Sig (HMAC-SHA256, minute window; see gatewayIdentity.ts).
    * - gatewayAdminGroups: X-Auth-Groups values granted full admin scope
@@ -2276,7 +2276,7 @@ function gitWebhookDeliveryId(provider: SourceProvider, request: IncomingMessage
     return headerValue(request, "x-gitea-delivery") ?? headerValue(request, "x-gogs-delivery") ?? headerValue(request, "x-github-delivery");
   }
 
-  // Generic provider: SiteFlow's own headers, with the Loom (HOLDFAST git)
+  // Generic provider: SiteFlow's own headers, with the Loom (Steadholme git)
   // dialect as a fallback (X-Loom-Delivery / X-Loom-Event / X-Loom-Signature).
   return headerValue(request, "x-siteflow-delivery") ?? headerValue(request, "x-loom-delivery");
 }
@@ -2343,7 +2343,7 @@ async function authorizeRequest(
     return undefined;
   }
 
-  // HOLDFAST gateway identity: when GATEWAY_HMAC_KEY is configured and the
+  // Steadholme gateway identity: when GATEWAY_HMAC_KEY is configured and the
   // Sluice gateway injected a signed X-Auth-* identity, trust it and short-
   // circuit the operator session (single source of truth for console auth).
   // Root token / api_tokens / deploy-hook tokens above stay untouched.
@@ -5837,7 +5837,7 @@ export function createSiteFlowServer(options: SiteFlowServerOptions) {
       requestBodyLimitBytes.set(request, maxBodyBytes(options));
 
       // Console SPA static serving: requests whose Host is the configured
-      // console host (e.g. siteflow.w33d.xyz behind the HOLDFAST gateway) get
+      // console host (e.g. siteflow.w33d.xyz behind the Steadholme gateway) get
       // the built dist/ bundle, except API/health/metrics paths, which keep
       // flowing into the control-plane routes below.
       if (

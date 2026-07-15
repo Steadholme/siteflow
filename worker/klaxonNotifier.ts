@@ -1,7 +1,7 @@
 import type { BuildJobResult, QueuedBuildJob } from "./buildWorker.js";
 
 /**
- * HOLDFAST Klaxon notification client (fire-and-forget, estate convention):
+ * Steadholme Klaxon notification client (fire-and-forget, estate convention):
  * - enabled ONLY when both KLAXON_NOTIFY_URL and KLAXON_INGEST_TOKEN are set;
  * - 5s timeout, detached, failures are logged as warnings and NEVER block or
  *   fail the build pipeline;
