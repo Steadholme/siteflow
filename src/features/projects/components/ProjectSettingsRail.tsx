@@ -5,10 +5,6 @@ import { StatusPill } from "@components/ui/StatusPill";
 import type { ProjectDetailReadModel, ProjectSettingsReadModel } from "@domain/readModels";
 import { formatDateTime, humanizeStatus } from "../projectPresentation";
 
-function canManage(settings: ProjectSettingsReadModel | undefined) {
-  return settings?.currentPermissions.includes("admin") ?? false;
-}
-
 export function ProjectSettingsRail({
   model,
   settings,
@@ -19,7 +15,6 @@ export function ProjectSettingsRail({
   settingsError?: string;
 }) {
   const { project } = model;
-  const canManageAccess = canManage(settings);
 
   return (
     <aside className="projects-settings-rail" aria-label="Project settings">
@@ -69,7 +64,7 @@ export function ProjectSettingsRail({
 
       <Panel
         title="Team access"
-        eyebrow={canManageAccess ? "Admin controls enabled" : "Read-only view"}
+        eyebrow={`${settings?.teamMembers.length ?? 0} recorded members`}
         actions={<UserCog aria-hidden="true" className="projects-panel-icon" size={17} />}
       >
         <div className="projects-stack">
@@ -91,15 +86,12 @@ export function ProjectSettingsRail({
           {settings && settings.teamMembers.length === 0 && (
             <p className="projects-empty-note">No project team members have been recorded.</p>
           )}
-          <button className="button button--secondary" type="button" disabled={!canManageAccess}>
-            <span>Manage access</span>
-          </button>
         </div>
       </Panel>
 
       <Panel
         title="Scoped API tokens"
-        eyebrow="Prefix only"
+        eyebrow={`Prefix only / ${settings?.apiTokens.length ?? 0} recorded`}
         actions={<KeyRound aria-hidden="true" className="projects-panel-icon" size={17} />}
       >
         <div className="projects-stack">
@@ -118,9 +110,6 @@ export function ProjectSettingsRail({
           {settings && settings.apiTokens.length === 0 && (
             <p className="projects-empty-note">No scoped API tokens have been created.</p>
           )}
-          <button className="button button--secondary" type="button" disabled={!canManageAccess}>
-            <span>Create token</span>
-          </button>
         </div>
       </Panel>
 

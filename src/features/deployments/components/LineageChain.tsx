@@ -20,6 +20,7 @@ import {
 
 interface LineageStep {
   id: string;
+  station: string;
   label: string;
   title: string;
   meta: string;
@@ -37,6 +38,7 @@ export function LineageChain({ lineage }: LineageChainProps) {
   const steps: LineageStep[] = [
     {
       id: "source_event",
+      station: "Station 1",
       label: "Source event",
       title: sourceEvent.kind,
       meta: `${sourceEvent.branch} ${shortenSha(sourceEvent.commitSha)} / delivery ${sourceEvent.providerDeliveryId}`,
@@ -46,6 +48,7 @@ export function LineageChain({ lineage }: LineageChainProps) {
     },
     {
       id: "build_job",
+      station: "Station 2",
       label: "Build job",
       title: buildJob.id,
       meta: `${buildJob.framework} / ${formatDuration(buildJob.startedAt, buildJob.finishedAt)}`,
@@ -55,6 +58,7 @@ export function LineageChain({ lineage }: LineageChainProps) {
     },
     {
       id: "artifact",
+      station: "Station 3",
       label: "Artifact",
       title: shortenSha(artifact.manifest.checksum, 16),
       meta: `${artifact.manifest.fileCount} files / ${formatBytes(artifact.manifest.totalBytes)}`,
@@ -64,6 +68,7 @@ export function LineageChain({ lineage }: LineageChainProps) {
     },
     {
       id: "deployment",
+      station: "Station 4",
       label: "Deployment",
       title: deployment.id,
       meta: `${deployment.environment} / ${formatDuration(deployment.createdAt, deployment.readyAt)}`,
@@ -73,6 +78,7 @@ export function LineageChain({ lineage }: LineageChainProps) {
     },
     {
       id: "route_revision",
+      station: "Station 5",
       label: "Route revision",
       title: routeRevision?.id ?? "Not created",
       meta: routeRevision ? `${routeRevision.channel} / previous ${routeRevision.previousDeploymentId ?? "none"}` : "Waiting for route planner",
@@ -83,13 +89,19 @@ export function LineageChain({ lineage }: LineageChainProps) {
   ];
 
   return (
-    <Panel title="Deployment lineage" eyebrow="Evidence chain" className="deployment-lineage-panel">
-      <div className="deployment-lineage__scroll">
+    <Panel title="Deployment lineage" eyebrow="Movement line" className="deployment-lineage-panel">
+      <div
+        className="deployment-lineage__scroll"
+        role="region"
+        aria-label="Scrollable deployment lineage"
+        tabIndex={0}
+      >
         <ol className="deployment-lineage" aria-label="Deployment lineage">
           {steps.map((step) => (
             <li key={step.id} className="deployment-lineage__step" data-lineage-id={step.id}>
-              <div className="deployment-lineage__icon">{step.icon}</div>
+              <div className="deployment-lineage__station-marker">{step.icon}</div>
               <div>
+                <span className="deployment-lineage__station">{step.station}</span>
                 <span className="deployment-lineage__label">{step.label}</span>
                 <strong className="deployment-lineage__title">{step.title}</strong>
                 <span className="deployment-lineage__meta">{step.meta}</span>

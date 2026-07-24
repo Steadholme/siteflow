@@ -60,18 +60,22 @@ export function SafetyChecks({ checks }: { checks: SafetyCheck[] }) {
 
   return (
     <Panel title="Safety checks" eyebrow="Release gate">
-      <div className="release-check-list">
-        {normalizedChecks.map((check) => (
-          <div key={check.id} className="release-check">
-            <div>
-              <strong>{check.label}</strong>
-              <p>{check.summary}</p>
-              {check.evidence && <span className="release-muted">{check.evidence}</span>}
+      {normalizedChecks.length > 0 ? (
+        <div className="release-check-list">
+          {normalizedChecks.map((check) => (
+            <div key={check.id} className="release-check">
+              <div>
+                <strong>{check.label}</strong>
+                <p>{check.summary}</p>
+                {check.evidence && <span className="release-muted">{check.evidence}</span>}
+              </div>
+              <StatusPill tone={toneForSafety(check.status)}>{check.status}</StatusPill>
             </div>
-            <StatusPill tone={toneForSafety(check.status)}>{check.status}</StatusPill>
-          </div>
-        ))}
-      </div>
+          ))}
+        </div>
+      ) : (
+        <p className="release-muted">No safety checks are available for this command.</p>
+      )}
     </Panel>
   );
 }

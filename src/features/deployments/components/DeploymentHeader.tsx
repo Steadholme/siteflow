@@ -1,4 +1,4 @@
-import { Copy, FileJson, RefreshCw } from "lucide-react";
+import { RefreshCw } from "lucide-react";
 
 import { Button } from "@components/ui/Button";
 import { StatusPill } from "@components/ui/StatusPill";
@@ -29,7 +29,7 @@ export function DeploymentHeader({ detail, onRefresh }: DeploymentHeaderProps) {
   return (
     <section className="page-header deployment-header" aria-labelledby="deployment-title">
       <div className="deployment-header__copy">
-        <p className="eyebrow">Deployment evidence</p>
+        <p className="eyebrow">Switchyard / Consist ticket</p>
         <h1 id="deployment-title" className="page-title">
           {deployment.version}
         </h1>
@@ -48,12 +48,6 @@ export function DeploymentHeader({ detail, onRefresh }: DeploymentHeaderProps) {
           <StatusPill tone={cdnOperationStateTone(cdnOperation?.state)}>{cdnOperationStateLabel(cdnOperation?.state)}</StatusPill>
         </div>
         <div className="page-header__actions">
-          <Button variant="secondary" icon={<Copy aria-hidden="true" size={16} />}>
-            Copy URL
-          </Button>
-          <Button variant="secondary" icon={<FileJson aria-hidden="true" size={16} />}>
-            Export evidence
-          </Button>
           <Button variant="primary" icon={<RefreshCw aria-hidden="true" size={16} />} onClick={onRefresh}>
             Refresh
           </Button>

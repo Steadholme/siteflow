@@ -1,7 +1,6 @@
-import { Download, ExternalLink } from "lucide-react";
+import { ExternalLink } from "lucide-react";
 import { Link } from "react-router-dom";
 
-import { Button } from "@components/ui/Button";
 import { DataTable, type DataTableColumn } from "@components/ui/DataTable";
 import { Panel } from "@components/ui/Panel";
 import { StatusPill } from "@components/ui/StatusPill";
@@ -23,7 +22,11 @@ const columns: Array<DataTableColumn<DeploymentSummaryReadModel>> = [
     width: "22%",
     render: (deployment) => (
       <span>
-        <Link className="projects-link-strong projects-mono" to={`/deployments/${deployment.id}`}>
+        <Link
+          className="projects-link-strong projects-mono"
+          to={`/deployments/${deployment.id}`}
+          title={deployment.id}
+        >
           {compactId(deployment.id)}
         </Link>
         <span className="table-subtext">Version {deployment.version}</span>
@@ -95,15 +98,7 @@ export function DeploymentHistory({ deployments }: { deployments: DeploymentSumm
   const rows = deployments.filter(isDeploymentSummary);
 
   return (
-    <Panel
-      title="Deployment history"
-      eyebrow="Build, artifact, and route evidence"
-      actions={
-        <Button variant="ghost" icon={<Download aria-hidden="true" size={15} />}>
-          Export
-        </Button>
-      }
-    >
+    <Panel title="Deployment history" eyebrow="Consists / Build, artifact, and route evidence">
       <DataTable
         rows={rows}
         columns={columns}

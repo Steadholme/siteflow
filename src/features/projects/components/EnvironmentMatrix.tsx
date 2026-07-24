@@ -1,6 +1,6 @@
 import { GitBranch, Route, ShieldCheck } from "lucide-react";
+import { Link } from "react-router-dom";
 
-import { Button } from "@components/ui/Button";
 import { Panel } from "@components/ui/Panel";
 import { StatusPill } from "@components/ui/StatusPill";
 import type { ProjectDetailReadModel, ReleaseChannelReadModel } from "@domain/readModels";
@@ -19,9 +19,13 @@ interface EnvironmentCard {
   statusLabel: string;
   tone: "success" | "warning" | "error" | "info";
   deploymentId: string;
+  deploymentTitle?: string;
   summary: string;
   facts: string[];
-  action: string;
+  action?: {
+    label: string;
+    to: string;
+  };
 }
 
 function findChannel(model: ProjectDetailReadModel, name: string): ReleaseChannelReadModel | undefined {
@@ -44,19 +48,24 @@ function buildEnvironmentCards(model: ProjectDetailReadModel): EnvironmentCard[]
       statusLabel: productionStatus.label,
       tone: productionStatus.tone,
       deploymentId: compactId(production?.currentDeployment?.id),
+      deploymentTitle: production?.currentDeployment?.id,
       summary: production?.routeRevision?.validationSummary ?? "No production route revision is active.",
       facts: [
         `Route ${production?.routeRevision ? routeStatusDescriptor(production.routeRevision.status).label : "not configured"}`,
         `Artifact ${production?.currentDeployment ? artifactStatusDescriptor(production.currentDeployment.artifactVerificationStatus).label : "not available"}`,
         `CDN ${production?.cdnOperation ? cdnStatusDescriptor(production.cdnOperation.state).label : "not attached"}`
       ],
-      action: "View route revision"
+      action: {
+        label: "Promote to production",
+        to: `/projects/${encodeURIComponent(model.project.id)}/release/production`
+      }
     },
     {
       name: "Staging",
       statusLabel: stagingStatus.label === "Verified" ? "Verified candidate" : stagingStatus.label,
       tone: stagingStatus.tone,
       deploymentId: compactId(stagingCandidate?.id),
+      deploymentTitle: stagingCandidate?.id,
       summary: stagingCandidate
         ? `Candidate from ${stagingCandidate.branch} at ${stagingCandidate.commitSha.slice(0, 8)}.`
         : "No staging candidate has been recorded for this project.",
@@ -65,7 +74,12 @@ function buildEnvironmentCards(model: ProjectDetailReadModel): EnvironmentCard[]
         `Created ${formatDateTime(stagingCandidate?.createdAt)}`,
         "Promotion requires a fresh audit reason"
       ],
-      action: "Open deployment"
+      action: stagingCandidate
+        ? {
+            label: "Open deployment",
+            to: `/deployments/${encodeURIComponent(stagingCandidate.id)}`
+          }
+        : undefined
     },
     {
       name: "Previews",
@@ -79,8 +93,7 @@ function buildEnvironmentCards(model: ProjectDetailReadModel): EnvironmentCard[]
         `Retention ${model.project.policy.retentionDays} days`,
         `Required checks ${model.project.policy.requiredChecks.length}`,
         model.project.policy.cdnEnabled ? "CDN policy enabled" : "CDN policy disabled"
-      ],
-      action: "Review policy"
+      ]
     }
   ];
 }
@@ -94,12 +107,15 @@ export function EnvironmentMatrix({ model }: { model: ProjectDetailReadModel }) 
         <Panel
           key={card.name}
           className="projects-environment-card"
+          eyebrow={`Track / ${card.name}`}
           title={card.name}
           actions={<StatusPill tone={card.tone}>{card.statusLabel}</StatusPill>}
         >
           <div className="projects-environment-card__body">
             <div className="projects-environment-card__headline">
-              <span className="projects-mono">{card.deploymentId}</span>
+              <span className="projects-mono" title={card.deploymentTitle}>
+                {card.deploymentId}
+              </span>
               {card.name === "Production" && <Route aria-hidden="true" size={18} />}
               {card.name === "Staging" && <GitBranch aria-hidden="true" size={18} />}
               {card.name === "Previews" && <ShieldCheck aria-hidden="true" size={18} />}
@@ -113,7 +129,11 @@ export function EnvironmentMatrix({ model }: { model: ProjectDetailReadModel }) 
                 </div>
               ))}
             </dl>
-            <Button variant="secondary">{card.action}</Button>
+            {card.action ? (
+              <Link className="button button--secondary projects-action-link" to={card.action.to}>
+                {card.action.label}
+              </Link>
+            ) : null}
           </div>
         </Panel>
       ))}

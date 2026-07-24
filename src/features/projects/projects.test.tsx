@@ -3,6 +3,7 @@ import { createMemoryRouter, MemoryRouter, Outlet, RouterProvider } from "react-
 
 import type { ProjectListReadModel } from "@domain/readModels";
 import { FixtureSiteFlowClient } from "@lib/api/fixtureClient";
+import { SiteFlowHttpError } from "@lib/api/httpClient";
 import type { SiteFlowClient } from "@lib/api/siteflowClient";
 import { fixtureProjectId } from "@lib/fixtures/siteflow.fixtures";
 import { SITEFLOW_SECRET_CANARY } from "@lib/redaction";
@@ -120,6 +121,17 @@ describe("projectRoutes", () => {
     expect(screen.getByText("LCP")).toBeInTheDocument();
     expect(screen.getByText("Recent events")).toBeInTheDocument();
     expect(screen.getByText(/Secret values and provider payloads are redacted/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Settings" })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("link", { name: "Promote to production" }).length).toBeGreaterThan(0);
+    expect(screen.getByRole("link", { name: "Open deployment" })).toHaveAttribute(
+      "href",
+      expect.stringMatching(/^\/deployments\//)
+    );
+    expect(screen.queryByRole("button", { name: "Review policy" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Export" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Watch" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Manage access" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Create token" })).not.toBeInTheDocument();
     expect(document.body).not.toHaveTextContent(SITEFLOW_SECRET_CANARY);
   });
 });
@@ -159,6 +171,22 @@ describe("ProjectListPage states", () => {
     expect(await screen.findByText("Project inventory unavailable")).toBeInTheDocument();
     expect(screen.getByText("Projects API unavailable")).toBeInTheDocument();
   });
+
+  it.each([
+    [401, "Sign-in required (401)", /operator session is missing or expired/i],
+    [403, "Access denied (403)", /does not include the required permission/i]
+  ])("renders a truthful %i access error state", async (status, label, guidance) => {
+    renderListPage(
+      clientWith({
+        listProjects: async () => {
+          throw new SiteFlowHttpError(status, "/v1/projects", "Gateway rejected the project inventory request.");
+        }
+      })
+    );
+
+    expect(await screen.findByText(label)).toBeInTheDocument();
+    expect(screen.getByText(guidance)).toBeInTheDocument();
+  });
 });
 
 describe("ProjectDetailPage safeguards", () => {
@@ -180,5 +208,21 @@ describe("ProjectDetailPage safeguards", () => {
 
     expect(await screen.findByText("Project unavailable")).toBeInTheDocument();
     expect(screen.getByText("Project detail API unavailable")).toBeInTheDocument();
+  });
+
+  it.each([
+    [401, "Sign-in required (401)", /operator session is missing or expired/i],
+    [403, "Access denied (403)", /does not include the required permission/i]
+  ])("renders a truthful %i project-detail access error state", async (status, label, guidance) => {
+    renderDetailPage(
+      clientWith({
+        getProject: async () => {
+          throw new SiteFlowHttpError(status, `/v1/projects/${fixtureProjectId}`, "Gateway rejected the project request.");
+        }
+      })
+    );
+
+    expect(await screen.findByText(label)).toBeInTheDocument();
+    expect(screen.getByText(guidance)).toBeInTheDocument();
   });
 });

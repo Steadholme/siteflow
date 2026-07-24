@@ -21,7 +21,7 @@ export function RouteRevisionPanel({ routeRevision, cdnOperation }: RouteRevisio
   const generatedConfig = routeRevision ? redactRouteConfig(routeRevision.generatedConfig) : "";
 
   return (
-    <Panel title="Route revision" eyebrow="Traffic boundary" className="deployment-route-panel">
+    <Panel title="Route revision" eyebrow="Switch state / Traffic boundary" className="deployment-route-panel">
       {routeRevision ? (
         <div className="deployment-route">
           <div className="deployment-route__status">

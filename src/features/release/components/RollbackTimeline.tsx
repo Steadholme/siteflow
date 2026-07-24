@@ -69,7 +69,9 @@ export function RollbackTimeline({ targets, selectedTargetId, onSelectTarget }: 
       header: "Deployment",
       render: (target) => (
         <span>
-          <strong className="release-mono">{target.deployment.id}</strong>
+          <strong className="release-mono" title={target.deployment.id}>
+            {target.deployment.id}
+          </strong>
           <span className="table-subtext">{target.deployment.version}</span>
         </span>
       )
@@ -93,13 +95,15 @@ export function RollbackTimeline({ targets, selectedTargetId, onSelectTarget }: 
 
   return (
     <Panel title="Known-good deployments" eyebrow="Rollback selector" actions={<StatusPill tone="info">protected only</StatusPill>}>
-      <DataTable
-        rows={targets}
-        columns={columns}
-        getRowKey={(target) => target.deployment.id}
-        ariaLabel="Known-good rollback deployments"
-        emptyState="No protected rollback targets are available."
-      />
+      <div className="release-target-group" role="radiogroup" aria-label="Known-good rollback deployments" tabIndex={0}>
+        <DataTable
+          rows={targets}
+          columns={columns}
+          getRowKey={(target) => target.deployment.id}
+          ariaLabel="Known-good rollback deployments"
+          emptyState="No protected rollback targets are available."
+        />
+      </div>
       <p className="release-muted release-table-note">
         Expired, failed, unverified, or deleted-artifact deployments remain disabled until backend eligibility passes again.
       </p>

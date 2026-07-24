@@ -1,6 +1,3 @@
-import { Bell } from "lucide-react";
-
-import { Button } from "@components/ui/Button";
 import { Panel } from "@components/ui/Panel";
 import { Timeline, type TimelineItem } from "@components/ui/Timeline";
 import type { AuditEvent, ChannelEvent, SourceEvent } from "@domain/siteflow";
@@ -55,15 +52,7 @@ export function ProjectActivity({ events, title = "Recent events" }: { events: E
   const timelineItems = buildTimelineItems(events);
 
   return (
-    <Panel
-      title={title}
-      eyebrow="Control-plane activity"
-      actions={
-        <Button variant="ghost" icon={<Bell aria-hidden="true" size={15} />}>
-          Watch
-        </Button>
-      }
-    >
+    <Panel title={title} eyebrow="Yard log / Control-plane activity">
       {timelineItems.length > 0 ? (
         <Timeline items={timelineItems} ariaLabel={title} />
       ) : (

@@ -20,12 +20,16 @@ export function DeploymentComparison({ currentDeployment, targetDeployment, rout
       <div className="release-comparison">
         <div className="release-comparison__item">
           <span className="release-label">Current channel deployment</span>
-          <strong className="release-mono">{currentDeployment?.id ?? "No current deployment"}</strong>
+          <strong className="release-mono" title={currentDeployment?.id}>
+            {currentDeployment?.id ?? "No current deployment"}
+          </strong>
           <p className="release-muted">{currentDeployment?.version ?? "No current version"}</p>
         </div>
         <div className="release-comparison__item">
           <span className="release-label">Selected rollback target</span>
-          <strong className="release-mono">{targetDeployment?.id ?? "No target selected"}</strong>
+          <strong className="release-mono" title={targetDeployment?.id}>
+            {targetDeployment?.id ?? "No target selected"}
+          </strong>
           <p className="release-muted">{targetDeployment?.version ?? "Select a protected deployment"}</p>
         </div>
         <div className="release-comparison__item">

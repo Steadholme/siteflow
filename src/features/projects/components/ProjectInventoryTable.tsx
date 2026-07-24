@@ -62,7 +62,9 @@ function getColumns(): Array<DataTableColumn<ProjectListItemReadModel>> {
       header: "Last deployment",
       render: (item) => (
         <span>
-          <span className="projects-mono">{compactId(item.productionDeployment?.id)}</span>
+          <span className="projects-mono" title={item.productionDeployment?.id}>
+            {compactId(item.productionDeployment?.id)}
+          </span>
           <span className="table-subtext">
             {item.productionDeployment ? formatDateTime(item.productionDeployment.createdAt) : "No deployment yet"}
           </span>

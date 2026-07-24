@@ -1,4 +1,4 @@
-import { RefreshCw, Rocket, Settings } from "lucide-react";
+import { RefreshCw, Rocket } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
@@ -6,7 +6,7 @@ import { Button } from "@components/ui/Button";
 import { Panel } from "@components/ui/Panel";
 import { StatusPill } from "@components/ui/StatusPill";
 import type { AnalyticsDashboardReadModel, ProjectDetailReadModel, ProjectSettingsReadModel } from "@domain/readModels";
-import { createSiteFlowClient, getDefaultSiteFlowClientMode, type SiteFlowClient } from "@lib/api";
+import { createSiteFlowClient, getDefaultSiteFlowClientMode, SiteFlowHttpError, type SiteFlowClient } from "@lib/api";
 import { AnalyticsPanel } from "./components/AnalyticsPanel";
 import { DeploymentHistory } from "./components/DeploymentHistory";
 import { EnvironmentMatrix } from "./components/EnvironmentMatrix";
@@ -33,6 +33,27 @@ export interface ProjectDetailPageProps {
 }
 
 const defaultFixtureProjectId = "project-acme-dashboard";
+
+function projectAccessError(error: Error) {
+  if (error instanceof SiteFlowHttpError && error.isUnauthorized) {
+    return {
+      eyebrow: "Sign-in required (401)",
+      guidance: "Your operator session is missing or expired. Sign in again through the gateway, then retry."
+    };
+  }
+
+  if (error instanceof SiteFlowHttpError && error.isForbidden) {
+    return {
+      eyebrow: "Access denied (403)",
+      guidance: "Your gateway identity does not include the required permission for this console."
+    };
+  }
+
+  return {
+    eyebrow: "API error",
+    guidance: "Retry after the project read becomes available."
+  };
+}
 
 function getDefaultClient() {
   return createSiteFlowClient();
@@ -110,11 +131,13 @@ export function ProjectDetailPage({ client: providedClient }: ProjectDetailPageP
   }
 
   if (state.status === "error") {
+    const accessError = projectAccessError(state.error);
+
     return (
       <div className="workspace-stack projects-page">
         <section className="page-header" aria-labelledby="project-detail-title">
           <div>
-            <p className="eyebrow">Projects / Detail</p>
+            <p className="eyebrow">{accessError.eyebrow}</p>
             <h1 id="project-detail-title" className="page-title">
               Project detail
             </h1>
@@ -125,6 +148,7 @@ export function ProjectDetailPage({ client: providedClient }: ProjectDetailPageP
         </section>
         <Panel title="Project unavailable">
           <p className="projects-error-text">{state.error.message}</p>
+          <p className="projects-error-guidance">{accessError.guidance}</p>
         </Panel>
       </div>
     );
@@ -139,7 +163,7 @@ export function ProjectDetailPage({ client: providedClient }: ProjectDetailPageP
     <div className="workspace-stack projects-page">
       <section className="page-header" aria-labelledby="project-detail-title">
         <div>
-          <p className="eyebrow">Projects / {data.project.slug}</p>
+          <p className="eyebrow">Yard / Project board</p>
           <h1 id="project-detail-title" className="page-title">
             {data.project.name}
           </h1>
@@ -151,12 +175,9 @@ export function ProjectDetailPage({ client: providedClient }: ProjectDetailPageP
         <div className="page-header__actions">
           <StatusPill tone={projectStatus.tone}>{projectStatus.label}</StatusPill>
           <StatusPill tone={trafficStatus.tone}>{trafficStatus.label}</StatusPill>
-          <Button variant="secondary" icon={<Settings aria-hidden="true" size={16} />}>
-            Settings
-          </Button>
           <Link className="button button--primary projects-action-link" to={`/projects/${data.project.id}/release/production`}>
             <Rocket aria-hidden="true" size={16} />
-            <span>Promote</span>
+            <span>Promote to production</span>
           </Link>
         </div>
       </section>

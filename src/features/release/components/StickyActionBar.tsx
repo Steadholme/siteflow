@@ -35,7 +35,7 @@ export function StickyActionBar({
   const submitting = commandState.status === "submitting";
 
   return (
-    <div className="release-sticky-actions">
+    <section className="release-sticky-actions" aria-label="Command submission">
       <div className="release-action-copy">
         <strong>Safeguard status</strong>
         {blockingReasons.length > 0 ? (
@@ -60,6 +60,6 @@ export function StickyActionBar({
           )}
         </div>
       )}
-    </div>
+    </section>
   );
 }

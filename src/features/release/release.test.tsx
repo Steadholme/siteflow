@@ -1,9 +1,10 @@
 import { isValidElement, type ReactElement } from "react";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { vi } from "vitest";
 
-import type { PromoteDeploymentCommand, RollbackDeploymentCommand, SiteFlowClient } from "@lib/api";
+import { SiteFlowHttpError, type PromoteDeploymentCommand, type RollbackDeploymentCommand, type SiteFlowClient } from "@lib/api";
 import { FixtureSiteFlowClient } from "@lib/api/fixtureClient";
 import { fixtureProjectId } from "@lib/fixtures/siteflow.fixtures";
 import { REDACTION_PLACEHOLDER, SITEFLOW_SECRET_CANARY } from "@lib/redaction";
@@ -235,7 +236,18 @@ describe("ReleaseConsolePage", () => {
     await user.click(promoteButton);
 
     expect(await screen.findByText(/Promotion accepted and route operation queued/i)).toBeVisible();
-    expect(client.promoteCommands[0]).toMatchObject({
+    expect(client.promoteCommands[0]).toEqual({
+      projectId: fixtureProjectId,
+      channel: "production",
+      targetDeploymentId: "dep-healthy",
+      actor: {
+        id: "actor-maya",
+        name: "Maya Chen",
+        email: "maya@example.test",
+        role: "release_manager"
+      },
+      reason: "Ship verified dashboard build.",
+      idempotencyKey: `promote-${fixtureProjectId}-production-dep-healthy`,
       releaseEvidence: {
         evidencePath: "evidence/release-evidence.json",
         bundle: releaseEvidenceBundle
@@ -308,6 +320,127 @@ describe("ReleaseConsolePage", () => {
       })
     ).toBeDisabled();
   });
+
+  it("reloads the same console read model and exposes only the client snapshot time", async () => {
+    const user = userEvent.setup();
+    const client = new FixtureSiteFlowClient("healthy");
+    const getReleaseConsole = vi.spyOn(client, "getReleaseConsole");
+
+    renderReleasePage("healthy", "", client);
+
+    expect(await screen.findByText(/Console snapshot loaded/i)).toBeVisible();
+    expect(screen.getByText(/Reload before submitting a command/i)).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Reload console state" }));
+
+    await waitFor(() => expect(getReleaseConsole).toHaveBeenCalledTimes(2));
+    expect(getReleaseConsole).toHaveBeenLastCalledWith(fixtureProjectId, "production");
+  });
+
+  it("renders an explicit 401 state without an automatic sign-in redirect", async () => {
+    const client = new FixtureSiteFlowClient("healthy");
+    vi.spyOn(client, "getReleaseConsole").mockRejectedValue(
+      new SiteFlowHttpError(401, `/api/projects/${fixtureProjectId}/release/production`, "Gateway session expired.")
+    );
+
+    renderReleasePage("healthy", "", client);
+
+    expect((await screen.findAllByText("Sign-in required (401)")).length).toBeGreaterThan(0);
+    expect(screen.getByText("Gateway session expired.")).toBeVisible();
+    expect(screen.getByText(/Your operator session is missing or expired/i)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeVisible();
+    expect(screen.queryByRole("link", { name: /sign in/i })).not.toBeInTheDocument();
+  });
+
+  it("labels a forbidden mutation response without changing the command contract", async () => {
+    const user = userEvent.setup();
+    const client = new RecordingReleaseClient("healthy");
+    vi.spyOn(client, "promoteDeployment").mockRejectedValue(
+      new SiteFlowHttpError(403, "/api/deployments/dep-healthy/promote", "Promotion permission denied.")
+    );
+
+    renderReleasePage("healthy", "Ship verified dashboard build.", client);
+
+    const promoteButton = await screen.findByRole("button", {
+      name: /promote production from dep-acme-20260514-088 to dep-healthy and queue route apply/i
+    });
+    fillReleaseEvidence();
+    await user.click(promoteButton);
+
+    expect(await screen.findByText("Access denied (403): Promotion permission denied.")).toBeVisible();
+    expect(client.promoteCommands).toHaveLength(0);
+  });
+
+  it("renders the validated ticket band from whitelisted fields only", async () => {
+    const ticketStatuses = Object.fromEntries(
+      [
+        "releaseGateStatus",
+        "dockerBuildRehearsalStatus",
+        "postgresRehearsalStatus",
+        "artifactEvidenceStatus",
+        "sourceProviderEvidenceStatus",
+        "backupEvidenceStatus",
+        "observabilityEvidenceStatus",
+        "operatorAccessEvidenceStatus",
+        "nonSessionCredentialEvidenceStatus",
+        "ingressEvidenceStatus",
+        "upgradeRollbackDrillStatus"
+      ].map((field) => [field, "passed"])
+    );
+    const bundle = {
+      ...releaseEvidenceBundle,
+      release: {
+        ...releaseEvidenceIdentity,
+        ...ticketStatuses,
+        releaseImageDigest: `sha256:${"a".repeat(64)}`
+      },
+      privateToken: SITEFLOW_SECRET_CANARY,
+      arbitraryBundlePayload: { raw: SITEFLOW_SECRET_CANARY }
+    };
+
+    renderReleasePage("healthy", "Ship the validated evidence.");
+
+    fireEvent.change(await screen.findByLabelText("Release evidence path"), {
+      target: { value: "evidence/release-evidence.json" }
+    });
+    fireEvent.change(screen.getByLabelText("Release evidence bundle JSON"), {
+      target: { value: releaseEvidenceText({ bundle }) }
+    });
+
+    const ticketBand = await screen.findByRole("region", { name: "Release evidence ticket band" });
+    const statusFields = [
+      "releaseGateStatus",
+      "dockerBuildRehearsalStatus",
+      "postgresRehearsalStatus",
+      "artifactEvidenceStatus",
+      "sourceProviderEvidenceStatus",
+      "backupEvidenceStatus",
+      "observabilityEvidenceStatus",
+      "operatorAccessEvidenceStatus",
+      "nonSessionCredentialEvidenceStatus",
+      "ingressEvidenceStatus",
+      "upgradeRollbackDrillStatus"
+    ];
+
+    expect(statusFields.every((field) => ticketBand.querySelector(`[data-evidence-field="${field}"]`))).toBe(true);
+    expect(ticketBand.querySelectorAll("[data-evidence-field]")).toHaveLength(16);
+    expect(within(ticketBand).getByText("Release commit")).toBeVisible();
+    expect(within(ticketBand).getByText("Release image digest")).toBeVisible();
+    expect(ticketBand).not.toHaveTextContent(SITEFLOW_SECRET_CANARY);
+    expect(ticketBand).not.toHaveTextContent("privateToken");
+    expect(ticketBand).not.toHaveTextContent("arbitraryBundlePayload");
+  });
+
+  it("does not expose dead release controls", async () => {
+    renderReleasePage("healthy");
+
+    expect(await screen.findByRole("heading", { name: "Candidate deployment" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Promote deployment" })).toBeVisible();
+    for (const label of ["Copy URL", "Export evidence", "Download", "Open manifest", "Review policy"]) {
+      expect(screen.queryByRole("button", { name: label })).not.toBeInTheDocument();
+      expect(screen.queryByRole("link", { name: label })).not.toBeInTheDocument();
+    }
+  });
 });
 
 describe("RollbackConsolePage", () => {
@@ -348,11 +481,38 @@ describe("RollbackConsolePage", () => {
     await user.click(rollbackButton);
 
     expect(await screen.findByText(/Rollback accepted and route operation queued/i)).toBeVisible();
-    expect(client.rollbackCommands[0]).toMatchObject({
+    expect(client.rollbackCommands[0]).toEqual({
+      projectId: fixtureProjectId,
+      channel: "production",
+      currentDeploymentId: "dep-healthy",
+      targetDeploymentId: "dep-acme-20260514-088",
+      actor: {
+        id: "actor-maya",
+        name: "Maya Chen",
+        email: "maya@example.test",
+        role: "release_manager"
+      },
+      reason: "Restore last known-good dashboard.",
+      idempotencyKey: `rollback-${fixtureProjectId}-production-dep-acme-20260514-088`,
       releaseEvidence: {
         evidencePath: "evidence/release-evidence.json",
         bundle: releaseEvidenceBundle
       }
     });
+  });
+
+  it("renders an explicit 403 state without changing routes", async () => {
+    const client = new FixtureSiteFlowClient("healthy");
+    vi.spyOn(client, "getRollbackConsole").mockRejectedValue(
+      new SiteFlowHttpError(403, `/api/projects/${fixtureProjectId}/rollback/production`, "Release permission denied.")
+    );
+
+    renderRollbackPage("healthy", "", client);
+
+    expect((await screen.findAllByText("Access denied (403)")).length).toBeGreaterThan(0);
+    expect(screen.getByText("Release permission denied.")).toBeVisible();
+    expect(screen.getByText(/does not include the required permission/i)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeVisible();
+    expect(screen.queryByRole("link", { name: /request access/i })).not.toBeInTheDocument();
   });
 });

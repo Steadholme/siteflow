@@ -106,3 +106,80 @@ button:disabled {
   letter-spacing: 0.12em;
   text-transform: uppercase;
 }
+
+/* Switchyard global refinements (append-only). */
+
+.page-title {
+  overflow-wrap: anywhere;
+}
+
+.skip-link {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 2px;
+}
+
+@media (forced-colors: active) {
+  .app-shell {
+    background-image: none;
+  }
+
+  .panel,
+  .release-sticky-actions,
+  .projects-row-card,
+  .projects-analytics-metric,
+  .deployment-lineage__step,
+  .release-metric,
+  .release-comparison__item,
+  .release-fact-grid > div,
+  .release-check,
+  .ticket-band,
+  .ticket-band__ticket {
+    border: 1px solid CanvasText;
+    box-shadow: none;
+  }
+
+  .status-pill {
+    border: 1px solid currentColor;
+  }
+
+  .sidebar__link.is-active {
+    box-shadow: none;
+    border: 1px solid CanvasText;
+  }
+
+  a {
+    text-decoration: underline;
+  }
+
+  .button,
+  .icon-button {
+    border: 1px solid ButtonText;
+    box-shadow: none;
+  }
+
+  .button:disabled,
+  .icon-button:disabled,
+  button:disabled {
+    color: GrayText;
+    border-color: GrayText;
+    opacity: 1;
+  }
+
+  .timeline__marker,
+  .deployment-lineage__station-marker {
+    border: 2px solid CanvasText;
+    background: Canvas;
+    box-shadow: none;
+  }
+
+  :focus-visible {
+    outline: 2px solid Highlight;
+    box-shadow: none;
+  }
+}

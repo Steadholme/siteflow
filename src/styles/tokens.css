@@ -114,6 +114,16 @@
   --transition-opacity: opacity var(--duration-normal) var(--ease-out);
   --transition-shadow: box-shadow var(--duration-normal) var(--ease-out);
   --transition-border: border-color var(--duration-fast) var(--ease-out);
+
+  /* Switchyard structural aliases: linear track, station, ticket, and gate
+     materials mapped onto the existing Odyssey 1.1 semantic tokens. */
+  --switchyard-track-line: var(--color-border-strong);
+  --switchyard-track-bed: var(--color-surface-inset);
+  --switchyard-station-marker: var(--color-surface-elevated);
+  --switchyard-ticket-band: var(--color-surface-inset);
+  --switchyard-ticket-perforation: var(--color-border-strong);
+  --switchyard-signal-mount: var(--color-surface-subtle);
+  --switchyard-gate-arm: var(--color-brand-primary);
 }
 
 @media (prefers-reduced-motion: reduce) {

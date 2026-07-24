@@ -1,6 +1,5 @@
-import { FileJson, ShieldCheck } from "lucide-react";
+import { ShieldCheck } from "lucide-react";
 
-import { Button } from "@components/ui/Button";
 import { Panel } from "@components/ui/Panel";
 import { StatusPill } from "@components/ui/StatusPill";
 import type { Artifact } from "@domain/siteflow";
@@ -21,15 +20,7 @@ export function ArtifactProof({ artifact }: ArtifactProofProps) {
   const manifestMetadata = redactManifest(artifact.manifest.metadata);
 
   return (
-    <Panel
-      title="Artifact proof"
-      eyebrow="Immutable bytes"
-      actions={
-        <Button variant="ghost" icon={<FileJson aria-hidden="true" size={16} />}>
-          Open manifest
-        </Button>
-      }
-    >
+    <Panel title="Artifact proof" eyebrow="Immutable seal / Verified bytes">
       <div className="deployment-proof">
         <div className="deployment-proof__status">
           <ShieldCheck aria-hidden="true" size={18} />

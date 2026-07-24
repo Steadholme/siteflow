@@ -64,7 +64,7 @@ export function BuildTimeline({ detail }: BuildTimelineProps) {
   ];
 
   return (
-    <Panel title="Build timeline" eyebrow="Source to traffic">
+    <Panel title="Build timeline" eyebrow="Crew log / Source to traffic">
       <Timeline items={items} ariaLabel="Build and routing timeline" />
     </Panel>
   );

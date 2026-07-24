@@ -1,37 +1,47 @@
-import { Bell, Plus, Search } from "lucide-react";
+import { useLocation } from "react-router-dom";
 
-import { Button } from "@components/ui/Button";
-import { IconButton } from "@components/ui/IconButton";
-import { StatusPill } from "@components/ui/StatusPill";
+function visibleSegment(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
+function routeLabel(pathname: string): string {
+  const parts = pathname.split("/").filter(Boolean).map(visibleSegment);
+
+  if (parts.length === 1 && parts[0] === "projects") {
+    return "Projects / Yard inventory";
+  }
+
+  if (parts[0] === "deployments" && parts[1]) {
+    return `Deployments / ${parts[1]} / Consist ticket`;
+  }
+
+  if (parts[0] === "projects" && parts[1]) {
+    if (parts[2] === "release" && parts[3]) {
+      return `Projects / ${parts[1]} / Promotion gate / ${parts[3]}`;
+    }
+    if (parts[2] === "rollback" && parts[3]) {
+      return `Projects / ${parts[1]} / Rollback gate / ${parts[3]}`;
+    }
+    return `Projects / ${parts[1]} / Project board`;
+  }
+
+  return "Projects / Yard inventory";
+}
 
 export function Topbar() {
+  const location = useLocation();
+
   return (
-    <header className="topbar">
+    <header className="topbar" aria-label="Current console location">
       <div className="topbar__title">
-        <span className="eyebrow">Production</span>
-        <span className="topbar__heading">Control plane</span>
-      </div>
-      <div className="topbar__command">
-        <label className="topbar__search">
-          <Search aria-hidden="true" size={15} />
-          <span className="sr-only">Search SiteFlow</span>
-          <input
-            className="topbar__search-input"
-            name="global-search"
-            autoComplete="off"
-            placeholder="Search projects, deployments, routes..."
-            type="search"
-          />
-          <kbd>/</kbd>
-        </label>
-      </div>
-      <div className="topbar__actions">
-        <StatusPill tone="success">All systems nominal</StatusPill>
-        <IconButton label="Search" icon={<Search aria-hidden="true" size={17} />} />
-        <IconButton label="Notifications" icon={<Bell aria-hidden="true" size={17} />} />
-        <Button variant="primary" icon={<Plus aria-hidden="true" size={16} />}>
-          New project
-        </Button>
+        <span className="eyebrow">SiteFlow operator console</span>
+        <span className="topbar__heading" aria-current="page">
+          {routeLabel(location.pathname)}
+        </span>
       </div>
     </header>
   );

@@ -4,7 +4,7 @@ import { useParams } from "react-router-dom";
 import { Panel } from "@components/ui/Panel";
 import type { Deployment } from "@domain/siteflow";
 import type { DeploymentDetailReadModel } from "@domain/readModels";
-import { createSiteFlowClient, getDefaultSiteFlowClientMode, type SiteFlowClient } from "@lib/api";
+import { createSiteFlowClient, getDefaultSiteFlowClientMode, SiteFlowHttpError, type SiteFlowClient } from "@lib/api";
 import { ArtifactProof } from "./components/ArtifactProof";
 import { BuildTimeline } from "./components/BuildTimeline";
 import { DeploymentHeader } from "./components/DeploymentHeader";
@@ -18,7 +18,7 @@ import "./deployments.css";
 type LoadState =
   | { status: "loading" }
   | { status: "ready"; detail: DeploymentDetailReadModel }
-  | { status: "error"; message: string };
+  | { status: "error"; error: Error };
 
 type SiteFlowScenarioName = "healthy" | "emptyProjects" | "queued" | "routeDrift" | "staleCandidate" | "routeFailed" | "rollbackIneligible";
 
@@ -76,6 +76,27 @@ function normalizedLineage(detail: DeploymentDetailReadModel) {
       };
 }
 
+function deploymentAccessError(error: Error) {
+  if (error instanceof SiteFlowHttpError && error.isUnauthorized) {
+    return {
+      eyebrow: "Sign-in required (401)",
+      guidance: "Your operator session is missing or expired. Sign in again through the gateway, then retry."
+    };
+  }
+
+  if (error instanceof SiteFlowHttpError && error.isForbidden) {
+    return {
+      eyebrow: "Access denied (403)",
+      guidance: "Your gateway identity does not include the required permission for this console."
+    };
+  }
+
+  return {
+    eyebrow: "API error",
+    guidance: "Retry after the deployment read becomes available."
+  };
+}
+
 export function DeploymentDetailWorkspace({ detail, onRefresh }: DeploymentDetailWorkspaceProps) {
   return (
     <div className="deployment-detail workspace-stack">
@@ -113,7 +134,7 @@ export function DeploymentDetailPage({ client: providedClient }: DeploymentDetai
     setLoadState({ status: "loading" });
 
     if (!resolvedDeploymentId) {
-      setLoadState({ status: "error", message: "Deployment id is required." });
+      setLoadState({ status: "error", error: new Error("Deployment id is required.") });
       return () => {
         mounted = false;
       };
@@ -130,7 +151,7 @@ export function DeploymentDetailPage({ client: providedClient }: DeploymentDetai
         if (mounted) {
           setLoadState({
             status: "error",
-            message: error instanceof Error ? error.message : "Deployment could not be loaded."
+            error: error instanceof Error ? error : new Error("Deployment could not be loaded.")
           });
         }
       });
@@ -149,10 +170,23 @@ export function DeploymentDetailPage({ client: providedClient }: DeploymentDetai
   }
 
   if (loadState.status === "error") {
+    const accessError = deploymentAccessError(loadState.error);
+
     return (
-      <Panel title="Deployment evidence" eyebrow="Unavailable">
-        <p className="deployment-error">{loadState.message}</p>
-      </Panel>
+      <div className="deployment-detail workspace-stack">
+        <section className="page-header" aria-labelledby="deployment-error-title">
+          <div>
+            <p className="eyebrow">{accessError.eyebrow}</p>
+            <h1 id="deployment-error-title" className="page-title">
+              Deployment evidence
+            </h1>
+          </div>
+        </section>
+        <Panel title="Deployment unavailable">
+          <p className="deployment-error">{loadState.error.message}</p>
+          <p className="deployment-error-guidance">{accessError.guidance}</p>
+        </Panel>
+      </div>
     );
   }
 

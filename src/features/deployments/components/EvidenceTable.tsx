@@ -150,7 +150,7 @@ export interface EvidenceTableProps {
 
 export function EvidenceTable({ detail }: EvidenceTableProps) {
   return (
-    <Panel title="Evidence table" eyebrow="Verification checks" className="deployment-evidence-panel">
+    <Panel title="Evidence table" eyebrow="Ticket band / Verification checks" className="deployment-evidence-panel">
       <DataTable rows={buildRows(detail)} columns={columns} getRowKey={(row) => row.id} ariaLabel="Evidence table" />
     </Panel>
   );

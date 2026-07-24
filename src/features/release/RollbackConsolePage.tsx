@@ -2,10 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, RotateCcw } from "lucide-react";
 import { useParams } from "react-router-dom";
 
+import { Button } from "@components/ui/Button";
 import { Panel } from "@components/ui/Panel";
 import type { ReleaseChannelName } from "@domain/siteflow";
 import type { CommandResultReadModel, RollbackConsoleReadModel } from "@domain/readModels";
-import { createSiteFlowClient, getDefaultSiteFlowClientMode, type SiteFlowClient } from "@lib/api";
+import { createSiteFlowClient, getDefaultSiteFlowClientMode, SiteFlowHttpError, type SiteFlowClient } from "@lib/api";
 import { AuditReasonForm } from "./components/AuditReasonForm";
 import { DeploymentComparison } from "./components/DeploymentComparison";
 import { parseReleaseEvidence, ReleaseEvidenceForm, releaseEvidenceFailure, releaseEvidenceRequest } from "./components/ReleaseEvidenceForm";
@@ -24,8 +25,14 @@ interface RollbackConsolePageProps {
 
 type LoadState =
   | { status: "loading" }
-  | { status: "ready"; data: RollbackConsoleReadModel }
-  | { status: "error"; message: string };
+  | { status: "ready"; data: RollbackConsoleReadModel; loadedAt: string }
+  | {
+      status: "error";
+      kind: "unauthorized" | "forbidden" | "api";
+      eyebrow: string;
+      message: string;
+      guidance?: string;
+    };
 
 const releaseChannels = ["production", "staging", "preview"] as const;
 const defaultFixtureProjectId = "project-acme-dashboard";
@@ -36,6 +43,47 @@ function isReleaseChannelName(value: string | undefined): value is ReleaseChanne
 
 function toErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Unknown rollback console error.";
+}
+
+function toLoadError(error: unknown): Extract<LoadState, { status: "error" }> {
+  if (error instanceof SiteFlowHttpError && error.isUnauthorized) {
+    return {
+      status: "error",
+      kind: "unauthorized",
+      eyebrow: "Sign-in required (401)",
+      message: error.message,
+      guidance: "Your operator session is missing or expired. Sign in again through the gateway, then retry."
+    };
+  }
+
+  if (error instanceof SiteFlowHttpError && error.isForbidden) {
+    return {
+      status: "error",
+      kind: "forbidden",
+      eyebrow: "Access denied (403)",
+      message: error.message,
+      guidance: "Your gateway identity does not include the required permission for this console."
+    };
+  }
+
+  return {
+    status: "error",
+    kind: "api",
+    eyebrow: "API error",
+    message: toErrorMessage(error)
+  };
+}
+
+function toCommandErrorMessage(error: unknown) {
+  if (error instanceof SiteFlowHttpError && error.isUnauthorized) {
+    return `Sign-in required (401): ${error.message}`;
+  }
+
+  if (error instanceof SiteFlowHttpError && error.isForbidden) {
+    return `Access denied (403): ${error.message}`;
+  }
+
+  return toErrorMessage(error);
 }
 
 function commandMessage(result: CommandResultReadModel) {
@@ -60,6 +108,7 @@ export function RollbackConsolePage({ client, projectId, channel, initialReason 
   const [releaseEvidencePathValue, setReleaseEvidencePathValue] = useState("");
   const [releaseEvidenceText, setReleaseEvidenceText] = useState("");
   const [commandState, setCommandState] = useState<CommandState>({ status: "idle" });
+  const [reloading, setReloading] = useState(false);
   const parsedReleaseEvidence = useMemo(() => parseReleaseEvidence(releaseEvidenceText), [releaseEvidenceText]);
 
   useEffect(() => {
@@ -71,12 +120,12 @@ export function RollbackConsolePage({ client, projectId, channel, initialReason 
       .then((data) => {
         if (!cancelled) {
           setSelectedTargetId(data.selectedTargetId ?? data.targets[0]?.deployment.id);
-          setLoadState({ status: "ready", data });
+          setLoadState({ status: "ready", data, loadedAt: new Date().toISOString() });
         }
       })
       .catch((error: unknown) => {
         if (!cancelled) {
-          setLoadState({ status: "error", message: toErrorMessage(error) });
+          setLoadState(toLoadError(error));
         }
       });
 
@@ -85,9 +134,32 @@ export function RollbackConsolePage({ client, projectId, channel, initialReason 
     };
   }, [requestProjectId, resolvedChannel, resolvedClient]);
 
+  async function reloadConsoleState() {
+    setReloading(true);
+    if (loadState.status === "error") {
+      setLoadState({ status: "loading" });
+    }
+
+    try {
+      const data = await resolvedClient.getRollbackConsole(requestProjectId, resolvedChannel);
+      setSelectedTargetId(data.selectedTargetId ?? data.targets[0]?.deployment.id);
+      setLoadState({ status: "ready", data, loadedAt: new Date().toISOString() });
+    } catch (error: unknown) {
+      setLoadState(toLoadError(error));
+    } finally {
+      setReloading(false);
+    }
+  }
+
   if (loadState.status === "loading") {
     return (
       <div className="workspace-stack release-page">
+        <header className="page-header release-header">
+          <div className="release-header__title">
+            <p className="eyebrow">Gate House / Rollback</p>
+            <h1 className="page-title">Rollback console</h1>
+          </div>
+        </header>
         <Panel title="Rollback console">
           <p className="release-muted">Loading rollback workflow…</p>
         </Panel>
@@ -98,10 +170,22 @@ export function RollbackConsolePage({ client, projectId, channel, initialReason 
   if (loadState.status === "error") {
     return (
       <div className="workspace-stack release-page">
-        <Panel title="Rollback console">
+        <header className="page-header release-header">
+          <div className="release-header__title">
+            <p className="eyebrow">Gate House / Rollback</p>
+            <h1 className="page-title">Rollback deployment</h1>
+          </div>
+        </header>
+        <Panel title="Rollback console" eyebrow={loadState.eyebrow}>
           <div role="alert" className="release-alert release-alert--error">
-            <strong>API error</strong>
+            <strong>{loadState.eyebrow}</strong>
             <span>{loadState.message}</span>
+            {loadState.guidance && <span>{loadState.guidance}</span>}
+          </div>
+          <div className="release-retry">
+            <Button variant="secondary" disabled={reloading} onClick={reloadConsoleState}>
+              Retry
+            </Button>
           </div>
         </Panel>
       </div>
@@ -187,7 +271,7 @@ export function RollbackConsolePage({ client, projectId, channel, initialReason 
         setReleaseEvidenceText("");
       }
     } catch (error: unknown) {
-      setCommandState({ status: "apiError", message: toErrorMessage(error) });
+      setCommandState({ status: "apiError", message: toCommandErrorMessage(error) });
     }
   }
 
@@ -199,6 +283,9 @@ export function RollbackConsolePage({ client, projectId, channel, initialReason 
         channel={data.channel}
         currentDeployment={data.currentDeployment}
         targetDeployment={selectedTarget?.deployment}
+        loadedAt={loadState.loadedAt}
+        reloading={reloading}
+        onReload={reloadConsoleState}
       />
       {selectedTarget && !targetSelectable && (
         <div role="alert" className="release-alert release-alert--error">
@@ -207,18 +294,18 @@ export function RollbackConsolePage({ client, projectId, channel, initialReason 
           <span>{selectedTarget.disabledReason ?? "The selected deployment failed rollback safety checks."}</span>
         </div>
       )}
-      <main className="release-grid">
-        <section className="release-stack">
+      <div className="release-grid gate-house">
+        <section className="release-stack gate-house__facts" aria-label="Rollback facts">
           <RollbackTimeline targets={data.targets} selectedTargetId={selectedTargetId} onSelectTarget={setSelectedTargetId} />
           <DeploymentComparison
             currentDeployment={data.currentDeployment}
             targetDeployment={selectedTarget?.deployment}
             routePreview={data.routePreview}
           />
+          <SafetyChecks checks={selectedSafetyChecks} />
           <RoutePreview preview={data.routePreview} />
         </section>
-        <aside className="release-stack">
-          <SafetyChecks checks={selectedSafetyChecks} />
+        <aside className="release-stack gate-house__command" aria-label="Rollback command">
           <AuditReasonForm
             title="Rollback reason"
             label="Rollback reason"
@@ -249,7 +336,7 @@ export function RollbackConsolePage({ client, projectId, channel, initialReason 
             onSubmit={submitRollback}
           />
         </aside>
-      </main>
+      </div>
     </div>
   );
 }

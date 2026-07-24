@@ -3,9 +3,11 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 
 import { REDACTION_PLACEHOLDER, SITEFLOW_SECRET_CANARY } from "@lib/redaction";
 import { createFixtureSiteFlowClient } from "@lib/api/fixtureClient";
+import { SiteFlowHttpError } from "@lib/api/httpClient";
+import type { SiteFlowClient } from "@lib/api/siteflowClient";
 import type { SiteFlowScenarioName } from "@lib/fixtures/scenarios";
 import { deploymentRoutes } from "./deploymentRoutes";
-import { DeploymentDetailWorkspace } from "./DeploymentDetailPage";
+import { DeploymentDetailPage, DeploymentDetailWorkspace } from "./DeploymentDetailPage";
 import { EvidenceTable } from "./components/EvidenceTable";
 import { LogPanel } from "./components/LogPanel";
 
@@ -31,6 +33,16 @@ function renderDeploymentRoute(path = "/deployments/dep-healthy") {
   );
 }
 
+function renderDeploymentPage(client: SiteFlowClient, path = "/deployments/dep-access-test") {
+  return render(
+    <MemoryRouter initialEntries={[path]}>
+      <Routes>
+        <Route path="/deployments/:deploymentId" element={<DeploymentDetailPage client={client} />} />
+      </Routes>
+    </MemoryRouter>
+  );
+}
+
 describe("deployment detail feature", () => {
   it("exports a deployment route that renders the evidence workspace instead of the placeholder", async () => {
     renderDeploymentRoute();
@@ -47,11 +59,23 @@ describe("deployment detail feature", () => {
 
     render(<DeploymentDetailWorkspace detail={detail} />);
 
-    const lineage = screen.getByRole("list", { name: "Deployment lineage" });
+    const region = screen.getByRole("region", { name: "Scrollable deployment lineage" });
+    const lineage = within(region).getByRole("list", { name: "Deployment lineage" });
+
+    expect(region).toHaveAttribute("tabindex", "0");
 
     for (const label of ["Source event", "Build job", "Artifact", "Deployment", "Route revision"]) {
       expect(within(lineage).getByText(label)).toBeInTheDocument();
     }
+
+    for (const station of ["Station 1", "Station 2", "Station 3", "Station 4", "Station 5"]) {
+      expect(within(lineage).getByText(station)).toBeInTheDocument();
+    }
+
+    expect(screen.queryByRole("button", { name: /copy url/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /export evidence/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /download/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /open manifest/i })).not.toBeInTheDocument();
   });
 
   it("keeps deployment success separate from route pending state", async () => {
@@ -104,5 +128,20 @@ describe("deployment detail feature", () => {
 
     rerender(<EvidenceTable detail={routeDrift} />);
     expect(within(screen.getByRole("table", { name: "Evidence table" })).getByText("stale")).toBeInTheDocument();
+  });
+
+  it.each([
+    [401, "Sign-in required (401)", /operator session is missing or expired/i],
+    [403, "Access denied (403)", /does not include the required permission/i]
+  ])("renders a truthful %i deployment access error state", async (status, label, guidance) => {
+    const client = createFixtureSiteFlowClient({ scenario: "healthy" });
+    client.getDeployment = async () => {
+      throw new SiteFlowHttpError(status, "/v1/deployments/dep-access-test", "Gateway rejected the deployment request.");
+    };
+
+    renderDeploymentPage(client);
+
+    expect(await screen.findByText(label)).toBeInTheDocument();
+    expect(screen.getByText(guidance)).toBeInTheDocument();
   });
 });

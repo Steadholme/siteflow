@@ -47,18 +47,22 @@ export function CandidatePanel({ channel, currentDeployment, candidateDeployment
   return (
     <Panel
       title="Candidate deployment"
-      eyebrow="Current-vs-next delta"
+      eyebrow={`Track / ${channel}`}
       actions={<StatusPill tone={deploymentTone(candidateDeployment)}>{candidateStatus}</StatusPill>}
     >
       <div className="release-metric-grid">
         <div className="release-metric">
           <span className="release-label">Candidate deployment</span>
-          <strong className="release-mono">{candidateDeployment?.id ?? "No candidate"}</strong>
+          <strong className="release-mono" title={candidateDeployment?.id}>
+            {candidateDeployment?.id ?? "No candidate"}
+          </strong>
           <span className="release-muted">{summaryLine(candidateDeployment)}</span>
         </div>
         <div className="release-metric">
           <span className="release-label">Current production or current channel</span>
-          <strong className="release-mono">{currentDeployment?.id ?? "No current target"}</strong>
+          <strong className="release-mono" title={currentDeployment?.id}>
+            {currentDeployment?.id ?? "No current target"}
+          </strong>
           <span className="release-muted">
             {channel} / {summaryLine(currentDeployment)}
           </span>

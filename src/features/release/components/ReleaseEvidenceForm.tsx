@@ -2,6 +2,7 @@ import { type ChangeEvent } from "react";
 
 import { Panel } from "@components/ui/Panel";
 import type { ReleaseEvidenceBundleRequest } from "@lib/api";
+import { redactString } from "@lib/redaction";
 
 export type ParsedReleaseEvidence =
   | { status: "empty" }
@@ -279,6 +280,51 @@ export function releaseEvidenceRequest(pathValue: string, parsed: ParsedReleaseE
   };
 }
 
+function releaseEvidenceTicketValue(bundle: Record<string, unknown>, field: string) {
+  const release = isRecord(bundle.release) ? bundle.release : undefined;
+  return stringValue(release?.[field]) ?? stringValue(bundle[field]);
+}
+
+function releaseEvidenceTicketBand(bundle: Record<string, unknown>) {
+  const identity = releaseEvidenceBundleIdentity(bundle);
+  const statusTickets = requiredReleaseEvidenceStatusFields.map(([field, label]) => {
+    const value = releaseEvidenceTicketValue(bundle, field);
+
+    return {
+      field,
+      label,
+      value: value && isPassingEvidenceStatus(value) ? "passed" : "Not recorded as passed"
+    };
+  });
+  const identityTickets = [
+    ["commitRef", "Release commit", identity.commitRef],
+    ["repository", "Repository", identity.repository],
+    ["branch", "Branch", identity.branch],
+    ["targetEnvironment", "Target environment", identity.targetEnvironment],
+    ["releaseImageDigest", "Release image digest", releaseEvidenceTicketValue(bundle, "releaseImageDigest")]
+  ] as const;
+
+  return (
+    <section className="ticket-band" role="region" aria-label="Release evidence ticket band">
+      <h3 className="ticket-band__title">Ticket band</h3>
+      <dl className="ticket-band__list">
+        {statusTickets.map((ticket) => (
+          <div key={ticket.field} className="ticket-band__ticket" data-evidence-field={ticket.field}>
+            <dt>{ticket.label}</dt>
+            <dd>{ticket.value}</dd>
+          </div>
+        ))}
+        {identityTickets.map(([field, label, value]) => (
+          <div key={field} className="ticket-band__ticket" data-evidence-field={field}>
+            <dt>{label}</dt>
+            <dd className="release-mono">{value ? redactString(value) : "Not recorded in bundle"}</dd>
+          </div>
+        ))}
+      </dl>
+    </section>
+  );
+}
+
 interface ReleaseEvidenceFormProps {
   required: boolean;
   evidencePath: string;
@@ -317,7 +363,7 @@ export function ReleaseEvidenceForm({
         : "Waiting for bundle";
 
   return (
-    <Panel title="Release evidence" eyebrow="Production gate">
+    <Panel title="Release evidence" eyebrow="Ticket band">
       <div className="release-form-stack">
         <label className="release-field">
           <span>Release evidence path</span>
@@ -342,6 +388,7 @@ export function ReleaseEvidenceForm({
             <dd>{status}</dd>
           </div>
         </dl>
+        {parsedEvidence.status === "valid" && releaseEvidenceTicketBand(parsedEvidence.bundle)}
       </div>
     </Panel>
   );

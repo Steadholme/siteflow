@@ -35,7 +35,7 @@ function cdnTone(state?: CdnOperationState): StatusTone {
 export function RoutePreview({ preview }: RoutePreviewProps) {
   if (!preview) {
     return (
-      <Panel title="Route preview" eyebrow="Dry-run">
+      <Panel title="Route preview" eyebrow="Switch state">
         <p className="release-muted">No route dry-run has been generated for this command.</p>
       </Panel>
     );
@@ -49,13 +49,15 @@ export function RoutePreview({ preview }: RoutePreviewProps) {
   return (
     <Panel
       title="Route preview"
-      eyebrow="Dry-run"
+      eyebrow="Switch state"
       actions={<StatusPill tone={routeTone(routeRevision.status)}>{routeRevision.status}</StatusPill>}
     >
       <div className="release-fact-grid">
         <div>
           <span className="release-label">Route revision</span>
-          <strong>{routeRevision.id}</strong>
+          <strong className="release-mono" title={routeRevision.id}>
+            {routeRevision.id}
+          </strong>
           <p className="release-muted">{routeRevision.validationSummary}</p>
         </div>
         <div>

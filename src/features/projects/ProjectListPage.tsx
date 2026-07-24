@@ -6,7 +6,7 @@ import { Button } from "@components/ui/Button";
 import { Panel } from "@components/ui/Panel";
 import { StatusPill } from "@components/ui/StatusPill";
 import type { ProjectListItemReadModel, ProjectListReadModel } from "@domain/readModels";
-import { createSiteFlowClient, type SiteFlowClient } from "@lib/api";
+import { createSiteFlowClient, SiteFlowHttpError, type SiteFlowClient } from "@lib/api";
 import { ProjectActivity } from "./components/ProjectActivity";
 import { ProjectInventoryTable } from "./components/ProjectInventoryTable";
 import { ProjectSummaryStrip } from "./components/ProjectSummaryStrip";
@@ -21,6 +21,27 @@ type LoadState =
   | { status: "loading" }
   | { status: "success"; data: ProjectListReadModel; loadedAt: string }
   | { status: "error"; error: Error };
+
+function projectAccessError(error: Error) {
+  if (error instanceof SiteFlowHttpError && error.isUnauthorized) {
+    return {
+      eyebrow: "Sign-in required (401)",
+      guidance: "Your operator session is missing or expired. Sign in again through the gateway, then retry."
+    };
+  }
+
+  if (error instanceof SiteFlowHttpError && error.isForbidden) {
+    return {
+      eyebrow: "Access denied (403)",
+      guidance: "Your gateway identity does not include the required permission for this console."
+    };
+  }
+
+  return {
+    eyebrow: "API error",
+    guidance: "Retry after the control-plane read becomes available."
+  };
+}
 
 export interface ProjectListPageProps {
   client?: SiteFlowClient;
@@ -85,18 +106,21 @@ function ProjectOperationsBoard({ projects }: { projects: ProjectListItemReadMod
 
   const lanes = [
     {
+      kind: "production" as const,
       title: "Production",
       status: `${productionRows.length} tracked`,
       rows: productionRows,
       empty: "No production channels are tracked."
     },
     {
+      kind: "staging" as const,
       title: "Staging",
       status: `${stagingRows.length} candidates`,
       rows: stagingRows,
       empty: "No queued staging candidates."
     },
     {
+      kind: "previews" as const,
       title: "Previews",
       status: `${previewRows.length} policies`,
       rows: previewRows,
@@ -107,7 +131,12 @@ function ProjectOperationsBoard({ projects }: { projects: ProjectListItemReadMod
   return (
     <section className="projects-board-lanes" aria-label="Operations board">
       {lanes.map((lane) => (
-        <Panel key={lane.title} title={lane.title} actions={<StatusPill tone="info">{lane.status}</StatusPill>}>
+        <Panel
+          key={lane.title}
+          eyebrow={`Track / ${lane.title}`}
+          title={lane.title}
+          actions={<StatusPill tone="info">{lane.status}</StatusPill>}
+        >
           <div className="projects-stack">
             {lane.rows.length > 0 ? (
               lane.rows.map((item) => {
@@ -115,18 +144,39 @@ function ProjectOperationsBoard({ projects }: { projects: ProjectListItemReadMod
                 const route = item.productionDeployment
                   ? routeStatusDescriptor(item.productionDeployment.routeRevisionStatus)
                   : { label: "Route pending", tone: "info" as const };
+                const consist =
+                  lane.kind === "production"
+                    ? compactId(item.productionDeployment?.id)
+                    : lane.kind === "staging"
+                      ? `${item.pendingDeploymentCount} pending`
+                      : "PR route policy";
+                const primarySignal =
+                  lane.kind === "production"
+                    ? traffic
+                    : lane.kind === "staging"
+                      ? {
+                          label: `${item.pendingDeploymentCount} candidate${item.pendingDeploymentCount === 1 ? "" : "s"}`,
+                          tone: item.pendingDeploymentCount > 0 ? ("warning" as const) : ("info" as const)
+                        }
+                      : {
+                          label: item.project.policy.previewDeploymentsEnabled ? "Policy enabled" : "Policy disabled",
+                          tone: item.project.policy.previewDeploymentsEnabled ? ("success" as const) : ("info" as const)
+                        };
 
                 return (
                   <div key={`${lane.title}-${item.project.id}`} className="projects-row-card">
                     <div>
                       <strong>{item.project.name}</strong>
-                      <span className="table-subtext">
-                        {lane.title.toLowerCase()} - {compactId(item.productionDeployment?.id)}
+                      <span
+                        className="table-subtext"
+                        title={lane.kind === "production" ? item.productionDeployment?.id : undefined}
+                      >
+                        {lane.title.toLowerCase()} — {consist}
                       </span>
                     </div>
                     <span className="projects-status-stack">
-                      <StatusPill tone={traffic.tone}>{traffic.label}</StatusPill>
-                      {lane.title === "Production" && <StatusPill tone={route.tone}>{route.label}</StatusPill>}
+                      <StatusPill tone={primarySignal.tone}>{primarySignal.label}</StatusPill>
+                      {lane.kind === "production" ? <StatusPill tone={route.tone}>{route.label}</StatusPill> : null}
                     </span>
                   </div>
                 );
@@ -207,11 +257,13 @@ export function ProjectListPage({ client: providedClient }: ProjectListPageProps
   }
 
   if (state.status === "error") {
+    const accessError = projectAccessError(state.error);
+
     return (
       <div className="workspace-stack projects-page">
         <section className="page-header" aria-labelledby="projects-title">
           <div>
-            <p className="eyebrow">Project inventory</p>
+            <p className="eyebrow">{accessError.eyebrow}</p>
             <h1 id="projects-title" className="page-title">
               Projects
             </h1>
@@ -222,6 +274,7 @@ export function ProjectListPage({ client: providedClient }: ProjectListPageProps
         </section>
         <Panel title="Project inventory unavailable">
           <p className="projects-error-text">{state.error.message}</p>
+          <p className="projects-error-guidance">{accessError.guidance}</p>
         </Panel>
       </div>
     );
@@ -235,7 +288,7 @@ export function ProjectListPage({ client: providedClient }: ProjectListPageProps
     <div className="workspace-stack projects-page">
       <section className="page-header" aria-labelledby="projects-title">
         <div>
-          <p className="eyebrow">Control plane / Projects</p>
+          <p className="eyebrow">Switchyard / Yard inventory</p>
           <h1 id="projects-title" className="page-title">
             Projects
           </h1>
